@@ -755,7 +755,8 @@ fn v112_sc_leaf_swaps_stay_within_their_plans_short_names() {
 }
 
 /// A plan the chain has never seen reaches every node through partitions no
-/// row diff can describe: each node is refreshed once, for that plan only.
+/// row diff can describe: the passthrough is refreshed once, for that plan
+/// only, and the sub-IMVs ignoring it are queued for their heal (1.12.1).
 fn sc_assert_new_plan_refreshes_each_node_once(dbname: &str, field_names: bool, explicit: bool) {
     let chain = ScChain { field_names, cross_plan: false };
     sc_open(dbname, "DEFERRED", chain);
@@ -766,6 +767,7 @@ fn sc_assert_new_plan_refreshes_each_node_once(dbname: &str, field_names: bool, 
     };
     chain.commit(&statements).expect("attach plan");
     let refreshes = chain.refreshes();
+    let queued = hor_queued_keys();
     let outside = chain.written_outside(&[5]);
     let wrong = chain.wrong_nodes(&[]);
     probe_db_close(dbname);
@@ -781,10 +783,21 @@ fn sc_assert_new_plan_refreshes_each_node_once(dbname: &str, field_names: bool, 
         "a node refreshed in full: {refreshes:?}"
     );
     assert!(outside.is_empty(), "wrote outside plan 5: {outside:?}\n{refreshes:?}");
-    for node in ["sc_sfv", "sc_fav", "sc_fav__cte_forecast_sales", "sc_fav__cte_history_sales"] {
+    assert!(
+        refreshes.contains(&(chain.named("sc_sfv"), "partitions".to_string())),
+        "sc_sfv not refreshed by partition: {refreshes:?}"
+    );
+    for node in ["sc_fav", "sc_fav__cte_forecast_sales", "sc_fav__cte_history_sales"] {
         assert!(
-            refreshes.contains(&(chain.named(node), "partitions".to_string())),
-            "{node} not refreshed by partition: {refreshes:?}"
+            !refreshes.iter().any(|(refreshed, _)| *refreshed == chain.named(node)),
+            "{node} ignores the passthrough but was refreshed: {refreshes:?}"
+        );
+    }
+    for node in ["sc_fav", "sc_fav__cte_forecast_sales", "sc_fav__cte_history_sales"] {
+        let prefix = format!("{}:", chain.named(node));
+        assert!(
+            queued.iter().any(|entry| entry.starts_with(&prefix)),
+            "{node} not queued for its heal: {queued:?}"
         );
     }
 }
@@ -805,15 +818,13 @@ fn v112_sc_new_plan_refreshes_each_node_once_explicit_flush() {
 }
 
 /// A dependent whose plans cannot be shown to follow the swapped source's is
-/// refreshed whole, once, without its generated sub-IMV, whichever flush runs;
-/// the provable ones keep their partition scope.
+/// queued whole for its heal, whichever flush runs (1.12.1: both ignore the
+/// passthrough); the provable ones keep their partition scope.
 #[pg_test]
 fn v112_sc_unprovable_dependents_are_refreshed_whole_once() {
     let chain = ScChain { field_names: false, cross_plan: true };
     sc_open("reflex_sc_whole", "DEFERRED", chain);
     let mut expected = chain.expected_refreshes(SC_ONE_LEAF_REFRESHES);
-    expected.push(("sc_versus".to_string(), "full".to_string()));
-    expected.push(("sc_mapped".to_string(), "full".to_string()));
     expected.sort();
     let mut failures = Vec::new();
     for (label, statements) in [
@@ -828,6 +839,12 @@ fn v112_sc_unprovable_dependents_are_refreshed_whole_once() {
         refreshes.sort();
         if refreshes != expected {
             failures.push(format!("{label}: refreshed {refreshes:?}"));
+        }
+        let queued = hor_queued_keys();
+        for whole in ["sc_versus:(whole IMV)", "sc_mapped:(whole IMV)"] {
+            if !queued.iter().any(|entry| entry == whole) {
+                failures.push(format!("{label}: {whole} not queued: {queued:?}"));
+            }
         }
         for wrong in chain.wrong_nodes(&[]) {
             failures.push(format!("{label}: {wrong}"));
@@ -1640,6 +1657,17 @@ fn sc_settled(oracle: impl Fn() -> Vec<String>) -> Vec<String> {
     failures
 }
 
+/// The IMVs of `names` that do not match their query from `fresh`.
+fn sc_mismatching(names: &[&str], fresh: &dyn Fn(&str) -> String) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            (mismatches != 0).then(|| format!("{name}: {mismatches} mismatches"))
+        })
+        .collect()
+}
+
 fn sx_wrong() -> Vec<String> {
     sc_settled(sx_oracle_mismatches)
 }
@@ -1679,7 +1707,9 @@ fn sx_swap_month(plan: i32, month: i32, rows: &str) -> String {
 struct SxStep {
     label: &'static str,
     statements: String,
-    /// `(node, kind)` refreshes the step must run exactly once each.
+    /// `(node, kind)` refreshes the step must run exactly once each. A node
+    /// that ignores its source is instead queued for its heal and not refreshed
+    /// (1.12.1).
     refreshed: &'static [(&'static str, &'static str)],
     /// A text one of the step's NOTICEs must hold.
     notice: Option<&'static str>,
@@ -1709,7 +1739,7 @@ fn sx_steps() -> Vec<SxStep> {
                 ("y_two_full", "full"),
             ],
             notice: Some(
-                "pg_reflex: 'yd' is refreshed whole, not by partition, after the partition rebuild \
+                "pg_reflex: 'yd_obs' is refreshed whole, not by partition, after the partition rebuild \
                  of 'yv': partition 'yv_ys_def' was created or altered in this transaction and its \
                  bound (DEFAULT) does not list the \"plan\" values its rows held",
             ),
@@ -1750,11 +1780,6 @@ fn sx_steps() -> Vec<SxStep> {
         ),
         SxStep {
             refreshed: &[("yx", "full")],
-            notice: Some(
-                "pg_reflex: 'yx' is refreshed whole, not by partition, after the partition \
-                 rebuild of 'yv': its partition-scoped refresh returned: reconcile_partition: \
-                 no children matched",
-            ),
             ..step(
                 "leaf of a plan the other root has no partition for",
                 sx_swap("ys", "ys_p5", "FOR VALUES IN (5)", "SELECT plan, k, q + 9 FROM ys_p5"),
@@ -1809,7 +1834,6 @@ fn sx_steps() -> Vec<SxStep> {
         ),
         SxStep {
             refreshed: &[("ng", "full")],
-            notice: Some("pg_reflex: 'ng' is refreshed whole, not by partition, after the partition rebuild of 'nv': "),
             ..step(
                 "leaf holding the null key changed",
                 sx_swap("ns", "ns_n", "FOR VALUES IN (NULL, 5)", "SELECT plan, k, q + 3 FROM ns_n"),
@@ -1817,7 +1841,6 @@ fn sx_steps() -> Vec<SxStep> {
         },
         SxStep {
             refreshed: &[("ng2", "full")],
-            notice: Some("holds rows whose \"plan\" is NULL"),
             ..step(
                 "month holding the null key changed",
                 sx_swap(
@@ -1934,6 +1957,10 @@ fn sx_steps() -> Vec<SxStep> {
     ]
 }
 
+fn sx_ignores_a_source(name: &str) -> bool {
+    SX_IMVS.iter().any(|imv| imv.name == name && !imv.ignore.is_empty())
+}
+
 fn sx_assert_shapes_stay_correct(dbname: &str, mode: &str) {
     sx_open(dbname, mode);
     let chain = ScChain { field_names: false, cross_plan: false };
@@ -1949,7 +1976,19 @@ fn sx_assert_shapes_stay_correct(dbname: &str, mode: &str) {
             continue;
         }
         let refreshes = chain.refreshes();
+        let queued = sc_text_rows("SELECT DISTINCT imv_name FROM public.__reflex_heal_pending");
+        for ignoring in SX_IMVS.iter().filter(|imv| !imv.ignore.is_empty()) {
+            if refreshes.iter().any(|(refreshed, _)| refreshed == ignoring.name) {
+                failures.push(format!("{label}: {} ignores its source but was refreshed", ignoring.name));
+            }
+        }
         for (node, kind) in step.refreshed {
+            if sx_ignores_a_source(node) {
+                if !queued.iter().any(|name| name == node) {
+                    failures.push(format!("{label}: {node} not queued for its heal: {queued:?}"));
+                }
+                continue;
+            }
             let kinds: Vec<&str> = refreshes
                 .iter()
                 .filter(|(refreshed, _)| refreshed == node)
@@ -1960,7 +1999,7 @@ fn sx_assert_shapes_stay_correct(dbname: &str, mode: &str) {
             }
         }
         if mode == "IMMEDIATE" {
-            for node in step.once_when_immediate {
+            for node in step.once_when_immediate.iter().filter(|node| !sx_ignores_a_source(node)) {
                 let times = refreshes.iter().filter(|(refreshed, _)| refreshed == node).count();
                 if times != 1 {
                     failures.push(format!("{label}: {node} refreshed {times} times, not once"));
@@ -2131,19 +2170,13 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
             failures.push(format!("{label}: raised {error}"));
             continue;
         }
-        for name in imvs.map(|(name, ..)| name).iter().filter(|name| !write || observing_the_write(name)) {
-            let mismatches = rbc_mismatch(name, &fresh(name));
-            if mismatches != 0 {
-                failures.push(format!(
-                    "{label}: {name}: {mismatches} mismatches; holds {:?}, query {:?}",
-                    sc_text_rows(&format!("SELECT to_jsonb(t)::text AS v FROM {name} t ORDER BY 1")),
-                    sc_text_rows(&format!(
-                        "SELECT to_jsonb(t)::text AS v FROM ({}) t ORDER BY 1",
-                        fresh(name)
-                    )),
-                ));
-                rbc_select(&format!("reflex_reconcile('{name}')"));
-            }
+        let names: Vec<&str> = imvs
+            .map(|(name, ..)| name)
+            .into_iter()
+            .filter(|name| !write || observing_the_write(name))
+            .collect();
+        for wrong in sc_settled(|| sc_mismatching(&names, &fresh)) {
+            failures.push(format!("{label}: {wrong}"));
         }
         if write {
             rbc_select("reflex_reconcile('ign_keyed')");
@@ -2212,10 +2245,8 @@ fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &
             if label == "write to plan 1" && ["zx_ign", "zx_tot"].contains(&name) {
                 continue;
             }
-            let mismatches = rbc_mismatch(name, &fresh(name));
-            if mismatches != 0 {
-                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
-                rbc_select(&format!("reflex_reconcile('{name}')"));
+            for wrong in sc_settled(|| sc_mismatching(&[name], &fresh)) {
+                failures.push(format!("{label}: {wrong}"));
             }
         }
     };
@@ -2295,15 +2326,13 @@ fn sc_run_committed_steps(
     }
     let mut failures = Vec::new();
     let check = |label: &str, skipped: &[&str], failures: &mut Vec<String>| {
-        for (name, ..) in imvs {
-            if skipped.contains(name) {
-                continue;
-            }
-            let mismatches = rbc_mismatch(name, &fresh(name));
-            if mismatches != 0 {
-                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
-                rbc_select(&format!("reflex_reconcile('{name}')"));
-            }
+        let names: Vec<&str> = imvs
+            .iter()
+            .map(|(name, ..)| *name)
+            .filter(|name| !skipped.contains(name))
+            .collect();
+        for wrong in sc_settled(|| sc_mismatching(&names, fresh)) {
+            failures.push(format!("{label}: {wrong}"));
         }
         for name in skipped {
             rbc_select(&format!("reflex_reconcile('{name}')"));
@@ -2681,16 +2710,20 @@ fn sc_assert_swaps_in_two_schemas_do_not_wait_on_each_other(dbname: &str, mode: 
         sc_second_exec("ROLLBACK");
     }
     worker_exec("COMMIT");
-    for schema in ["sa", "sb"] {
-        let v = format!("SELECT s.plan, s.k, s.q FROM {schema}.s AS s");
-        let g = format!("SELECT v.plan, SUM(v.q) AS sq FROM ({v}) AS v GROUP BY v.plan");
-        for (imv, fresh) in [(format!("{schema}.v"), v.clone()), (format!("{schema}.g"), g)] {
-            let wrong = rbc_mismatch(&imv, &fresh);
-            if wrong != 0 {
-                failures.push(format!("{imv}: {wrong} rows differ"));
+    failures.extend(sc_settled(|| {
+        let mut wrong_rows = Vec::new();
+        for schema in ["sa", "sb"] {
+            let v = format!("SELECT s.plan, s.k, s.q FROM {schema}.s AS s");
+            let g = format!("SELECT v.plan, SUM(v.q) AS sq FROM ({v}) AS v GROUP BY v.plan");
+            for (imv, fresh) in [(format!("{schema}.v"), v.clone()), (format!("{schema}.g"), g)] {
+                let wrong = rbc_mismatch(&imv, &fresh);
+                if wrong != 0 {
+                    wrong_rows.push(format!("{imv}: {wrong} rows differ"));
+                }
             }
         }
-    }
+        wrong_rows
+    }));
     let _ = Spi::get_one::<String>("SELECT dblink_disconnect('sc_second')");
     probe_db_close(dbname);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -2708,7 +2741,9 @@ fn v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_deferred() {
 
 /// A plan dropped from the source reaches the readers of an IMV that ignores
 /// the mirroring IMV: they ignore the IMV the catch-up refreshes, so a refresh
-/// of the dropped keys behind its root alone never reaches them.
+/// of the dropped keys behind its root alone never reaches them. Since 1.12.1
+/// the push queues the ignoring IMV, the readers report stale, and the heal
+/// sweep brings every one of them back.
 fn sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan(dbname: &str, mode: &str) {
     let setup = [
         "CREATE TABLE ws (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (plan, k)) \
