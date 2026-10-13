@@ -1949,6 +1949,7 @@ mod tests {
     include!("tests/pg_test_v112_named_relation.rs");
     include!("tests/pg_test_v112_partition_perf.rs");
     include!("tests/pg_test_v112_full_join_scope.rs");
+    include!("tests/pg_test_v1121_heal_own_rebuild.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
