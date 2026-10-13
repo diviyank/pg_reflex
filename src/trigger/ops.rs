@@ -641,27 +641,31 @@ pub(crate) fn outer_join_secondary_stmts(
                 //   target name so the membership subquery's projection matches the
                 //   target columns being filtered (the secondary's join column may
                 //   differ from the IMV output name, e.g. b.a_id projected as "id").
-                let alias_pairs: Vec<String> = mappings
-                    .iter()
-                    .map(|(t, s)| format!("__t.\"{}\" AS \"{}\"", s, t))
-                    .collect();
-                let ap = alias_pairs.join(", ");
+                // A proven FULL JOIN column is read qualified by its transition
+                // table, so a column the source lacks raises instead of binding
+                // to the target's column of that name.
+                let scoped_by_proof = full_join_mappings.is_some();
+                let keys_of = |transition: &str| -> String {
+                    let pairs: Vec<String> = mappings
+                        .iter()
+                        .map(|(t, s)| {
+                            if scoped_by_proof {
+                                format!("\"{transition}\".\"{s}\" AS \"{t}\"")
+                            } else {
+                                format!("\"{s}\" AS \"{t}\"")
+                            }
+                        })
+                        .collect();
+                    format!("SELECT {} FROM \"{transition}\"", pairs.join(", "))
+                };
                 let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
                 let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
                 let mut sides: Vec<String> = Vec::new();
                 if needs_old {
-                    sides.push(format!(
-                        "SELECT {ap} FROM \"{old}\" __t",
-                        ap = ap,
-                        old = old_tbl
-                    ));
+                    sides.push(keys_of(old_tbl));
                 }
                 if needs_new {
-                    sides.push(format!(
-                        "SELECT {ap} FROM \"{new}\" __t",
-                        ap = ap,
-                        new = new_tbl
-                    ));
+                    sides.push(keys_of(new_tbl));
                 }
                 let changed_keys = sides.join(" UNION ");
                 // The membership source is a derived table (a UNION over the
