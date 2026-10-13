@@ -167,3 +167,81 @@ fn v1121_hor_unproven_reader_keeps_its_heal() {
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
     assert_eq!(queued, vec!["hor_two_level:2".to_string()]);
 }
+
+/// Readers of the passthrough the flush's coverage leaves out, with the query
+/// that recomputes each from the base tables.
+const HOR_UNCOVERED_READERS: [(&str, &str, &str, &str); 2] = [
+    (
+        "hor_by_product",
+        "SELECT pr.product, sf.plan, sf.loc, sf.d, sf.quantity \
+         FROM sc_sfv AS sf JOIN hor_prod AS pr ON pr.product = sf.product",
+        "product, plan, loc, d",
+        "'!sc_sfv', ARRAY['product']",
+    ),
+    (
+        "hor_qualified",
+        "SELECT dp.id AS plan, sf.product, sf.loc, sf.d, sf.quantity \
+         FROM public.sc_sfv AS sf JOIN sc_dp AS dp ON dp.id = sf.plan",
+        "plan, product, loc, d",
+        "'!public.sc_sfv', ARRAY['plan']",
+    ),
+];
+
+/// A reader mapping another column than the passthrough's partition column
+/// keeps its heal; so does one the flush's cascade may not recognise as an
+/// ignoring reader (its ignore names the passthrough schema-qualified). Neither
+/// is ever left wrong without being reported stale.
+#[pg_test]
+fn v1121_hor_readers_outside_the_coverage_keep_their_heal() {
+    let chain = ScChain { field_names: false, cross_plan: false };
+    sc_open("reflex_hor_out", "IMMEDIATE", chain);
+    chain.exec(
+        "CREATE TABLE hor_prod (product INT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (product)) \
+         PARTITION BY LIST (product)",
+    );
+    for product in 1..=5 {
+        chain.exec(&format!(
+            "CREATE TABLE hor_prod_{product} PARTITION OF hor_prod FOR VALUES IN ({product})"
+        ));
+    }
+    chain.exec("INSERT INTO hor_prod SELECT p, 'p' || p FROM generate_series(1, 5) p");
+    let mut failures = Vec::new();
+    for (name, query, key, tail) in HOR_UNCOVERED_READERS {
+        chain.create(&format!(
+            "create_reflex_ivm('{name}', {}, '{key}', NULL, 'IMMEDIATE', {tail})",
+            sql_lit(query)
+        ));
+        if worker_scalar_i64(&format!(
+            "SELECT count(*)::int8 FROM public.__reflex_ivm_reference \
+             WHERE name = '{name}' AND aggregations->'ignore_heal_keys' <> '{{}}'::jsonb"
+        )) != 1
+        {
+            failures.push(format!("fixture: {name} maps no ignored source"));
+        }
+    }
+    if let Err(error) =
+        chain.commit(&format!("{}; {SC_FLUSH}", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7))))
+    {
+        failures.push(format!("swap and flush: raised {error}"));
+    }
+    let queued = hor_queued_keys();
+    let stale = hor_stale_imvs();
+    failures.extend(chain.wrong_nodes(&[]));
+    for (name, query, _, _) in HOR_UNCOVERED_READERS {
+        if !queued.iter().any(|row| row.starts_with(&format!("{name}:"))) {
+            failures.push(format!("{name}: no heal queued, {queued:?}"));
+        }
+        let fresh = query
+            .replace("public.sc_sfv AS sf", "sc_sfv AS sf")
+            .replace("sc_sfv AS sf", &format!("({SC_SFV_SQL}) AS sf"));
+        let mismatches = rbc_mismatch(name, &fresh);
+        if mismatches != 0 && !stale.iter().any(|imv| imv == name) {
+            failures.push(format!("{name}: {mismatches} mismatches, not reported stale"));
+        }
+    }
+    if queued.iter().any(|row| row.starts_with("sc_fav__cte_forecast_sales:")) {
+        failures.push(format!("the covered sub-IMV queued a heal: {queued:?}"));
+    }
+    probe_db_close("reflex_hor_out");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -373,7 +373,10 @@ impl HealsCoveredByRebuild {
                 None,
                 &[
                     unsafe {
-                        DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
                     },
                     unsafe {
                         DatumWithOid::new(
