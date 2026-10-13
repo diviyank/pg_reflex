@@ -245,3 +245,76 @@ fn v112_pp_full_join_passthrough_is_refreshed_by_the_values_it_follows_immediate
 fn v112_pp_full_join_passthrough_is_refreshed_by_the_values_it_follows_deferred() {
     pp_full_join_run("pp_fjd", "DEFERRED");
 }
+
+/// An aggregate IMV partitioned by plan, with NULL groups, read by a
+/// passthrough, each statement committed on a private database: a leaf swap
+/// of its source rebuilds its mirror leaf as a diff keyed by its GROUP BY
+/// columns.
+fn pp_group_keyed_run(db: &str, mode: &str) {
+    probe_db_open(db);
+    for ddl in [
+        "CREATE TABLE pp_src (plan INT NOT NULL, d INT NOT NULL, g INT, v INT NOT NULL) PARTITION BY LIST (plan)",
+        "CREATE TABLE pp_src_1 PARTITION OF pp_src FOR VALUES IN (1) PARTITION BY RANGE (d)",
+        "CREATE TABLE pp_src_1_a PARTITION OF pp_src_1 FOR VALUES FROM (1) TO (7)",
+        "CREATE TABLE pp_src_1_b PARTITION OF pp_src_1 FOR VALUES FROM (7) TO (21)",
+        "CREATE TABLE pp_src_2 PARTITION OF pp_src FOR VALUES IN (2) PARTITION BY RANGE (d)",
+        "CREATE TABLE pp_src_2_a PARTITION OF pp_src_2 FOR VALUES FROM (1) TO (21)",
+        "INSERT INTO pp_src SELECT p, d, NULLIF(d % 4, 0), p * d FROM generate_series(1, 2) p, generate_series(1, 12) d",
+    ] {
+        worker_exec(ddl);
+    }
+    let agg = "SELECT plan, g, SUM(v) AS s, COUNT(*) AS c FROM pp_src GROUP BY plan, g";
+    for (name, query, key) in [
+        ("pp_agg", agg, "NULL"),
+        ("pp_reader", "SELECT plan, g, s, c FROM pp_agg", "'plan, g'"),
+    ] {
+        let created = worker_scalar_i64(&format!(
+            "SELECT (create_reflex_ivm('{name}', {}, {key}, NULL, '{mode}', NULL, ARRAY['plan']) \
+               = 'CREATE REFLEX INCREMENTAL VIEW')::int::int8",
+            sql_lit(query)
+        ));
+        assert_eq!(created, 1, "{name}");
+    }
+    assert_eq!(
+        worker_scalar_i64(
+            "SELECT count(*)::int8 FROM pg_index WHERE indrelid = 'pp_agg'::regclass AND indisunique"
+        ),
+        0,
+        "the aggregate's target must have no unique index for its groups to be the diff's key"
+    );
+    for rows in [
+        "SELECT 1, d, NULLIF(d % 4, 0), d + 1 FROM generate_series(7, 12) d",
+        "SELECT 1, d, NULLIF(d % 5, 0), d FROM generate_series(7, 20) d",
+        "SELECT 1, d, NULL, d FROM generate_series(7, 9) d",
+        "SELECT 1, d, d % 3, d FROM generate_series(7, 15) d",
+    ] {
+        worker_exec(&format!(
+            "CREATE TABLE pp_new (LIKE pp_src INCLUDING DEFAULTS); \
+             INSERT INTO pp_new {rows}; \
+             ALTER TABLE pp_src_1 DETACH PARTITION pp_src_1_b; \
+             ALTER TABLE pp_src_1 ATTACH PARTITION pp_new FOR VALUES FROM (7) TO (21); \
+             DROP TABLE pp_src_1_b; ALTER TABLE pp_new RENAME TO pp_src_1_b"
+        ));
+        for (name, fresh) in [
+            ("pp_agg", agg.to_string()),
+            ("pp_reader", format!("SELECT plan, g, s, c FROM ({agg}) x")),
+        ] {
+            let mismatches = worker_scalar_i64(&format!(
+                "SELECT count(*)::int8 FROM ((SELECT plan, g, s, c FROM {name} EXCEPT ALL ({fresh})) \
+                 UNION ALL (({fresh}) EXCEPT ALL SELECT plan, g, s, c FROM {name})) x"
+            ));
+            assert_eq!(mismatches, 0, "{mode} {name} after swapping in <{rows}>");
+        }
+    }
+    probe_db_close(db);
+}
+
+#[pg_test]
+fn v112_pp_aggregate_leaf_rebuilt_as_a_diff_keyed_by_its_groups_immediate() {
+    pp_group_keyed_run("reflex_pp_gki", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_pp_aggregate_leaf_rebuilt_as_a_diff_keyed_by_its_groups_deferred() {
+    pp_group_keyed_run("reflex_pp_gkd", "DEFERRED");
+}
