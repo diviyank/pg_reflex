@@ -912,8 +912,8 @@ pub(crate) fn columns_following(sql_query: &str, source: &str) -> Vec<String> {
 
 fn of_one_type_and_collation(one: &WrittenColumn, other: &WrittenColumn) -> bool {
     Spi::connect(|client| {
-        let one_type = column_type(&client, &one.0, &one.1);
-        one_type.is_some() && one_type == column_type(&client, &other.0, &other.1)
+        let one_type = column_type(client, &one.0, &one.1);
+        one_type.is_some() && one_type == column_type(client, &other.0, &other.1)
     })
 }
 
