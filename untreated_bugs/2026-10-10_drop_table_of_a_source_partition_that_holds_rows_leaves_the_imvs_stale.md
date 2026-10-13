@@ -48,3 +48,16 @@ In `__reflex_on_sql_drop`, queue the partition root of a dropped table that appe
 come from the snapshot, not from the catalog), and let the existing flush handle the `Drop`
 action: the child is gone, so the unpartitioned IMVs take the bound probe or a full reconcile.
 The event trigger is bootstrap DDL and needs its migration twin.
+
+## Later observation (added 2026-10-12)
+
+From the full re-review of 1.12.0, seat R3 (pg16, `0324f47` against `6946400`,
+`full-review-r3-out/*/r3b_pc_imm.txt` in the ledger
+`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/`): the outcome is the same on both
+trees (step 22: all IMVs wrong). It answers one "not established" item above for IMMEDIATE: on
+the 1.12.0 tree **the next partition change of the same source repairs the IMVs that read the
+source directly (step 23), but not the IMVs built on them**. On 1.11.5 that step was not reported
+as repairing anything. The review's advice until this is fixed: retire a partition with `DETACH`
+and `DROP` in one transaction, which is correct for the direct IMVs (their dependents are
+`2026-10-10_detach_partition_leaves_dependents_of_partition_mirroring_imvs_stale.md`). DEFERRED
+and a sub-partitioned branch are still not established.

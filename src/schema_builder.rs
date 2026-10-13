@@ -484,7 +484,7 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 }
 
 /// The suffix a source's statement triggers and their functions carry.
-fn source_trigger_suffix(source_table: &str) -> String {
+pub(crate) fn source_trigger_suffix(source_table: &str) -> String {
     source_table.replace('.', "_").replace('"', "")
 }
 
@@ -1019,6 +1019,59 @@ pub(crate) fn member_register_ddl(fn_name: &str) -> String {
     )
 }
 
+const DEFERRED_FLUSH_FUNCTION_BODY: &str = " \
+         BEGIN \
+           IF NEW.operation = 'TRUNCATE' THEN \
+             DELETE FROM public.__reflex_deferred_pending WHERE id = NEW.id; \
+           END IF; \
+           PERFORM public.reflex_flush_deferred(NEW.source_table); \
+           RETURN NULL; \
+         END; \
+         ";
+
+/// True when the pending table, its flush function and its COMMIT-time trigger
+/// already exist as `build_deferred_flush_ddl` would create them. Creating them
+/// again locks the pending table against every DEFERRED write of the database
+/// until the creating transaction ends.
+pub(crate) fn deferred_flush_is_installed(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    const AFTER_INSERT_FOR_EACH_ROW: i16 = 5;
+    client
+        .select(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_trigger t \
+                 JOIN pg_proc f ON f.oid = t.tgfoid \
+                 JOIN pg_namespace n ON n.oid = f.pronamespace \
+                 JOIN pg_language l ON l.oid = f.prolang \
+                 WHERE t.tgrelid = to_regclass('public.__reflex_deferred_pending') \
+                   AND t.tgname = '__reflex_deferred_flush_trigger' \
+                   AND t.tgconstraint <> 0 AND t.tgdeferrable AND t.tginitdeferred \
+                   AND t.tgenabled = 'O' AND t.tgtype = $2 \
+                   AND n.nspname = 'public' AND f.proname = '__reflex_deferred_flush_fn' \
+                   AND l.lanname = 'plpgsql' AND f.prosrc = $1 \
+                   AND (NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_reflex') \
+                        OR EXISTS (SELECT 1 FROM pg_depend d \
+                                   JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_reflex' \
+                                   WHERE d.deptype = 'e' AND d.objid = f.oid)) \
+             ) AS installed",
+            Some(1),
+            &[
+                unsafe {
+                    pgrx::datum::DatumWithOid::new(
+                        DEFERRED_FLUSH_FUNCTION_BODY.to_string(),
+                        pgrx::pg_sys::TEXTOID,
+                    )
+                },
+                unsafe {
+                    pgrx::datum::DatumWithOid::new(AFTER_INSERT_FOR_EACH_ROW, pgrx::pg_sys::INT2OID)
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("installed").ok().flatten())
+        .unwrap_or(false)
+}
+
 /// Build DDL for the deferred-pending table and its constraint trigger.
 ///
 /// The constraint trigger fires at COMMIT time and processes all accumulated
@@ -1048,16 +1101,10 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
         // A 'TRUNCATE' row is a flush request (reflex_build_truncate_sql): bulk
         // pending deletes keep it, and exactly its own event removes it, so its
         // presence means that event is still queued.
-        "CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
-         BEGIN \
-           IF NEW.operation = 'TRUNCATE' THEN \
-             DELETE FROM public.__reflex_deferred_pending WHERE id = NEW.id; \
-           END IF; \
-           PERFORM public.reflex_flush_deferred(NEW.source_table); \
-           RETURN NULL; \
-         END; \
-         $fn$ LANGUAGE plpgsql"
-            .to_string(),
+        format!(
+            "CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn() RETURNS TRIGGER AS \
+             $fn${DEFERRED_FLUSH_FUNCTION_BODY}$fn$ LANGUAGE plpgsql"
+        ),
         member_register_ddl("__reflex_deferred_flush_fn"),
         // Constraint trigger — fires at COMMIT for any INSERT into the pending table
         "DROP TRIGGER IF EXISTS __reflex_deferred_flush_trigger ON public.__reflex_deferred_pending"

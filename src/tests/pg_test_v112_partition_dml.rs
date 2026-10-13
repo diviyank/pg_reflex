@@ -433,10 +433,10 @@ fn v112_pd_plain_source_keeps_its_four_triggers() {
     }
 }
 
-/// A partition read by its own IMV and, through the root, by another: a write
-/// addressed to the partition reaches both, each once.
+/// A partition of a source is refused as a source of its own, nothing created; a
+/// write addressed to the partition reaches the IMV over the root, once.
 #[pg_test]
-fn v112_pd_partition_that_is_also_a_source_feeds_both_imvs() {
+fn v112_pd_partition_refused_as_a_source_still_feeds_the_root_imv() {
     const ROOT_QUERY: &str = "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM v112_pd_two GROUP BY g";
     const LEAF_QUERY: &str = "SELECT COUNT(*) AS c, SUM(v) AS sv FROM v112_pd_two_a";
     for mode in ["IMMEDIATE", "DEFERRED"] {
@@ -446,7 +446,18 @@ fn v112_pd_partition_that_is_also_a_source_feeds_both_imvs() {
         Spi::run("CREATE TABLE v112_pd_two_d PARTITION OF v112_pd_two DEFAULT").expect("d");
         Spi::run("INSERT INTO v112_pd_two VALUES (1,'a',1),(2,'b',2),(3,'z',3)").expect("seed");
         v112_pd_create("v112_pd_two_root", ROOT_QUERY, mode);
-        v112_pd_create("v112_pd_two_leaf", LEAF_QUERY, mode);
+        let refused = crate::create_reflex_ivm("v112_pd_two_leaf", LEAF_QUERY, None, None, Some(mode), None);
+        assert!(
+            refused.starts_with("ERROR: [reflex-unsupported] a source is a partition")
+                && refused.contains("The partition is v112_pd_two_a, of v112_pd_two."),
+            "{mode}: {refused}"
+        );
+        let left_behind = Spi::get_one::<i64>(
+            "SELECT (SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'v112_pd_two_leaf%') \
+                  + (SELECT count(*) FROM pg_class WHERE relname LIKE '%v112_pd_two_leaf%')",
+        )
+        .expect("left behind");
+        assert_eq!(left_behind, Some(0), "{mode}");
         for statement in [
             "INSERT INTO v112_pd_two_a VALUES (4,'a',4),(5,'b',5)",
             "UPDATE v112_pd_two_a SET v = v + 1 WHERE g = 'a'",
@@ -454,15 +465,9 @@ fn v112_pd_partition_that_is_also_a_source_feeds_both_imvs() {
         ] {
             Spi::run(statement).expect("leaf write");
             Spi::run("SELECT reflex_flush_deferred('v112_pd_two')").expect("flush root");
-            Spi::run("SELECT reflex_flush_deferred('v112_pd_two_a')").expect("flush leaf");
             assert_imv_correct("v112_pd_two_root", ROOT_QUERY);
-            assert_imv_correct("v112_pd_two_leaf", LEAF_QUERY);
         }
         assert_eq!(crate::drop_reflex_ivm("v112_pd_two_root"), "DROP REFLEX INCREMENTAL VIEW");
-        Spi::run("INSERT INTO v112_pd_two_a VALUES (6,'a',6)").expect("leaf write");
-        Spi::run("SELECT reflex_flush_deferred('v112_pd_two_a')").expect("flush leaf");
-        assert_imv_correct("v112_pd_two_leaf", LEAF_QUERY);
-        assert_eq!(crate::drop_reflex_ivm("v112_pd_two_leaf"), "DROP REFLEX INCREMENTAL VIEW");
         Spi::run("DROP TABLE v112_pd_two").expect("drop source");
     }
 }

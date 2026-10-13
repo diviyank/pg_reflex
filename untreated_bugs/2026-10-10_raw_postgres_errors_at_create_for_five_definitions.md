@@ -27,3 +27,17 @@ Expected: a tagged rejection naming the construct and a remedy, or support. The 
 - o06: DISTINCT ON with a function-call expression is rewritten by text and cuts at the `ts`; accept or refuse expression keys.
 - c13: a CTE column list is not applied before the CTE body is rewritten; refuse it with the remedy "rename in the CTE's select list".
 - x68/x69: validate the declared key (exists in the select list, unique in the current data) before creating objects, and return a tagged error.
+
+## Seed rows of the probe (added 2026-10-12, from `full-review-r1-probes.rs` in the ledger)
+
+Copied from the probe source; not re-run as a standalone script. Every failure is at create over
+the seeded tables. Only x68 depends on the rows (the declared key `region` is duplicated in the
+60-row `orders` seed).
+
+```sql
+-- orders: table and 60-row seed as printed in 2026-10-10_select_distinct_expression_alias_is_lost.md
+INSERT INTO domestic_orders SELECT g, (ARRAY['US','EU','ASIA'])[1 + g % 3], g * 10.5 FROM generate_series(1, 15) g;
+INSERT INTO international_orders SELECT g, (ARRAY['EU','ASIA','LATAM',NULL])[1 + g % 4], g * 7.25 FROM generate_series(1, 15) g;
+INSERT INTO measurements SELECT g, TIMESTAMPTZ '2024-01-01 00:00:00+00' + g * INTERVAL '1 hour', g * 1.5, 's' || g % 3
+  FROM generate_series(1, 30) g;
+```

@@ -60,3 +60,12 @@ Key the partition bookkeeping by what `quote_ident` prints (or by OID): `_parent
 function, and existing rows of `__reflex_partition_pending` / the snapshot tables keyed the old
 way. Then remove `partitioned_source_whose_name_needs_quotes` and turn the three `…_is_refused`
 cells into `ok` cells.
+
+## See also (added 2026-10-12)
+
+The cross-schema lock work of 1.12.0 (`p3-c-report.md` R2.9 in the ledger
+`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/`) added
+`public.__reflex_named_relation(TEXT)` and notes, read from the code and not run: a root key
+derived from the catalog is unquoted (`n.nspname || '.' || c.relname`), so a root whose name
+needs quotes folds wrongly in `__reflex_named_relation`. Nothing reaches it today because create
+refuses such a source; lifting this refusal has to fix that key too.

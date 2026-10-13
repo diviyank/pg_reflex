@@ -36,6 +36,13 @@ use crate::trigger::deferred::ScopedRebuildGuard;
 /// `known_stale`, so the condition is reported rather than silently retried.
 pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 
+/// Errors a later flush of the same root can succeed past without any change:
+/// deadlock, serialization failure, lock not available (`lock_timeout`, NOWAIT).
+/// They are recorded and leave the root queued, but never count toward
+/// `PARTITION_FLUSH_FAILURE_CAP`. A cancel or a `statement_timeout` (57014) is
+/// not caught by `EXCEPTION WHEN OTHERS`: it fails the whole call, counting nothing.
+const TRANSIENT_FLUSH_SQLSTATES: &str = "'40P01', '40001', '55P03'";
+
 /// An explicit PostgreSQL subtransaction, the same primitive a plpgsql
 /// `BEGIN … EXCEPTION` block opens.
 ///
@@ -4273,7 +4280,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 .select(
                     "SELECT name, partition_depth, depends_on FROM public.__reflex_ivm_reference \
                      WHERE partition_columns IS NOT NULL AND array_length(partition_columns,1) > 0 \
-                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                       AND public.__reflex_reads_relation(depends_on, $1)",
                     None,
                     &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
                 )
@@ -4561,7 +4568,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     "SELECT name, depends_on FROM public.__reflex_ivm_reference \
                      WHERE enabled = TRUE \
                        AND COALESCE(array_length(partition_columns, 1), 0) = 0 \
-                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                       AND public.__reflex_reads_relation(depends_on, $1)",
                     None,
                     &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
                 )
@@ -4704,11 +4711,11 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                  EXCEPTION WHEN OTHERS THEN \
                    UPDATE public.__reflex_partition_pending \
                       SET last_error = left(SQLERRM, 2000), \
-                          failures   = failures + 1 \
+                          failures   = failures + CASE WHEN SQLSTATE IN ({TRANSIENT_FLUSH_SQLSTATES}) THEN 0 ELSE 1 END \
                     WHERE source_root = '{root_esc}'; \
                    WITH RECURSIVE affected(name) AS ( \
                        SELECT name FROM public.__reflex_ivm_reference \
-                        WHERE depends_on @> ARRAY['{root_esc}'] OR depends_on @> ARRAY[split_part('{root_esc}', '.', 2)] \
+                        WHERE public.__reflex_reads_relation(depends_on, '{root_esc}') \
                      UNION \
                        SELECT unnest(r.graph_child) FROM public.__reflex_ivm_reference r \
                          JOIN affected a ON a.name = r.name) \
@@ -4766,6 +4773,17 @@ pub(crate) struct DrainEntry {
     pub default_level: i32,
 }
 
+/// The DEFAULT partitions in the tree of `$1`, each with its level in that tree.
+/// Read from `pg_partitioned_table.partdefid`, a plain catalog column: a
+/// predicate over `pg_get_expr(relpartbound, oid)` opens every relation the
+/// planner chooses to evaluate it on, including partitions of other trees.
+pub(crate) const TREE_DEFAULT_PARTITIONS_SQL: &str =
+    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q, t.level AS lvl \
+       FROM pg_partition_tree($1) t \
+       JOIN pg_partitioned_table parent ON parent.partdefid = t.relid \
+       JOIN pg_class c ON c.oid = t.relid \
+       JOIN pg_namespace n ON n.oid = c.relnamespace";
+
 /// Phase 1 of the multi-level default drain: for every DEFAULT partition in each
 /// root's tree that holds rows, move those rows into a fresh holding table and
 /// leave the default attached but empty. Emptied defaults let the subsequent
@@ -4776,29 +4794,22 @@ pub(crate) fn drain_tree_defaults(
 ) -> Result<Vec<DrainEntry>, String> {
     let mut entries = Vec::new();
     for root in roots {
-        // `pg_get_expr` opens the relation it reads: evaluated as a filter on
-        // all of pg_class it would wait on a partition another transaction is
-        // swapping in another tree, so it reads the tree's own rows only.
-        let defaults: Vec<(String, i32)> = client
-            .select(
-                "WITH tree AS MATERIALIZED ( \
-                     SELECT c.oid, c.relpartbound, c.relname, c.relnamespace, t.level \
-                       FROM pg_partition_tree($1) t \
-                       JOIN pg_class c ON c.oid = t.relid) \
-                 SELECT quote_ident(n.nspname) || '.' || quote_ident(tree.relname) AS q, tree.level AS lvl \
-                   FROM tree \
-                   JOIN pg_namespace n ON n.oid = tree.relnamespace \
-                  WHERE pg_get_expr(tree.relpartbound, tree.oid) = 'DEFAULT'",
-                None,
-                &[unsafe { DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value()) }],
-            )
-            .map_err(|e| format!("drain: enumerate defaults of {}: {}", root, e))?
-            .filter_map(|r| {
-                let q = r.get_by_name::<&str, _>("q").ok().flatten()?.to_string();
-                let lvl = r.get_by_name::<i32, _>("lvl").ok().flatten().unwrap_or(0);
-                Some((q, lvl))
-            })
-            .collect();
+        let defaults: Vec<(String, i32)> =
+            client
+                .select(
+                    TREE_DEFAULT_PARTITIONS_SQL,
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .map_err(|e| format!("drain: enumerate defaults of {}: {}", root, e))?
+                .filter_map(|r| {
+                    let q = r.get_by_name::<&str, _>("q").ok().flatten()?.to_string();
+                    let lvl = r.get_by_name::<i32, _>("lvl").ok().flatten().unwrap_or(0);
+                    Some((q, lvl))
+                })
+                .collect();
 
         for (default_qual, default_level) in defaults {
             let (schema, bare) = split_qualified_name(&default_qual);
