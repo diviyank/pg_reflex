@@ -1,5 +1,11 @@
 # When a DEFERRED flush fails, only the failing IMV is flagged `known_stale`; the IMVs built on it are wrong and not flagged — S2 (wrong result without a flag)
 
+**Narrowed (fix/v112-swap-cascade-scope, round 5):** a failed *partition* flush (the per-root
+`DO` block of `reflex_flush_partitions_impl`) now flags every IMV reaching the root through
+`graph_child`, recursively (test `v112_sc_repeated_bound_literals_keep_the_tree_*`). What is
+left is the DEFERRED delta flush below (`src/trigger/deferred.rs`) and the clearing of flags set
+on readers.
+
 Pre-existing: identical on `6946400` (1.11.5) and on the 1.12.0 integration branch at `0324f47`.
 Found by review seat R3 of the 1.12.0 full re-review (pg16; `*/r3_commit.txt` steps 14 to 17 under
 `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-out/`).
