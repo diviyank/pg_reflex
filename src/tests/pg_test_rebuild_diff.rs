@@ -420,13 +420,14 @@ fn pg_rbd_keyed_duplicate_key_rebuild_raises() {
 }
 
 /// An invalid unique index (e.g. a failed CREATE UNIQUE INDEX CONCURRENTLY)
-/// guarantees nothing, so it must not be used as the diff key.
+/// guarantees nothing, so it must not be used as the diff key. The IMV is a
+/// keyless passthrough: nothing but that index could name a key.
 #[pg_test]
 fn pg_rbd_invalid_unique_index_is_not_a_key() {
-    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbi_rel GROUP BY product_id, location_id";
-    Spi::run("CREATE TABLE rbi_rel (product_id INT NOT NULL, location_id INT NOT NULL)")
+    let up_sql = "SELECT product_id, location_id, n FROM rbi_rel";
+    Spi::run("CREATE TABLE rbi_rel (product_id INT NOT NULL, location_id INT NOT NULL, n INT NOT NULL)")
         .expect("rel");
-    Spi::run("INSERT INTO rbi_rel VALUES (1,1),(1,1),(2,2)").expect("seed");
+    Spi::run("INSERT INTO rbi_rel VALUES (1,1,2),(2,2,1)").expect("seed");
     assert_eq!(
         crate::create_reflex_ivm("rbi_up", up_sql, None, None, None, None),
         "CREATE REFLEX INCREMENTAL VIEW"
@@ -460,6 +461,57 @@ fn pg_rbd_invalid_unique_index_is_not_a_key() {
         seen.as_deref(),
         Some("DELETE:2,INSERT:2"),
         "an invalid unique index was used as the diff key"
+    );
+}
+
+/// An aggregate target holds one row per group, so an invalid unique index on
+/// it does not stop the diff from being keyed: the GROUP BY columns are the
+/// key, and its reader receives the changed group as an UPDATE.
+#[pg_test]
+fn pg_rbd_aggregate_with_an_invalid_unique_index_is_diffed_by_its_groups() {
+    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbg_rel GROUP BY product_id, location_id";
+    let reader_sql = "SELECT product_id, location_id, n FROM rbg_up";
+    Spi::run("CREATE TABLE rbg_rel (product_id INT NOT NULL, location_id INT NOT NULL)")
+        .expect("rel");
+    Spi::run("INSERT INTO rbg_rel VALUES (1,1),(1,1),(2,2)").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rbg_up", up_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm("rbg_reader", reader_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run(
+        "CREATE UNIQUE INDEX rbg_up_key ON rbg_up (product_id, location_id) NULLS NOT DISTINCT",
+    )
+    .expect("key");
+    Spi::run("UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = 'rbg_up_key'::regclass")
+        .expect("invalidate");
+    Spi::run("CREATE TABLE rbg_seen (op TEXT, product_id INT)").expect("seen");
+    Spi::run(
+        "CREATE FUNCTION rbg_record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO rbg_seen VALUES (TG_OP, COALESCE(NEW.product_id, OLD.product_id)); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER rbg_record_seen AFTER INSERT OR UPDATE OR DELETE ON rbg_up \
+         FOR EACH ROW EXECUTE FUNCTION rbg_record_seen()",
+    )
+    .expect("trigger");
+    Spi::run("UPDATE rbg_up SET n = n + 5 WHERE product_id = 2").expect("drift");
+    Spi::run("TRUNCATE rbg_seen").expect("reset");
+    assert_eq!(rbd_rebuild("rbg_up", up_sql), "DIFFED");
+    assert_imv_correct("rbg_up", up_sql);
+    assert_imv_correct("rbg_reader", "SELECT product_id, location_id, COUNT(*) AS n FROM rbg_rel GROUP BY product_id, location_id");
+    let seen = Spi::get_one::<String>(
+        "SELECT string_agg(op || ':' || product_id, ',' ORDER BY op, product_id) FROM rbg_seen",
+    )
+    .unwrap();
+    assert_eq!(
+        seen.as_deref(),
+        Some("UPDATE:2"),
+        "the aggregate was not diffed by its GROUP BY columns"
     );
 }
 
