@@ -1102,7 +1102,20 @@ fn reconcile_node_then_dependents(
         cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans, all_leaves_diffed);
     }
     if !own.starts_with("ERROR") && !is_partitioned_imv(view_name) {
-        for dep in ignoring_dependents(view_name) {
+        let ignoring = ignoring_dependents(view_name);
+        if crate::heal::push_rebuild_in_progress() {
+            Spi::connect_mut(|client| {
+                crate::heal::queue_heals(
+                    client,
+                    view_name,
+                    None,
+                    &ignoring,
+                    &Err("rebuilt whole".to_string()),
+                )
+            });
+            return own;
+        }
+        for dep in ignoring {
             if crate::cascade::queue_whole_refresh(&dep, view_name) {
                 continue;
             }
@@ -1114,6 +1127,7 @@ fn reconcile_node_then_dependents(
                     dep,
                     result
                 );
+                crate::cascade::flag_stale_after_failed_refresh(&dep, view_name, result);
             }
         }
     }
@@ -1203,6 +1217,24 @@ fn cascade_partitioned_rebuild_to_dependents(
     } else {
         dependents
     };
+    let dependents = if !dependents.is_empty() && crate::heal::push_rebuild_in_progress() {
+        let ignoring = ignoring_dependents(view_name);
+        Spi::connect_mut(|client| {
+            crate::heal::queue_heals(
+                client,
+                view_name,
+                None,
+                &ignoring,
+                &Err("rebuilt whole".to_string()),
+            )
+        });
+        dependents
+            .into_iter()
+            .filter(|dep| !ignoring.contains(dep))
+            .collect()
+    } else {
+        dependents
+    };
 
     for dep in &dependents {
         if crate::cascade::queue_whole_refresh(dep, view_name) {
@@ -1219,6 +1251,7 @@ fn cascade_partitioned_rebuild_to_dependents(
                 result,
                 dep
             );
+            crate::cascade::flag_stale_after_failed_refresh(dep, view_name, result);
         }
     }
 }

@@ -319,6 +319,229 @@ pub(crate) fn install_heal_triggers(
     installed
 }
 
+/// The queue key of a heal of a whole IMV: a rebuild by `reflex_reconcile`. Any
+/// queue row of an IMV carrying it makes the heal rebuild the whole IMV, so a
+/// genuine partition key spelled the same way only widens its heal.
+pub(crate) const WHOLE_IMV_HEAL_KEY: &str = "(whole IMV)";
+
+/// Set (`SET LOCAL`) by the partition flush around the statements of one source
+/// root: the rebuilds it runs follow a change of the source's partitions, and
+/// the IMVs ignoring a rebuilt IMV are then queued for their heal, not refreshed.
+pub(crate) const PUSH_REBUILD_GUC: &str = "pg_reflex.push_rebuild";
+
+pub(crate) fn push_rebuild_in_progress() -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(current_setting('{PUSH_REBUILD_GUC}', true), '') = 'on'"
+    ))
+    .unwrap_or(Some(false))
+    .unwrap_or(false)
+}
+
+/// The statement that queues the heal of `reader`, an IMV ignoring `rebuilt`,
+/// after rows of `rebuilt` whose first partition column (`partition_column`)
+/// holds one of `keys` were rebuilt: those keys when the reader's heal maps that
+/// very column, else its whole rebuild. No key is narrower than the change, and
+/// a reader that cannot be scoped is rebuilt whole.
+pub(crate) fn heal_queue_statement(
+    client: &pgrx::spi::SpiClient<'_>,
+    rebuilt: &str,
+    partition_column: Option<&str>,
+    reader: &str,
+    keys: &Result<Vec<String>, String>,
+) -> String {
+    let literal = crate::partition::sql_literal_text;
+    let keyed = match (partition_column, keys) {
+        (Some(column), Ok(keys)) if !keys.is_empty() => client
+            .select(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM public.__reflex_ivm_reference r \
+                      CROSS JOIN LATERAL jsonb_each( \
+                            COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k \
+                      WHERE r.name = $1 \
+                        AND COALESCE(array_length(r.partition_columns, 1), 0) > 0 \
+                        AND to_regclass(k.value->>'relation') = to_regclass($2) \
+                        AND k.value->>'source_column' = $3) AS keyed",
+                Some(1),
+                &[
+                    unsafe {
+                        DatumWithOid::new(reader.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(rebuilt.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(column.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .ok()
+            .and_then(|mut rows| rows.next())
+            .and_then(|row| row.get_by_name::<bool, _>("keyed").ok().flatten())
+            .unwrap_or(false)
+            .then_some(keys.clone()),
+        _ => None,
+    };
+    let keys = keyed.unwrap_or_else(|| vec![WHOLE_IMV_HEAL_KEY.to_string()]);
+    format!(
+        "INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) \
+         SELECT {reader}, k, {rebuilt} FROM unnest(ARRAY[{keys}]::text[]) AS k \
+         ON CONFLICT (imv_name, partition_key) DO UPDATE \
+         SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL",
+        reader = literal(reader),
+        rebuilt = literal(rebuilt),
+        keys = keys
+            .iter()
+            .map(|k| literal(k))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Queue the heals of `readers`, IMVs ignoring `rebuilt`, after a rebuild of
+/// `rebuilt` (see [`heal_queue_statement`]).
+pub(crate) fn queue_heals(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    rebuilt: &str,
+    partition_column: Option<&str>,
+    readers: &[String],
+    keys: &Result<Vec<String>, String>,
+) {
+    for reader in readers {
+        let statement = heal_queue_statement(client, rebuilt, partition_column, reader, keys);
+        client
+            .update(&statement, None, &[])
+            .unwrap_or_else(|e| pgrx::error!("pg_reflex: queue the heal of '{reader}': {e}"));
+    }
+}
+
+/// A keyed heal of `imv` found no partition left for `keys` (its pre-sync
+/// dropped them, with their rows): the IMVs ignoring `imv` saw none of those
+/// rows leave, so they are queued in turn, for the next pass of the sweep.
+fn queue_heals_of_ignoring_readers_of_gone_partitions(imv: &str, keys: &[String]) {
+    let readers = crate::reconcile::ignoring_dependents(imv);
+    if readers.is_empty() {
+        return;
+    }
+    let partition_column = Spi::get_one_with_args::<String>(
+        "SELECT partition_columns[1] FROM public.__reflex_ivm_reference WHERE name = $1",
+        &[unsafe { DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+    )
+    .unwrap_or(None);
+    Spi::connect_mut(|client| {
+        queue_heals(
+            client,
+            imv,
+            partition_column.as_deref(),
+            &readers,
+            &Ok(keys.to_vec()),
+        )
+    });
+}
+
+const COVERED_BY_REBUILD_GUC: &str = "pg_reflex.heal_covered_by_rebuild";
+
+/// Tells the heal trigger, until [`HealsCoveredByRebuild::end`], that writes to
+/// `view_name` are pg_reflex's rebuild of some of its partitions, after which
+/// that rebuild refreshes `refreshed_readers` on every key of the rebuilt
+/// partitions (the dependent cascade, `crate::cascade`). A heal queued for such a
+/// write would rebuild again what the cascade just rebuilt.
+///
+/// With `queued_directly` (the partition flush), the rebuild queues every one of
+/// `refreshed_readers` for its heal itself, on the keys of the rebuilt partitions
+/// or whole, so the trigger has nothing to add for them. Otherwise only the
+/// readers whose heal the refresh provably subsumes are named: a heal queues the
+/// values of the reader's mapped column in the changed rows, so that column must
+/// be `view_name`'s first partition column (every changed row lies in a rebuilt
+/// partition, whose keys the cascade refreshes), and the reader must have that
+/// single partition level (a refresh of its partitions by the rebuilt ones then
+/// still spans each whole key). Any other reader keeps its heal.
+pub(crate) struct HealsCoveredByRebuild {
+    previous: String,
+}
+
+impl HealsCoveredByRebuild {
+    /// `None` when the rebuild covers no reader: the setting is left as it is.
+    pub(crate) fn begin(
+        client: &mut pgrx::spi::SpiClient<'_>,
+        view_name: &str,
+        partition_column: &str,
+        refreshed_readers: &[String],
+        queued_directly: bool,
+    ) -> Option<Self> {
+        let (previous, covered) = client
+            .select(
+                &format!(
+                    "SELECT COALESCE(current_setting('{COVERED_BY_REBUILD_GUC}', true), '') AS previous, \
+                            (SELECT jsonb_build_object('relid', to_regclass($1)::oid, \
+                                                       'imvs', jsonb_agg(DISTINCT r.name))::text \
+                               FROM public.__reflex_ivm_reference r \
+                              CROSS JOIN LATERAL jsonb_each( \
+                                    COALESCE(r.aggregations->'ignore_heal_keys', '{{}}'::jsonb)) k \
+                              WHERE COALESCE(r.enabled, TRUE) \
+                                AND r.name = ANY($3::text[]) \
+                                AND to_regclass(k.value->>'relation') = to_regclass($1) \
+                                AND ($4 OR (array_length(r.partition_columns, 1) = 1 \
+                                            AND k.value->>'source_column' = $2)) \
+                             HAVING count(*) > 0) AS covered"
+                ),
+                Some(1),
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            partition_column.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            refreshed_readers.to_vec(),
+                            PgBuiltInOids::TEXTARRAYOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(queued_directly, PgBuiltInOids::BOOLOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage of '{view_name}': {e}"))
+            .next()
+            .map(|row| {
+                (
+                    row.get_by_name::<String, _>("previous")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    row.get_by_name::<String, _>("covered").ok().flatten(),
+                )
+            })?;
+        let covered = covered?;
+        set_heal_coverage(client, &covered);
+        Some(HealsCoveredByRebuild { previous })
+    }
+
+    pub(crate) fn end(self, client: &mut pgrx::spi::SpiClient<'_>) {
+        set_heal_coverage(client, &self.previous);
+    }
+}
+
+fn set_heal_coverage(client: &mut pgrx::spi::SpiClient<'_>, value: &str) {
+    client
+        .update(
+            &format!("SELECT set_config('{COVERED_BY_REBUILD_GUC}', $1, true)"),
+            None,
+            &[unsafe {
+                DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage: {e}"));
+}
+
 /// One heal attempt: the IMV, what the partition reconcile returned, and how long
 /// it took.
 pub(crate) struct HealResult {
@@ -348,7 +571,85 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
     if !heal_table_exists {
         return Vec::new();
     }
-    let batches: Vec<HealBatch> = Spi::connect(|client| {
+    let names = imv.map(imv_and_everything_it_reads);
+    let mut attempted: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut heals = Vec::new();
+    // A heal can queue further heals (the ignoring readers of a partition it
+    // found gone), drained by the next pass; a row is attempted once per call.
+    for _ in 0..MAX_HEAL_PASSES {
+        let batches: Vec<HealBatch> = queued_batches(names.as_deref(), target_schema)
+            .into_iter()
+            .filter_map(|mut batch| {
+                let fresh: Vec<(String, String)> = batch
+                    .keys
+                    .iter()
+                    .cloned()
+                    .zip(batch.stamps.iter().cloned())
+                    .filter(|(key, stamp)| {
+                        !attempted.contains(&(batch.imv.clone(), key.clone(), stamp.clone()))
+                    })
+                    .collect();
+                if fresh.is_empty() {
+                    return None;
+                }
+                (batch.keys, batch.stamps) = fresh.into_iter().unzip();
+                Some(batch)
+            })
+            .collect();
+        if batches.is_empty() {
+            break;
+        }
+        for batch in batches {
+            for (key, stamp) in batch.keys.iter().zip(&batch.stamps) {
+                attempted.insert((batch.imv.clone(), key.clone(), stamp.clone()));
+            }
+            heals.push(heal_batch(batch));
+        }
+    }
+    heals
+}
+
+const MAX_HEAL_PASSES: usize = 32;
+
+/// The registered IMV `imv` names (bare or schema-qualified) and every IMV it
+/// reads, transitively: its generated sub-IMVs (the application knows only the
+/// IMV it created) and the IMVs upstream of it, whose queued heals it depends
+/// on. Healing all of them, shallowest first, leaves `imv` matching its query.
+fn imv_and_everything_it_reads(imv: &str) -> Vec<String> {
+    Spi::connect(|client| {
+        client
+            .select(
+                "WITH RECURSIVE upstream AS ( \
+                     SELECT r.name FROM public.__reflex_ivm_reference r \
+                      WHERE r.name = $1 \
+                         OR to_regclass(r.name) = to_regclass($1) \
+                   UNION \
+                     SELECT r.name FROM upstream u \
+                       JOIN public.__reflex_ivm_reference d ON d.name = u.name \
+                       JOIN public.__reflex_ivm_reference r \
+                         ON u.name = ANY(COALESCE(r.graph_child, ARRAY[]::text[])) \
+                         OR r.name = ANY(COALESCE(d.depends_on_imv, ARRAY[]::text[])) \
+                         OR d.depends_on && ARRAY[r.name, split_part(r.name, '.', 2), \
+                                                  'public.' || r.name]) \
+                 SELECT name FROM upstream",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map(|rows| {
+                rows.filter_map(|row| row.get_by_name::<String, _>("name").ok().flatten())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Every IMV's queue rows, shallowest IMV first, so that a node is healed
+/// before the nodes built on it.
+fn queued_batches(names: Option<&[String]>, target_schema: &str) -> Vec<HealBatch> {
+    Spi::connect(|client| {
         client
             .select(
                 "SELECT p.imv_name, \
@@ -361,7 +662,7 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
                    FROM public.__reflex_heal_pending p \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.name = p.imv_name AND COALESCE(r.enabled, TRUE) \
-                  WHERE ($1::text IS NULL OR p.imv_name = $1) \
+                  WHERE ($1::text[] IS NULL OR p.imv_name = ANY($1)) \
                     AND ($2 = '' OR COALESCE(r.target_schema, 'public') = $2) \
                   GROUP BY p.imv_name, r.graph_depth, r.partition_columns \
                   ORDER BY r.graph_depth NULLS FIRST, p.imv_name",
@@ -369,8 +670,8 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
                 &[
                     unsafe {
                         DatumWithOid::new(
-                            imv.map(str::to_string),
-                            PgBuiltInOids::TEXTOID.oid().value(),
+                            names.map(<[String]>::to_vec),
+                            PgBuiltInOids::TEXTARRAYOID.oid().value(),
                         )
                     },
                     unsafe {
@@ -393,9 +694,7 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
                 .collect()
             })
             .unwrap_or_default()
-    });
-
-    batches.into_iter().map(heal_batch).collect()
+    })
 }
 
 /// One IMV's queue rows as read before its heal.
@@ -409,6 +708,17 @@ struct HealBatch {
 
 fn heal_batch(batch: HealBatch) -> HealResult {
     let started = std::time::Instant::now();
+    if batch.keys.iter().any(|key| key == WHOLE_IMV_HEAL_KEY) {
+        let result =
+            rebuild_isolated(|| crate::reconcile::reflex_reconcile(&batch.imv).to_string());
+        let heal = HealResult {
+            imv: batch.imv,
+            result,
+            ms: started.elapsed().as_millis() as i64,
+        };
+        record_heal_outcome(&heal, batch.keys, batch.stamps);
+        return heal;
+    }
     let (holdable, unholdable): (Vec<_>, Vec<_>) = batch
         .keys
         .into_iter()
@@ -433,7 +743,14 @@ fn heal_batch(batch: HealBatch) -> HealResult {
             ms: started.elapsed().as_millis() as i64,
         };
     }
-    let result = reconcile_keys_isolated(&batch.imv, &keys);
+    let result = rebuild_isolated(|| {
+        let result =
+            crate::partition::reflex_reconcile_partition_impl(&batch.imv, &keys, "", false);
+        if result.starts_with("reconcile_partition: no children matched") {
+            queue_heals_of_ignoring_readers_of_gone_partitions(&batch.imv, &keys);
+        }
+        result
+    });
     let heal = HealResult {
         imv: batch.imv,
         result,
@@ -457,15 +774,15 @@ fn partition_type_can_hold(key_type: Option<&str>, key: &str) -> bool {
         .is_ok_and(|value| bounds.contains(&value))
 }
 
-/// Rebuild `keys` of `imv` in a subtransaction. A PostgreSQL error raised inside
+/// Run one heal's rebuild in a subtransaction. A PostgreSQL error raised inside
 /// (a key the partition column cannot parse, say) rolls back only this heal and
 /// comes back as an `ERROR:` string, so one bad IMV cannot abort the sweep and its
 /// failure is recorded like any other. A query cancel or shutdown is re-raised: it
 /// is the caller stopping the sweep, not a failed heal.
-fn reconcile_keys_isolated(imv: &str, keys: &[String]) -> String {
+fn rebuild_isolated(rebuild: impl FnOnce() -> String + std::panic::UnwindSafe) -> String {
     pgrx::PgTryBuilder::new(|| {
         let subxact = crate::partition::SubTransaction::begin();
-        let result = crate::partition::reflex_reconcile_partition_impl(imv, keys, "", false);
+        let result = rebuild();
         subxact.release();
         result
     })
@@ -681,6 +998,29 @@ pub(crate) fn unhealable_reasons_by_imv() -> BTreeMap<String, String> {
     })
 }
 
+/// The IMV the application created that `imv` belongs to: `imv` itself, or for
+/// a generated sub-IMV the first IMV up its chain of readers that is not one.
+fn top_level_imv(client: &pgrx::spi::SpiClient<'_>, imv: &str) -> String {
+    client
+        .select(
+            "WITH RECURSIVE up(name, generated, depth) AS ( \
+                 SELECT r.name, COALESCE(r.is_generated_sub_imv, FALSE), 0 \
+                   FROM public.__reflex_ivm_reference r WHERE r.name = $1 \
+                 UNION \
+                 SELECT p.name, COALESCE(p.is_generated_sub_imv, FALSE), up.depth + 1 \
+                   FROM up JOIN public.__reflex_ivm_reference p \
+                     ON COALESCE(p.depends_on_imv, ARRAY[]::text[]) @> ARRAY[up.name] \
+                  WHERE up.generated AND up.depth < 32) \
+             SELECT name FROM up WHERE NOT generated ORDER BY depth, name LIMIT 1",
+            Some(1),
+            &[unsafe { DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<String, _>("name").ok().flatten())
+        .unwrap_or_else(|| imv.to_string())
+}
+
 /// Stale reasons for every IMV with queued heals or an ignored source it can no
 /// longer heal from, and every IMV reading one, transitively: a downstream IMV
 /// is exactly as wrong as the slice it reads.
@@ -689,7 +1029,13 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
         .iter()
         .map(|(imv, heal)| (imv.clone(), heal.stale_reason(imv)))
         .collect();
-    for (imv, reason) in unhealable_reasons_by_imv() {
+    let unhealable = unhealable_reasons_by_imv();
+    let healed_by_the_sweep: Vec<String> = reasons
+        .keys()
+        .filter(|imv| !unhealable.contains_key(*imv))
+        .cloned()
+        .collect();
+    for (imv, reason) in unhealable {
         reasons
             .entry(imv)
             .and_modify(|existing| {
@@ -707,32 +1053,56 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
             "WITH RECURSIVE reach(name, origin, depth) AS ( \
                  SELECT r.name, o.origin, 1 \
                    FROM unnest($1::text[]) AS o(origin) \
+                   JOIN public.__reflex_ivm_reference src ON src.name = o.origin \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[o.origin, split_part(o.origin, '.', 2), 'public.' || o.origin] \
+                     OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                  UNION \
                  SELECT r.name, x.origin, x.depth + 1 \
                    FROM reach x \
+                   JOIN public.__reflex_ivm_reference src ON src.name = x.name \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[x.name, split_part(x.name, '.', 2), 'public.' || x.name] \
+                     OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                   WHERE x.depth < 32 \
              ) \
-             SELECT DISTINCT ON (name) name, origin FROM reach ORDER BY name, depth, origin",
+             SELECT DISTINCT name, origin, depth FROM reach ORDER BY name, depth, origin",
             None,
             &[unsafe { DatumWithOid::new(origins, PgBuiltInOids::TEXTARRAYOID.oid().value()) }],
         ) else {
             return;
         };
-        for row in rows {
-            let name = row.get_by_name::<String, _>("name").ok().flatten();
-            let origin = row.get_by_name::<String, _>("origin").ok().flatten();
-            if let (Some(name), Some(origin)) = (name, origin) {
-                reasons.entry(name).or_insert_with(|| {
-                    format!(
-                        "reads IMV '{origin}', which is known stale after one of its ignored \
-                         sources changed; repair '{origin}' first (see its stale_reason)."
-                    )
-                });
+        let reached: Vec<(String, String)> = rows
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("name").ok().flatten()?,
+                    row.get_by_name::<String, _>("origin").ok().flatten()?,
+                ))
+            })
+            .collect();
+        let mut origins_by_reader: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, origin) in reached {
+            if !reasons.contains_key(&name) {
+                origins_by_reader.entry(name).or_default().push(origin);
             }
+        }
+        for (name, origins) in origins_by_reader {
+            let needs_repair = origins
+                .iter()
+                .find(|origin| !healed_by_the_sweep.contains(origin));
+            let reason = match needs_repair {
+                Some(origin) => format!(
+                    "reads IMV '{origin}', which is known stale after one of its ignored \
+                     sources changed; repair '{origin}' first (see its stale_reason)."
+                ),
+                None => format!(
+                    "reads IMV '{}', which is known stale after one of its ignored \
+                     sources changed. Run SELECT reflex_heal_ignored_sources('{}');",
+                    origins[0],
+                    top_level_imv(client, &name).replace('\'', "''")
+                ),
+            };
+            reasons.insert(name, reason);
         }
     });
     reasons
