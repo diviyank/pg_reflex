@@ -2,6 +2,85 @@
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-10-13
+
+A performance release for partition swaps of a source read by a chain of
+IMVs. A push that swaps leaves of a partitioned source no longer refreshes,
+at COMMIT, the IMVs that list the rebuilt partition-mirroring IMV in their
+`ignored_sources`: their affected partitions are queued as stale and are
+rebuilt by `reflex_heal_ignored_sources`, `reflex_scheduled_reconcile` or
+`reflex_doctor(fix => TRUE)`, as `ignore_sources` documents. A FULL JOIN
+passthrough refreshes only the rows of the join keys that changed, and an
+aggregate IMV without a unique index is diffed by its groups.
+`ALTER EXTENSION pg_reflex UPDATE TO '1.12.1';`
+
+---
+
+### Changed
+
+- **A partition swap honours `ignored_sources`.** When the partition flush
+  rebuilds a partition-mirroring IMV because partitions of its source were
+  attached, detached, dropped or swapped, the IMVs that ignore the rebuilt
+  IMV are no longer refreshed in that COMMIT (1.11.5 and 1.12.0 refreshed
+  them, which put the whole chain's cost on the COMMIT). Their affected
+  partitions, the keys before and after the rebuild and those of dropped
+  partitions, are queued in `__reflex_heal_pending`; an IMV with no heal
+  mapping onto the rebuilt IMV's partition column is queued whole.
+  `reflex_ivm_status` reports every IMV made wrong by the queue as
+  `known_stale`, including the parent and sibling sub-IMVs of a generated
+  CTE sub-IMV and every IMV reading one, with the remedy
+  `SELECT reflex_heal_ignored_sources('<imv>');`. A named heal also heals
+  the queued IMVs the named IMV reads and its generated sub-IMVs, deepest
+  first. Explicit `reflex_reconcile`, `reflex_reconcile_partition` and
+  `reflex_rebuild_imv` calls still refresh the ignoring IMVs. In DEFERRED
+  mode, a user write to the source in the same transaction as a swap
+  rebuilds the IMV whole, which still refreshes them.
+  On a field-shaped chain with 100 k-row leaves (PostgreSQL 16, assertion
+  build): one leaf swapped commits in 2.9 s instead of 25.2 s, ten leaves
+  in 26.6 s instead of 133.9 s (12.1 → 2.6 s per leaf). The work moves to
+  the heal rather than going away: the heal then takes 18.5 s and 58.2 s,
+  so COMMIT plus heal is about what 1.12.0 spent in the COMMIT alone.
+- **A FULL JOIN passthrough refreshes only the changed join keys.** A write
+  to either side used to rebuild the whole IMV. The rebuild is now limited
+  to rows whose `COALESCE`d output columns hold the changed values, old and
+  new, when the alignment proof accepts the pair: both columns of one type,
+  type modifier and collation, every source read once, later joins LEFT.
+  Otherwise the whole rebuild stays.
+- **An aggregate IMV without a unique index is diffed by its groups.** A
+  rebuild compared whole rows; it now matches rows on the GROUP BY columns
+  when neither the new rows nor the target repeat a group, and falls back to
+  the whole-row comparison otherwise.
+- The ignored-source heal trigger no longer compares whole transition
+  tables for the readers the partition flush queued directly.
+
+### Fixed
+
+- A dependent whose refresh after a rebuild returns an error is flagged
+  `known_stale` with the remedy `SELECT reflex_reconcile('<imv>');`; it was
+  left with a WARNING only.
+
+### Tests
+
+- `pg_test_v112_full_join_scope.rs`, `pg_test_v112_partition_perf.rs`,
+  `pg_test_v1121_heal_own_rebuild.rs`, and new cases in
+  `pg_test_rebuild_diff.rs`. The swap-cascade tests that required the
+  ignoring IMVs to be right at COMMIT now require them to be reported stale,
+  and right after the heal. `pg_rbd_invalid_unique_index_is_not_a_key` runs
+  on a passthrough (an aggregate is now diffed by its groups); its
+  assertions are unchanged.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.1';` replaces
+  `public.__reflex_heal_on_ignored_change()`, byte-identical to the
+  bootstrap text. No registry column, table, index, trigger, event trigger
+  or function signature changes.
+- Applications that need the IMVs ignoring a rebuilt IMV to be fresh after a
+  push call `reflex_heal_ignored_sources('<imv>')` for them (base-db 6.7.7
+  `refresh-views` does).
+
+---
+
 ## [1.12.0] - 2026-10-13
 
 A correctness release for what `create_reflex_ivm` accepts and for how an

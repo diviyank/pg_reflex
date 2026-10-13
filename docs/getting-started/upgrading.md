@@ -196,6 +196,22 @@ into them, so on a large IMV the `COMMIT` can take minutes.
   rebuilds an IMV with dependents (also via `reflex_reconcile`) cannot be
   prepared with `PREPARE TRANSACTION`.
 
+## Upgrading to 1.12.1
+
+```sql
+ALTER EXTENSION pg_reflex UPDATE TO '1.12.1';
+```
+
+The migration replaces `__reflex_heal_on_ignored_change()` only. No IMV needs to be recreated.
+
+**Behaviour change: a partition swap no longer refreshes the IMVs that ignore the rebuilt IMV.** On 1.11.5 and 1.12.0, when a push attached, detached, dropped or swapped partitions of a source, the COMMIT rebuilt the partition-mirroring IMV and then refreshed every IMV listing it in `ignored_sources`. On 1.12.1 those IMVs are queued in `__reflex_heal_pending` and reported `known_stale` by `reflex_ivm_status` until a heal runs:
+
+```sql
+SELECT reflex_heal_ignored_sources('<schema>.<imv>');  -- or reflex_scheduled_reconcile(...)
+```
+
+Applications that read such an IMV right after a push must run the heal first; base-db 6.7.7 `refresh-views` does it for every IMV it refreshes. Explicit `reflex_reconcile`, `reflex_reconcile_partition` and `reflex_rebuild_imv` calls still refresh the ignoring IMVs.
+
 ## Upgrading to 1.12.0
 
 **Recreate every IMV after the update.** Three things an IMV is built from
