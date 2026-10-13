@@ -484,8 +484,10 @@ fn scope_of(
 /// without reaching it (a dropped partition, read by an IMV that ignores
 /// `rebuilt`): a refresh of the keys they held when its query proves those keys
 /// are its own, else a whole refresh. A keyed refresh that does not report
-/// success, or that names no partition of `dependent`'s left (its partition of
-/// those keys went with them), falls back to the whole one.
+/// success falls back to the whole one. One that finds no partition of
+/// `dependent` for those keys left (its pre-sync dropped it, its query filling
+/// none) leaves `dependent` right but its own ignoring readers behind: they are
+/// caught up on the same keys in turn.
 pub(crate) fn catch_up_statement(
     client: &pgrx::spi::SpiClient<'_>,
     dependent: &str,
@@ -500,16 +502,35 @@ pub(crate) fn catch_up_statement(
         RefreshScope::Partitions {
             source_partitions,
             keys,
-        } if source_partitions.is_empty() && !keys.is_empty() => format!(
-            "IF (SELECT r NOT LIKE 'RECONCILED%' AND r <> {queued} \
-                        AND r NOT LIKE 'reconcile_partition: no children matched%' \
-                   FROM public.reflex_reconcile_partition({dependent}, {keys}) AS r) THEN \
-               {whole}; \
-             END IF",
-            queued = literal(crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT),
-            dependent = literal(dependent),
-            keys = literal(&keys.into_iter().collect::<Vec<_>>().join(",")),
-        ),
+        } if source_partitions.is_empty() && !keys.is_empty() => {
+            let keys: Vec<String> = keys.into_iter().collect();
+            let dependent_rows = RebuiltRows {
+                view_name: dependent,
+                partition_columns: &shape.partition_columns,
+                schema: rebuilt.schema,
+                partitions: &[],
+                keys: Ok(keys.clone()),
+            };
+            let readers_catch_up: String = crate::reconcile::ignoring_dependents(dependent)
+                .iter()
+                .map(|reader| format!("{};", catch_up_statement(client, reader, &dependent_rows)))
+                .collect();
+            let result = format!("refreshed_{}", shape.graph_depth);
+            format!(
+                "DECLARE {result} TEXT; \
+                 BEGIN \
+                   {result} := public.reflex_reconcile_partition({dependent}, {keys}); \
+                   IF {result} LIKE 'reconcile_partition: no children matched%' THEN \
+                     NULL; {readers_catch_up} \
+                   ELSIF {result} NOT LIKE 'RECONCILED%' AND {result} <> {queued} THEN \
+                     {whole}; \
+                   END IF; \
+                 END",
+                queued = literal(crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT),
+                dependent = literal(dependent),
+                keys = literal(&keys.join(",")),
+            )
+        }
         _ => whole,
     }
 }
