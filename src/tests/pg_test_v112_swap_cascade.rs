@@ -594,8 +594,6 @@ fn sc_swap_scenarios() -> Vec<ScStep> {
             not_compared: &[],
         },
         sc_step("heal of the ignored change", "SELECT reflex_heal_ignored_sources()".to_string()),
-        // The dependents of a mirror are not told of a partition it drops:
-        // untreated_bugs/2026-10-10_detach_partition_leaves_dependents_of_partition_mirroring_imvs_stale.md
         ScStep {
             label: "leaf swap then detach of its plan",
             statements: format!(
@@ -603,7 +601,7 @@ fn sc_swap_scenarios() -> Vec<ScStep> {
                 sc_swap(4, 1, &sc_leaf_rows(4, 1, 4, 3))
             ),
             compared: true,
-            not_compared: &["sc_fdya", "sc_fav__cte_forecast_bounds"],
+            not_compared: &[],
         },
     ]
 }
