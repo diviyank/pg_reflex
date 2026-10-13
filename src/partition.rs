@@ -4329,7 +4329,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 // gone source partition may also have fed other partitions:
                 // the IMV is then rebuilt whole.
                 let rebuilt_whole_for_drops = !to_drop.is_empty()
-                    && !crate::cascade::partitions_follow_source(client, imv, &root);
+                    && !crate::cascade::partitions_follow_source(client, imv, root);
                 let (filled_nodes, to_drop): (BTreeSet<String>, BTreeSet<String>) =
                     to_drop.into_iter().partition(|node| {
                         query_fills_partition(client, imv, schema, &target_child_name(imv, node))
