@@ -55,7 +55,13 @@ reason.
    are known only when the top-level bound lists them (`FOR VALUES IN (...)` of plain values)
    or the rebuilt partition was not created or altered in the transaction (it is then read
    before and after). So for such a dependent a replaced top-level RANGE or DEFAULT
-   partition, and any partition holding a NULL key, means a whole refresh.
+   partition, and any partition holding a NULL key, means a whole refresh. Since a swap of a
+   RANGE or DEFAULT leaf recreates the mirror child in the same transaction, the key-scoped
+   dependents of those swaps are always refreshed whole.
+   Keys are also handed only to a dependent whose column has the type, type modifier and
+   collation of the rebuilt view's (`numeric` beside `integer`, `varchar(5)` beside `text`,
+   `timestamp` beside `timestamptz` are refreshed whole), so that no key is re-parsed into
+   another type.
 4. **Second partition level.** A dependent whose second-level column is not proven to be the
    rebuilt view's is refreshed in the whole first-level partition, not the leaf.
 5. **An aggregate grouped by a qualified column (`GROUP BY v.plan`) is refreshed whole**: the
@@ -64,18 +70,31 @@ reason.
 6. **An unchanged leaf still refreshes the dependents that ignore the rebuilt view.** Ordinary
    writes do not reach such a dependent, so an empty diff of the swapped leaf does not prove
    it current; the swap is what catches it up.
-7. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
+7. **A swapped leaf that replaced a mirror child dropped with rows its readers never saw**
+   (the ATTACH auto-sync drops the old child of a same-bound swap without DML) is refreshed as
+   replaced even when the new leaf is empty, so its observing dependents are refreshed by
+   bound or whole rather than by an empty diff.
+8. **Untested branch, kept:** a group refresh whose DML reached no reader queues only the
+   readers that ignore the rebuilt view. That happens only under
+   `session_replication_role = replica`, which needs a superuser; no test reaches it.
+9. **An IMV whose partitions are not proven to follow its source's is rebuilt whole** on
+   every partition change of a source table it mirrors (attach, detach, swap), because a
+   partition of the source may feed any of its partitions (`partition_by` naming a column
+   taken from a joined table, or a shape the proof of item 2 cannot read). A partition of
+   such an IMV that the query still fills is kept, never dropped, and is renamed to the
+   incoming child at a bound collision. The benchmark's `sop_forecast_view` shape is proven
+   (its swap timings are unchanged); `sop_last_forecast_view` has the same form (partition
+   column projected from the mirrored source, INNER/LEFT joins) but was not run.
+10. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
    node reached both by the cascade and by that COMMIT-time reconcile is refreshed twice:
    `2026-10-02_in_trigger_scoped_reconcile_escalates_to_full_commit_rebuild.md`.
-8. **Not verified in the field.** The cause was reproduced with the field names and shapes on
+11. **Not verified in the field.** The cause was reproduced with the field names and shapes on
    a synthetic chain, not on the tenant. After the upgrade the push should show partition
    refreshes of the three direct dependents only; any `is refreshed whole, not by partition`
    NOTICE on that chain names what is left.
 
 ## Related, filed separately
 
-- `2026-10-10_detach_partition_leaves_dependents_of_partition_mirroring_imvs_stale.md`
-  (unchanged by this work).
 - `2026-10-12_deferred_flush_into_partitioned_join_of_an_ignored_source_and_an_aggregate_fails_column_does_not_exist.md`
 - `2026-10-12_create_raises_raw_syntax_error_for_a_partitioned_passthrough_joining_a_cte_aggregate_of_its_own_source.md`
 - `2026-10-12_default_drain_catalog_query_locks_every_partition_in_the_database.md`
