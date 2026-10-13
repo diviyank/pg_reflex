@@ -1,5 +1,11 @@
-# `reflex_rebuild_chain` / `reflex_rebuild_imv` of an IMV created before 1.12.0 fails when 1.12.0 refuses its definition — S3 (loud, rolled back; the upgrade remedy does not apply to these IMVs)
+# `reflex_rebuild_chain` of an IMV created before 1.12.0 fails when 1.12.0 refuses its definition — S3 (loud, rolled back; the upgrade remedy does not apply to these IMVs)
 
+
+**Narrowed 2026-10-13 by the packaging upgrade test (pg15, `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/packaging-report.md`, "Phase 3"):**
+on an upgraded instance `reflex_rebuild_imv` does NOT fail on such an IMV: it reconciles in
+place and returns `RECONCILED` (observed twice). Only `reflex_rebuild_chain` raises and keeps the
+IMV. Whether `reflex_rebuild_imv` keeping a definition that 1.12.0 would refuse is itself a
+problem (it keeps maintaining a shape now considered unsafe) is not established.
 1.12.0 refuses at create several definitions that 1.11.5 accepted. The rebuild calls recreate an
 IMV through the same validation, so on such an IMV they raise and roll back. Not possible on
 1.11.5 (the refusals are new). Sources, in the ledger
