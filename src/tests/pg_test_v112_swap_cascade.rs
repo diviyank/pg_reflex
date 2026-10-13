@@ -2141,7 +2141,7 @@ fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &
         "CREATE TABLE zs_p4 PARTITION OF zs FOR VALUES IN (4)",
         "INSERT INTO zs SELECT p, k, p * 10 + k FROM generate_series(1, 4) p, generate_series(1, 4) k",
         "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
-        "INSERT INTO zmap VALUES (1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (4, 4)",
+        "INSERT INTO zmap VALUES (1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (4, 4), (4, 1)",
     ] {
         worker_exec(ddl);
     }
@@ -2151,6 +2151,7 @@ fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &
         ("zv", "SELECT s.plan, s.k, s.q FROM zs AS s", "'plan, k'", "NULL", "ARRAY['plan']"),
         ("zx_ign", mapped, "'plan, k, q'", "'!zv'", "ARRAY['plan']"),
         ("zx_obs", mapped, "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_direct", "SELECT m.plan, v.k, v.q FROM zs AS v JOIN zmap AS m ON m.src_plan = v.plan", "NULL", "NULL", "ARRAY['plan']"),
         ("zx_agg", "SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM zx_obs AS x GROUP BY x.plan", "NULL", "NULL", "ARRAY['plan']"),
         ("zx_tot", "SELECT COUNT(*) AS n, SUM(x.q) AS t FROM zx_ign AS x", "NULL", "NULL", "ARRAY[]::text[]"),
     ];
@@ -2195,7 +2196,7 @@ fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &
             check("reconcile of zx_ign after the write", &mut failures);
         }
     }
-    for name in ["zv", "zx_ign", "zx_obs", "zx_agg", "zx_tot"] {
+    for name in ["zv", "zx_ign", "zx_obs", "zx_direct", "zx_agg", "zx_tot"] {
         let result = rbc_select(&format!("reflex_reconcile('{name}')"));
         if !result.starts_with("RECONCILED") {
             failures.push(format!("reconcile of {name} returned {result}"));
