@@ -2033,3 +2033,78 @@ fn v112_sc_group_refresh_inside_a_trigger_is_left_to_commit() {
     );
     assert_eq!(mismatches, 0, "hg");
 }
+
+/// Detaching source partitions removes the rows of the IMVs that mirror them;
+/// the IMVs reading those lose the rows too, whether they observe them or are
+/// refreshed for them.
+fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE s (id INT NOT NULL, g TEXT NOT NULL, v INT) PARTITION BY LIST (g)",
+        "CREATE TABLE s_pa PARTITION OF s FOR VALUES IN ('a', 'b')",
+        "CREATE TABLE s_pc PARTITION OF s FOR VALUES IN ('c')",
+        "CREATE TABLE s_pd PARTITION OF s FOR VALUES IN ('d')",
+        "CREATE TABLE s_pe PARTITION OF s FOR VALUES IN ('e')",
+        "INSERT INTO s VALUES (1,'a',1),(2,'a',2),(3,'b',5),(4,'c',7),(5,'d',9),(6,'e',11)",
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+    ] {
+        worker_exec(ddl);
+    }
+    let mode = sql_lit(mode);
+    let imvs = [
+        ("agg", "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM s GROUP BY g", "NULL", "NULL", "ARRAY['g']"),
+        ("keyed", "SELECT id, g, v FROM s", "'id, g'", "NULL", "ARRAY['g']"),
+        ("dep_agg", "SELECT COUNT(*) AS n, SUM(sv) AS t FROM agg", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("dep_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("ign_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "'!keyed'", "ARRAY[]::text[]"),
+    ];
+    for (name, sql, keys, ignore, partition_by) in imvs {
+        let call = format!(
+            "create_reflex_ivm('{name}', {}, {keys}, NULL, {mode}, {ignore}, {partition_by})",
+            sql_lit(sql)
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let fresh = |name: &str| match name {
+        "agg" => "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM s GROUP BY g".to_string(),
+        "keyed" => "SELECT id, g, v FROM s".to_string(),
+        "dep_agg" => {
+            "SELECT COUNT(*) AS n, SUM(sv) AS t FROM (SELECT SUM(v) AS sv FROM s GROUP BY g) x"
+                .to_string()
+        }
+        _ => "SELECT g, COUNT(*) AS c FROM s GROUP BY g".to_string(),
+    };
+    let mut failures = Vec::new();
+    for (label, statements) in [
+        ("detach", "ALTER TABLE s DETACH PARTITION s_pa"),
+        ("detach and drop", "ALTER TABLE s DETACH PARTITION s_pc; DROP TABLE s_pc"),
+        ("detach and write", "ALTER TABLE s DETACH PARTITION s_pd; INSERT INTO s VALUES (7, 'e', 13)"),
+        ("two detaches", "ALTER TABLE s DETACH PARTITION s_pe; ALTER TABLE s ATTACH PARTITION s_pa FOR VALUES IN ('a', 'b'); ALTER TABLE s DETACH PARTITION s_pa"),
+    ] {
+        if let Err(error) = chain.commit(statements) {
+            failures.push(format!("{label}: raised {error}"));
+            continue;
+        }
+        for (name, ..) in imvs {
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            if mismatches != 0 {
+                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
+                rbc_select(&format!("reflex_reconcile('{name}')"));
+            }
+        }
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_detached_rows_reach_every_reader_immediate() {
+    sc_assert_detached_rows_reach_every_reader("reflex_sc_detach_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_detached_rows_reach_every_reader_deferred() {
+    sc_assert_detached_rows_reach_every_reader("reflex_sc_detach_d", "DEFERRED");
+}
