@@ -1625,7 +1625,7 @@ fn sc_settled(oracle: impl Fn() -> Vec<String>) -> Vec<String> {
         })
         .map(|wrong| format!("{wrong}, not reported stale"))
         .collect();
-    worker_exec("SELECT reflex_heal_ignored_sources()");
+    worker_exec("DO $$ BEGIN PERFORM reflex_heal_ignored_sources(); END $$");
     failures.extend(
         oracle()
             .into_iter()
