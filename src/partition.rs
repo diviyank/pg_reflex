@@ -4776,13 +4776,19 @@ pub(crate) fn drain_tree_defaults(
 ) -> Result<Vec<DrainEntry>, String> {
     let mut entries = Vec::new();
     for root in roots {
+        // `pg_get_expr` opens the relation it reads: evaluated as a filter on
+        // all of pg_class it would wait on a partition another transaction is
+        // swapping in another tree, so it reads the tree's own rows only.
         let defaults: Vec<(String, i32)> = client
             .select(
-                "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q, t.level AS lvl \
-                   FROM pg_partition_tree($1) t \
-                   JOIN pg_class c ON c.oid = t.relid \
-                   JOIN pg_namespace n ON n.oid = c.relnamespace \
-                  WHERE pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'",
+                "WITH tree AS MATERIALIZED ( \
+                     SELECT c.oid, c.relpartbound, c.relname, c.relnamespace, t.level \
+                       FROM pg_partition_tree($1) t \
+                       JOIN pg_class c ON c.oid = t.relid) \
+                 SELECT quote_ident(n.nspname) || '.' || quote_ident(tree.relname) AS q, tree.level AS lvl \
+                   FROM tree \
+                   JOIN pg_namespace n ON n.oid = tree.relnamespace \
+                  WHERE pg_get_expr(tree.relpartbound, tree.oid) = 'DEFAULT'",
                 None,
                 &[unsafe { DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value()) }],
             )
