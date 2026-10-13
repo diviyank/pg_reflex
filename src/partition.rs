@@ -4413,15 +4413,18 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                                 .and_then(|o| oid_to_qualified_name(client, *o))
                                 .map(|q| relation_has_rows(client, &q))
                                 .unwrap_or(true);
-                            // An empty leaf still needs its fill when its mirror
-                            // holds rows (a drained DEFAULT refilled into it) or
-                            // when this transaction dropped a partition of the IMV
-                            // with rows its readers never saw: the fill is then
-                            // what cascades to them.
+                            // An empty leaf still needs its fill when its own
+                            // mirror holds rows (a drained DEFAULT refilled into
+                            // it) or when this transaction dropped a partition of
+                            // the IMV with rows its readers never saw: the fill is
+                            // then what cascades to them. The mirror of an
+                            // ancestor holds the rows of its other leaves, which an
+                            // empty new leaf leaves as they are.
                             let mirror = schema_prefix(imv, &target_child_name(imv, &node));
                             let fill = source_nonempty
                                 || lost_rows_without_dml(client, imv)
-                                || (relation_exists(client, &mirror)
+                                || (node == *leaf
+                                    && relation_exists(client, &mirror)
                                     && relation_has_rows(client, &mirror));
                             *fill_node.entry(node).or_insert(false) |= fill;
                         }
