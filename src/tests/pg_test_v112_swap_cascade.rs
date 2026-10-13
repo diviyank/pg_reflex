@@ -2044,7 +2044,8 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
         "CREATE TABLE s_pc PARTITION OF s FOR VALUES IN ('c')",
         "CREATE TABLE s_pd PARTITION OF s FOR VALUES IN ('d')",
         "CREATE TABLE s_pe PARTITION OF s FOR VALUES IN ('e')",
-        "INSERT INTO s VALUES (1,'a',1),(2,'a',2),(3,'b',5),(4,'c',7),(5,'d',9),(6,'e',11)",
+        "CREATE TABLE s_pf PARTITION OF s FOR VALUES IN ('f')",
+        "INSERT INTO s VALUES (1,'a',1),(2,'a',2),(3,'b',5),(4,'c',7),(5,'d',9),(6,'e',11),(8,'f',17)",
         "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
         "CREATE TABLE sc_xact (id TEXT NOT NULL)",
     ] {
@@ -2081,6 +2082,7 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
     for (label, statements, write) in [
         ("detach", "ALTER TABLE s DETACH PARTITION s_pa", false),
         ("detach and drop", "ALTER TABLE s DETACH PARTITION s_pc; DROP TABLE s_pc", false),
+        ("detach and sync by hand", "ALTER TABLE s DETACH PARTITION s_pf; SELECT reflex_sync_partitions('keyed', true); SELECT reflex_sync_partitions('agg', true)", false),
         ("detach and write", "ALTER TABLE s DETACH PARTITION s_pd; INSERT INTO s VALUES (7, 'e', 13)", true),
         ("two detaches", "ALTER TABLE s DETACH PARTITION s_pe; ALTER TABLE s ATTACH PARTITION s_pa FOR VALUES IN ('a', 'b'); ALTER TABLE s DETACH PARTITION s_pa", false),
     ] {
