@@ -790,6 +790,28 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
     Some(relations)
 }
 
+/// Whether every partition column of `imv` is proven to be the column of
+/// `source` that `source` is partitioned by: a partition of `source` then
+/// feeds only the partition of `imv` that mirrors it.
+pub(crate) fn partitions_follow_source(
+    client: &pgrx::spi::SpiClient<'_>,
+    imv: &str,
+    source: &str,
+) -> bool {
+    read_dependent(client, imv).is_some_and(|dependent| {
+        !dependent.partition_columns.is_empty()
+            && dependent.partition_columns.iter().all(|column| {
+                unproven_partition_alignment(
+                    &dependent.sql_query,
+                    &dependent.depends_on,
+                    source,
+                    column,
+                )
+                .is_none()
+            })
+    })
+}
+
 /// Why a change to the rows of `source` that hold some values of
 /// `partition_column` could change rows of the dependent that hold other values
 /// of its own `partition_column`; `None` when the dependent's query shows it
