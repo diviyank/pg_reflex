@@ -20,6 +20,10 @@ yet `known_stale` is still TRUE on `sim_agg, sim_agg_part, sim_keyed, sim_keyed_
 sim_minmax` (only `sim_total` is cleared). Same result on the unmodified branch after
 `reflex_reset_partition_failures` + flush (logic-failure scenario).
 
+Since round 5 of `fix/v112-swap-cascade-scope` the handler also flags, recursively, every reader of
+those IMVs (`graph_child`), so the flags left behind by a successful retry include the readers; the
+fix below must clear theirs too.
+
 ## Not established
 
 - Which path reconciles the other IMVs without clearing the flag (the flush issues
