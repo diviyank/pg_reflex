@@ -1947,6 +1947,8 @@ mod tests {
     include!("tests/pg_test_v112_transient_suspension.rs");
     include!("tests/pg_test_v112_commit_flush_errors.rs");
     include!("tests/pg_test_v112_named_relation.rs");
+    include!("tests/pg_test_v112_partition_perf.rs");
+    include!("tests/pg_test_v112_full_join_scope.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

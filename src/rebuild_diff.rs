@@ -103,6 +103,57 @@ pub(crate) fn key_columns(client: &pgrx::spi::SpiClient<'_>, view_name: &str) ->
         .collect()
 }
 
+/// The GROUP BY output columns of an aggregate IMV, as keys of its target: a
+/// GROUP BY yields one row per group, so they name one row each. `None` for a
+/// passthrough, or when a group column is not a target column by that name.
+fn group_key_columns(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    target_cols: &[String],
+) -> Option<Vec<KeyColumn>> {
+    let plan = crate::sql_writer::registry::read_imv(client, view_name)?.plan?;
+    if plan.is_passthrough || plan.group_by_columns.is_empty() {
+        return None;
+    }
+    plan.group_by_columns
+        .iter()
+        .map(|column| {
+            let name = crate::query_decomposer::normalized_column_name(
+                plan.group_by_aliases.get(column).unwrap_or(column),
+            );
+            target_cols.contains(&name).then_some(KeyColumn {
+                name,
+                nullable: true,
+            })
+        })
+        .collect()
+}
+
+/// Whether two rows of `relation` matching `scope` hold the same `keys`, NULL
+/// equal to NULL as in a GROUP BY.
+fn holds_duplicate_keys(
+    client: &pgrx::spi::SpiClient<'_>,
+    relation: &str,
+    scope: &str,
+    keys: &[KeyColumn],
+) -> bool {
+    let key_list = keys
+        .iter()
+        .map(|k| format!("t.{}", quoted(&k.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    !client
+        .select(
+            &format!(
+                "SELECT 1 FROM {relation} t WHERE {scope} GROUP BY {key_list} HAVING count(*) > 1 LIMIT 1"
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .is_empty()
+}
+
 /// A keyed UPDATE rewrites rows one by one, so two rows swapping values on a
 /// second unique (or exclusion) index trip its immediate check mid-statement.
 fn has_second_unique_index(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> bool {
@@ -189,7 +240,17 @@ pub(crate) fn rebuild_target_rows(
 
     let target_cols = column_names(client, &root);
     let staged_cols = column_names(client, &format!("pg_temp.{staged}"));
-    let keys = key_columns(client, view_name);
+    let indexed_keys = key_columns(client, view_name);
+    let keys = if indexed_keys.is_empty() {
+        group_key_columns(client, view_name, &target_cols)
+            .filter(|keys| {
+                !holds_duplicate_keys(client, &format!("pg_temp.{staged}"), "TRUE", keys)
+                    && !holds_duplicate_keys(client, &root, &scope_on_t, keys)
+            })
+            .unwrap_or_default()
+    } else {
+        indexed_keys
+    };
     if !keys.is_empty() && target_cols == staged_cols && !has_second_unique_index(client, view_name)
     {
         reject_duplicate_keys(client, view_name, &staged, &keys);
