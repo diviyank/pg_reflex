@@ -2560,3 +2560,112 @@ fn v112_sc_kept_partition_is_not_an_audit_finding() {
     probe_db_close("reflex_sc_kept_audit");
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+fn sc_second_session(sql: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT COALESCE(string_agg(v, ','), '') FROM dblink('sc_second', {}) AS t(v text)",
+        sql_lit(&format!("SELECT ({sql})::text"))
+    ))
+    .unwrap_or_else(|e| Some(format!("ERR {e}")))
+    .unwrap_or_default()
+}
+
+fn sc_second_exec(sql: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_exec('sc_second', {}, false)",
+        sql_lit(sql)
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+/// A partition change of a source in one schema neither waits on nor flags the
+/// IMVs of a source in another schema that an open transaction is swapping:
+/// two such commits at once must not deadlock (a failing flush at COMMIT
+/// aborts the backend, see the abort report).
+fn sc_assert_swaps_in_two_schemas_do_not_wait_on_each_other(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    for schema in ["sa", "sb"] {
+        for ddl in [
+            format!("CREATE SCHEMA {schema}"),
+            format!(
+                "CREATE TABLE {schema}.s (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL, \
+                 PRIMARY KEY (plan, k)) PARTITION BY LIST (plan)"
+            ),
+            format!("CREATE TABLE {schema}.s_p1 PARTITION OF {schema}.s FOR VALUES IN (1)"),
+            format!("CREATE TABLE {schema}.s_p2 PARTITION OF {schema}.s FOR VALUES IN (2)"),
+            format!(
+                "INSERT INTO {schema}.s SELECT p, k, p * 100 + k FROM generate_series(1, 2) p, \
+                 generate_series(1, 4) k"
+            ),
+            format!(
+                "DO $do$ BEGIN PERFORM create_reflex_ivm('{schema}.v', 'SELECT s.plan, s.k, s.q FROM {schema}.s AS s', \
+                 'plan, k', NULL, '{mode}', NULL, ARRAY['plan']); END $do$"
+            ),
+            format!(
+                "DO $do$ BEGIN PERFORM create_reflex_ivm('{schema}.g', 'SELECT v.plan, SUM(v.q) AS sq FROM {schema}.v AS v \
+                 GROUP BY v.plan', 'plan', NULL, '{mode}', '!{schema}.v', ARRAY[]::text[]); END $do$"
+            ),
+        ] {
+            worker_exec(&ddl);
+        }
+    }
+    let swap = |schema: &str, bump: i32| {
+        format!(
+            "CREATE TABLE {schema}.s_p1_swap (LIKE {schema}.s INCLUDING DEFAULTS); \
+             INSERT INTO {schema}.s_p1_swap SELECT plan, k, q + {bump} FROM {schema}.s_p1; \
+             ALTER TABLE {schema}.s DETACH PARTITION {schema}.s_p1; \
+             ALTER TABLE {schema}.s ATTACH PARTITION {schema}.s_p1_swap FOR VALUES IN (1); \
+             DROP TABLE {schema}.s_p1; ALTER TABLE {schema}.s_p1_swap RENAME TO s_p1"
+        )
+    };
+    let _ = Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('sc_second', {})",
+        sql_lit(&conninfo_for(dbname))
+    ));
+    let flagged = "SELECT COALESCE(string_agg(name || ': ' || COALESCE(stale_reason, ''), '; '), 'none') \
+                   FROM public.__reflex_ivm_reference WHERE known_stale";
+    let mut failures = Vec::new();
+    worker_exec(&format!("BEGIN; {}", swap("sa", 40)));
+    let second_swap = sc_second_exec(&format!(
+        "BEGIN; SET LOCAL lock_timeout = '5s'; {}; \
+         DO $$ BEGIN PERFORM public.reflex_flush_partitions(); END $$",
+        swap("sb", 60)
+    ));
+    let flagged_in_second = sc_second_session(flagged);
+    if flagged_in_second != "none" {
+        failures.push(format!(
+            "the swap in sb ({second_swap}) flagged: {flagged_in_second}"
+        ));
+    }
+    let second_commit = sc_second_exec("COMMIT");
+    if second_commit != "COMMIT" {
+        failures.push(format!("the sb commit returned {second_commit}"));
+        sc_second_exec("ROLLBACK");
+    }
+    worker_exec("COMMIT");
+    for schema in ["sa", "sb"] {
+        let v = format!("SELECT s.plan, s.k, s.q FROM {schema}.s AS s");
+        let g = format!("SELECT v.plan, SUM(v.q) AS sq FROM ({v}) AS v GROUP BY v.plan");
+        for (imv, fresh) in [(format!("{schema}.v"), v.clone()), (format!("{schema}.g"), g)] {
+            let wrong = rbc_mismatch(&imv, &fresh);
+            if wrong != 0 {
+                failures.push(format!("{imv}: {wrong} rows differ"));
+            }
+        }
+    }
+    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('sc_second')");
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_immediate() {
+    sc_assert_swaps_in_two_schemas_do_not_wait_on_each_other("reflex_sc_two_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_deferred() {
+    sc_assert_swaps_in_two_schemas_do_not_wait_on_each_other("reflex_sc_two_d", "DEFERRED");
+}
