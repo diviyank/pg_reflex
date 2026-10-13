@@ -287,6 +287,45 @@ pub(crate) fn source_partitioned_on(
         .unwrap_or(false)
 }
 
+/// Whether `source` is partitioned by `columns[0]` at its top level and, for
+/// each further level `i`, every partition at depth `i` that is partitioned is
+/// partitioned by `columns[i]` (at least one is).
+pub(crate) fn source_levels_partitioned_on(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+    columns: &[String],
+) -> bool {
+    let Some((top, deeper)) = columns.split_first() else {
+        return false;
+    };
+    if !source_partitioned_on(client, source, top) {
+        return false;
+    }
+    if deeper.is_empty() {
+        return true;
+    }
+    let (schema_opt, bare) = canonical_source(source);
+    let tree = list_partition_tree(
+        client,
+        &match schema_opt {
+            Some(schema) => format!("{}.{}", schema, bare),
+            None => bare,
+        },
+    );
+    deeper.iter().enumerate().all(|(index, column)| {
+        let partitioned_at_level: Vec<&PartitionNode> = tree
+            .iter()
+            .filter(|node| node.depth == index + 1 && node.sub_strategy.is_some())
+            .collect();
+        !partitioned_at_level.is_empty()
+            && partitioned_at_level.iter().all(|node| {
+                node.sub_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(column))
+            })
+    })
+}
+
 /// List existing child partitions of `parent` (schema-qualified or bare).
 /// Returns an empty vector if the parent is not partitioned or has no
 /// children. `bound_expr` is the post-FOR-VALUES fragment.
@@ -2026,6 +2065,17 @@ fn query_fills_partition(
         .unwrap_or(true)
 }
 
+/// Whether the sync keeps `child`, a partition of `view_name` mirroring no
+/// source partition, because the query of `view_name` still fills it.
+pub(crate) fn partition_kept_as_filled(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    child: &str,
+) -> bool {
+    let (schema_opt, _) = split_qualified_name(view_name);
+    query_fills_partition(client, view_name, schema_opt.unwrap_or("public"), child)
+}
+
 /// Rebuilds, behind the root, the leaves of `view_name` that mirror none of
 /// `mirror_leaves` (the source leaves it mirrors): leaves kept because its
 /// query still fills them. Returns whether any was rebuilt.
@@ -3362,7 +3412,6 @@ fn swap_partition_child_ddl(
                         let full_nodes = list_partition_tree(client, &anchor);
                         let src_expected_tgt: std::collections::HashSet<String> = full_nodes
                             .iter()
-                            .filter(|n| n.sub_strategy.is_none()) // Only leaf sources
                             .map(|n| target_child_name(view_name, &n.bare_name))
                             .collect();
 
@@ -3379,8 +3428,11 @@ fn swap_partition_child_ddl(
                             );
                         } else {
                             // Live-source set was successfully enumerated and non-empty; safe to drop confirmed orphans.
-                            // List target parent's children and find any with matching bounds
-                            let tgt_children = list_partition_children(client, &tgt_parent);
+                            // The siblings of the swapped child only, never the
+                            // root's children: a bound literal repeats across the
+                            // levels of a tree.
+                            let tgt_children =
+                                list_partition_children(client, &tgt_immediate_parent);
                             for child in &tgt_children {
                                 // Skip the expected target we're about to attach
                                 if child.bare_name == tgt_child_bare {
@@ -3814,6 +3866,19 @@ fn oid_to_qualified_name(client: &pgrx::spi::SpiClient<'_>, oid: u32) -> Option<
 /// regclass-resolvable name from `oid_to_qualified_name`) hold at least one row?
 /// On probe failure we assume non-empty so the caller still does the swap — the
 /// skip is an optimization and must never trade correctness for speed.
+fn relation_exists(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool {
+    client
+        .select(
+            "SELECT to_regclass($1) IS NOT NULL AS present",
+            Some(1),
+            &[crate::source_truncate::text_arg(qualified)],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("present").ok().flatten())
+        .unwrap_or(false)
+}
+
 fn relation_has_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool {
     client
         .select(
@@ -4348,7 +4413,20 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                                 .and_then(|o| oid_to_qualified_name(client, *o))
                                 .map(|q| relation_has_rows(client, &q))
                                 .unwrap_or(true);
-                            *fill_node.entry(node).or_insert(false) |= source_nonempty;
+                            // An empty leaf still needs its fill when its own
+                            // mirror holds rows (a drained DEFAULT refilled into
+                            // it) or when this transaction dropped a partition of
+                            // the IMV with rows its readers never saw: the fill is
+                            // then what cascades to them. The mirror of an
+                            // ancestor holds the rows of its other leaves, which an
+                            // empty new leaf leaves as they are.
+                            let mirror = schema_prefix(imv, &target_child_name(imv, &node));
+                            let fill = source_nonempty
+                                || lost_rows_without_dml(client, imv)
+                                || (node == *leaf
+                                    && relation_exists(client, &mirror)
+                                    && relation_has_rows(client, &mirror));
+                            *fill_node.entry(node).or_insert(false) |= fill;
                         }
                         PartitionDiffAction::SwapFill => {
                             let chain = leaf_ancestor_chain(&live_tree, leaf);
@@ -4389,6 +4467,24 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     });
                 let rebuilt_whole = !filled_nodes.is_empty()
                     || !crate::cascade::partitions_follow_source(client, imv, root);
+                let partition_columns: Vec<String> =
+                    crate::sql_writer::registry::read_imv(client, imv)
+                        .and_then(|record| record.plan)
+                        .map(|plan| plan.partition_columns)
+                        .unwrap_or_default();
+                let dropped_keys = match partition_columns.first() {
+                    Some(column) => {
+                        let dropped: Vec<String> = to_drop
+                            .iter()
+                            .map(|node| target_child_name(imv, node))
+                            .collect();
+                        let mut keys =
+                            KeysOfRebuiltPartitions::of(client, schema, &dropped, column, &[]);
+                        keys.add_the_keys_held(client);
+                        keys.listed()
+                    }
+                    None => Err(format!("'{}' names no partition column", imv)),
+                };
                 for node in &to_drop {
                     root_stmts.extend(delete_through_the_imv_root_statement(
                         client,
@@ -4425,12 +4521,20 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     ));
                 }
                 // The readers that ignore the IMV's writes did not see the rows
-                // of the dropped partitions leave: they are caught up whole.
-                if !to_drop.is_empty() {
+                // of the dropped partitions leave: they are caught up on the
+                // keys those rows held (read above, before the drop).
+                let dropped_rows_held_no_key = matches!(&dropped_keys, Ok(keys) if keys.is_empty());
+                if !to_drop.is_empty() && !rebuilt_whole && !dropped_rows_held_no_key {
+                    let rebuilt = crate::cascade::RebuiltRows {
+                        view_name: imv,
+                        partition_columns: &partition_columns,
+                        schema,
+                        partitions: &[],
+                        keys: dropped_keys.clone(),
+                    };
                     for dependent in crate::reconcile::ignoring_dependents(imv) {
-                        root_stmts.push(format!(
-                            "PERFORM public.reflex_reconcile({})",
-                            sql_literal_text(&dependent)
+                        root_stmts.push(crate::cascade::catch_up_statement(
+                            client, &dependent, &rebuilt,
                         ));
                     }
                 }
@@ -4612,9 +4716,15 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                       SET last_error = left(SQLERRM, 2000), \
                           failures   = failures + CASE WHEN SQLSTATE IN ({TRANSIENT_FLUSH_SQLSTATES}) THEN 0 ELSE 1 END \
                     WHERE source_root = '{root_esc}'; \
+                   WITH RECURSIVE affected(name) AS ( \
+                       SELECT name FROM public.__reflex_ivm_reference \
+                        WHERE public.__reflex_reads_relation(depends_on, '{root_esc}') \
+                     UNION \
+                       SELECT unnest(r.graph_child) FROM public.__reflex_ivm_reference r \
+                         JOIN affected a ON a.name = r.name) \
                    UPDATE public.__reflex_ivm_reference \
                       SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now() \
-                    WHERE public.__reflex_reads_relation(depends_on, '{root_esc}'); \
+                    WHERE name IN (SELECT name FROM affected); \
                    RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
                      '{root_esc}', SQLERRM, SQLSTATE; \
                  END \
