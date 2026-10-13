@@ -1242,34 +1242,46 @@ extension_sql!(
     -- names a relation of public: a source or an IMV of another schema is
     -- always registered with its schema.
     CREATE OR REPLACE FUNCTION public.__reflex_named_relation(spelling TEXT)
-    RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $fn$
-        SELECT CASE
-                 WHEN p.part IS NULL THEN ARRAY[spelling]
-                 WHEN p.part[2] IS NULL THEN ARRAY['public', f.first_part]
-                 ELSE ARRAY[f.first_part, f.second_part]
-               END
-          FROM (SELECT regexp_match(
-                    spelling,
-                    '^("(?:[^"]|"")*"|[^."]+)(?:\.("(?:[^"]|"")*"|[^."]+))?$') AS part) p
-         CROSS JOIN LATERAL (
-            SELECT CASE WHEN p.part[1] LIKE '"%"'
-                        THEN replace(substr(p.part[1], 2, length(p.part[1]) - 2), '""', '"')
-                        ELSE translate(p.part[1], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
-                   END AS first_part,
-                   CASE WHEN p.part[2] LIKE '"%"'
-                        THEN replace(substr(p.part[2], 2, length(p.part[2]) - 2), '""', '"')
-                        ELSE translate(p.part[2], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
-                   END AS second_part) f
+    RETURNS TEXT[] LANGUAGE plpgsql IMMUTABLE AS $fn$
+    DECLARE
+        part TEXT[] := regexp_match(
+            spelling, '^("(?:[^"]|"")*"|[^."]+)(?:\.("(?:[^"]|"")*"|[^."]+))?$');
+        first_part TEXT;
+    BEGIN
+        IF part IS NULL THEN
+            RETURN ARRAY[spelling];
+        END IF;
+        first_part := CASE WHEN part[1] LIKE '"%"'
+                           THEN replace(substr(part[1], 2, length(part[1]) - 2), '""', '"')
+                           ELSE translate(part[1], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+                      END;
+        IF part[2] IS NULL THEN
+            RETURN ARRAY['public', first_part];
+        END IF;
+        RETURN ARRAY[first_part,
+                     CASE WHEN part[2] LIKE '"%"'
+                          THEN replace(substr(part[2], 2, length(part[2]) - 2), '""', '"')
+                          ELSE translate(part[2], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+                     END];
+    END;
     $fn$;
 
     -- True when one of the registered spellings names the relation `relation`
     -- spells. `ta.t` is read by an IMV registered with `ta.t` or `"ta"."t"`,
     -- never by one registered with `t`, which is `public.t`.
     CREATE OR REPLACE FUNCTION public.__reflex_reads_relation(registered TEXT[], relation TEXT)
-    RETURNS BOOLEAN LANGUAGE sql IMMUTABLE AS $fn$
-        SELECT EXISTS (
-            SELECT 1 FROM unnest(registered) AS spelling
-             WHERE public.__reflex_named_relation(spelling) = public.__reflex_named_relation(relation))
+    RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $fn$
+    DECLARE
+        named TEXT[] := public.__reflex_named_relation(relation);
+        spelling TEXT;
+    BEGIN
+        FOREACH spelling IN ARRAY COALESCE(registered, ARRAY[]::TEXT[]) LOOP
+            IF public.__reflex_named_relation(spelling) = named THEN
+                RETURN TRUE;
+            END IF;
+        END LOOP;
+        RETURN FALSE;
+    END;
     $fn$;
 
     CREATE OR REPLACE FUNCTION public.__reflex_on_ddl_command_end()
