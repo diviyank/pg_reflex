@@ -1971,12 +1971,13 @@ fn v112_sc_shapes_stay_correct_deferred() {
     sx_assert_shapes_stay_correct("reflex_sx_d", "DEFERRED");
 }
 
-/// A write that rebuilds a hot partition of an IMMEDIATE IMV inside the
-/// source's statement trigger reaches a DEFERRED aggregate of it by key. That
-/// refresh cannot run while the statement may still stage a delta, so it is
-/// left to the COMMIT-time reconcile, which must find it listed.
+/// A partition reconcile run from inside a statement's trigger (here a user
+/// trigger; the hot-partition dispatch of an IMMEDIATE IMV is the internal one)
+/// reaches a DEFERRED aggregate by key. That refresh cannot run while the
+/// statement may still stage a delta, so it is left to the COMMIT-time
+/// reconcile, which must find it listed.
 #[pg_test]
-fn v112_sc_group_refresh_inside_a_write_is_left_to_commit() {
+fn v112_sc_group_refresh_inside_a_trigger_is_left_to_commit() {
     probe_db_open("reflex_sc_hot");
     let chain = ScChain { field_names: false, cross_plan: false };
     for ddl in [
@@ -1984,9 +1985,10 @@ fn v112_sc_group_refresh_inside_a_write_is_left_to_commit() {
            PARTITION BY LIST (region)",
         "CREATE TABLE hs_a PARTITION OF hs FOR VALUES IN ('A')",
         "CREATE TABLE hs_b PARTITION OF hs FOR VALUES IN ('B')",
-        "CREATE TABLE hs_c PARTITION OF hs FOR VALUES IN ('C')",
-        "CREATE TABLE hs_d PARTITION OF hs FOR VALUES IN ('D')",
-        "INSERT INTO hs SELECT g, r, g FROM unnest(ARRAY['B', 'C', 'D']) r, generate_series(1, 20) g",
+        "INSERT INTO hs SELECT g, r, g FROM unnest(ARRAY['A', 'B']) r, generate_series(1, 20) g",
+        "CREATE TABLE zr (r TEXT PRIMARY KEY, w INT NOT NULL)",
+        "INSERT INTO zr VALUES ('A', 1), ('B', 2)",
+        "CREATE TABLE kick (n INT)",
         "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
         "CREATE TABLE sc_xact (id TEXT NOT NULL)",
     ] {
@@ -1995,39 +1997,39 @@ fn v112_sc_group_refresh_inside_a_write_is_left_to_commit() {
     for call in [
         "create_reflex_ivm('hv', 'SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs \
            GROUP BY region', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['region'])",
-        "create_reflex_ivm('hg', 'SELECT region, SUM(total) AS t FROM hv GROUP BY region', \
-           NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[])",
+        "create_reflex_ivm('hg', 'SELECT v.region, SUM(v.total) AS t, SUM(z.w) AS sw \
+           FROM hv AS v JOIN zr AS z ON z.r = v.region GROUP BY region', \
+           NULL, NULL, 'DEFERRED', '!hv', ARRAY[]::text[])",
     ] {
         assert_eq!(rbc_select(call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
     }
     for ddl in [
-        "SELECT reflex_set_wipe_threshold('hv', 0.1::numeric)",
-        "SELECT reflex_set_wipe_floor_rows('hv', 1)",
-        "ANALYZE hs",
-        "ANALYZE \"__reflex_intermediate_hv\"",
+        "CREATE FUNCTION kick_reconcile() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           BEGIN PERFORM public.reflex_reconcile_partition('hv', 'A'); RETURN NULL; END $$",
+        "CREATE TRIGGER kick_reconcile AFTER INSERT ON kick \
+           FOR EACH STATEMENT EXECUTE FUNCTION kick_reconcile()",
+        "CREATE FUNCTION sc_note_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           DECLARE stack TEXT; BEGIN GET DIAGNOSTICS stack = PG_CONTEXT; \
+             INSERT INTO sc_trace (name, context) VALUES (NEW.name, stack); RETURN NULL; END $$",
+        "CREATE TRIGGER sc_note_refresh AFTER UPDATE OF last_update_date \
+           ON public.__reflex_ivm_reference FOR EACH ROW EXECUTE FUNCTION sc_note_refresh()",
     ] {
-        if let Some(call) = ddl.strip_prefix("SELECT ") {
-            worker_exec(&format!("DO $$ BEGIN PERFORM {call}; END $$"));
-        } else {
-            worker_exec(ddl);
-        }
+        worker_exec(ddl);
     }
-    let outcome = chain.commit("INSERT INTO hs SELECT g, 'A', g FROM generate_series(1, 50) g");
-    let wrong: Vec<String> = [
-        ("hv", "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs GROUP BY region"),
-        (
-            "hg",
-            "SELECT region, SUM(total) AS t FROM \
-             (SELECT region, SUM(amount) AS total FROM hs GROUP BY region) AS hv GROUP BY region",
-        ),
-    ]
-    .iter()
-    .filter_map(|(imv, fresh)| {
-        let mismatches = rbc_mismatch(imv, fresh);
-        (mismatches != 0).then(|| format!("{imv}: {mismatches} mismatches"))
-    })
-    .collect();
+    let outcome = chain
+        .commit("UPDATE hs SET amount = amount + 7 WHERE region = 'A'; INSERT INTO kick VALUES (1)");
+    let refreshes = chain.refreshes();
+    let mismatches = rbc_mismatch(
+        "hg",
+        "SELECT v.region, SUM(v.total) AS t, SUM(z.w) AS sw FROM \
+           (SELECT region, SUM(amount) AS total FROM hs GROUP BY region) AS v \
+           JOIN zr AS z ON z.r = v.region GROUP BY region",
+    );
     probe_db_close("reflex_sc_hot");
     assert_eq!(outcome, Ok(()));
-    assert!(wrong.is_empty(), "{}", wrong.join(", "));
+    assert!(
+        refreshes.iter().any(|(node, kind)| node == "hg" && kind == "full"),
+        "the key refresh of hg is left to the COMMIT-time reconcile: {refreshes:?}"
+    );
+    assert_eq!(mismatches, 0, "hg");
 }
