@@ -571,7 +571,7 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
     if !heal_table_exists {
         return Vec::new();
     }
-    let names = imv.map(imv_and_its_generated_sub_imvs);
+    let names = imv.map(imv_and_everything_it_reads);
     let mut attempted: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
     let mut heals = Vec::new();
@@ -612,24 +612,27 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
 
 const MAX_HEAL_PASSES: usize = 32;
 
-/// The registered IMV `imv` names (bare or schema-qualified) and the generated
-/// sub-IMVs it is built on, transitively: the application knows only the IMV
-/// it created.
-fn imv_and_its_generated_sub_imvs(imv: &str) -> Vec<String> {
+/// The registered IMV `imv` names (bare or schema-qualified) and every IMV it
+/// reads, transitively: its generated sub-IMVs (the application knows only the
+/// IMV it created) and the IMVs upstream of it, whose queued heals it depends
+/// on. Healing all of them, shallowest first, leaves `imv` matching its query.
+fn imv_and_everything_it_reads(imv: &str) -> Vec<String> {
     Spi::connect(|client| {
         client
             .select(
-                "WITH RECURSIVE named AS ( \
+                "WITH RECURSIVE upstream AS ( \
                      SELECT r.name FROM public.__reflex_ivm_reference r \
                       WHERE r.name = $1 \
                          OR to_regclass(r.name) = to_regclass($1) \
                    UNION \
-                     SELECT g.name FROM named n \
-                       JOIN public.__reflex_ivm_reference p ON p.name = n.name \
-                       JOIN public.__reflex_ivm_reference g \
-                         ON g.name = ANY(COALESCE(p.depends_on_imv, ARRAY[]::text[])) \
-                      WHERE COALESCE(g.is_generated_sub_imv, FALSE)) \
-                 SELECT name FROM named",
+                     SELECT r.name FROM upstream u \
+                       JOIN public.__reflex_ivm_reference d ON d.name = u.name \
+                       JOIN public.__reflex_ivm_reference r \
+                         ON u.name = ANY(COALESCE(r.graph_child, ARRAY[]::text[])) \
+                         OR r.name = ANY(COALESCE(d.depends_on_imv, ARRAY[]::text[])) \
+                         OR d.depends_on && ARRAY[r.name, split_part(r.name, '.', 2), \
+                                                  'public.' || r.name]) \
+                 SELECT name FROM upstream",
                 None,
                 &[unsafe {
                     DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -995,6 +998,29 @@ pub(crate) fn unhealable_reasons_by_imv() -> BTreeMap<String, String> {
     })
 }
 
+/// The IMV the application created that `imv` belongs to: `imv` itself, or for
+/// a generated sub-IMV the first IMV up its chain of readers that is not one.
+fn top_level_imv(client: &pgrx::spi::SpiClient<'_>, imv: &str) -> String {
+    client
+        .select(
+            "WITH RECURSIVE up(name, generated, depth) AS ( \
+                 SELECT r.name, COALESCE(r.is_generated_sub_imv, FALSE), 0 \
+                   FROM public.__reflex_ivm_reference r WHERE r.name = $1 \
+                 UNION \
+                 SELECT p.name, COALESCE(p.is_generated_sub_imv, FALSE), up.depth + 1 \
+                   FROM up JOIN public.__reflex_ivm_reference p \
+                     ON COALESCE(p.depends_on_imv, ARRAY[]::text[]) @> ARRAY[up.name] \
+                  WHERE up.generated AND up.depth < 32) \
+             SELECT name FROM up WHERE NOT generated ORDER BY depth, name LIMIT 1",
+            Some(1),
+            &[unsafe { DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<String, _>("name").ok().flatten())
+        .unwrap_or_else(|| imv.to_string())
+}
+
 /// Stale reasons for every IMV with queued heals or an ignored source it can no
 /// longer heal from, and every IMV reading one, transitively: a downstream IMV
 /// is exactly as wrong as the slice it reads.
@@ -1021,13 +1047,19 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
             "WITH RECURSIVE reach(name, origin, depth) AS ( \
                  SELECT r.name, o.origin, 1 \
                    FROM unnest($1::text[]) AS o(origin) \
+                   JOIN public.__reflex_ivm_reference src ON src.name = o.origin \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[o.origin, split_part(o.origin, '.', 2), 'public.' || o.origin] \
+                     OR COALESCE(r.depends_on_imv, ARRAY[]::text[]) @> ARRAY[o.origin] \
+                     OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                  UNION \
                  SELECT r.name, x.origin, x.depth + 1 \
                    FROM reach x \
+                   JOIN public.__reflex_ivm_reference src ON src.name = x.name \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[x.name, split_part(x.name, '.', 2), 'public.' || x.name] \
+                     OR COALESCE(r.depends_on_imv, ARRAY[]::text[]) @> ARRAY[x.name] \
+                     OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                   WHERE x.depth < 32 \
              ) \
              SELECT DISTINCT ON (name) name, origin FROM reach ORDER BY name, depth, origin",
@@ -1036,17 +1068,27 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
         ) else {
             return;
         };
-        for row in rows {
-            let name = row.get_by_name::<String, _>("name").ok().flatten();
-            let origin = row.get_by_name::<String, _>("origin").ok().flatten();
-            if let (Some(name), Some(origin)) = (name, origin) {
-                reasons.entry(name).or_insert_with(|| {
-                    format!(
-                        "reads IMV '{origin}', which is known stale after one of its ignored \
-                         sources changed; repair '{origin}' first (see its stale_reason)."
-                    )
-                });
+        let reached: Vec<(String, String)> = rows
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("name").ok().flatten()?,
+                    row.get_by_name::<String, _>("origin").ok().flatten()?,
+                ))
+            })
+            .collect();
+        for (name, origin) in reached {
+            if reasons.contains_key(&name) {
+                continue;
             }
+            let top = top_level_imv(client, &name);
+            reasons.insert(
+                name,
+                format!(
+                    "reads IMV '{origin}', which is known stale after one of its ignored \
+                     sources changed. Run SELECT reflex_heal_ignored_sources('{}');",
+                    top.replace('\'', "''")
+                ),
+            );
         }
     });
     reasons
