@@ -1468,9 +1468,33 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         if drop_orphans && !source_enumeration_empty {
             let (schema_opt, _) = split_qualified_name(view_name);
             let schema = schema_opt.unwrap_or("public");
+            let filled_orphans: std::collections::HashSet<String> = tgt_children
+                .iter()
+                .filter(|c| !src_expected_tgt.contains(&c.bare_name))
+                .filter(|c| query_fills_partition(client, view_name, schema, &c.bare_name))
+                .map(|c| c.bare_name.clone())
+                .collect();
+            let filled_bounds: std::collections::HashSet<String> = filled_orphans
+                .iter()
+                .map(|bare| read_partition_constraint_def(client, schema, bare))
+                .collect();
+            for bare in &filled_orphans {
+                pgrx::notice!(
+                    "pg_reflex: partition '{}' of IMV '{}' mirrors no source partition but its \
+                     query still yields rows in it: kept",
+                    bare,
+                    view_name
+                );
+            }
             // Drop bottom-up (children before parents) to avoid depending on CASCADE.
             for c in int_children.iter().rev() {
-                if !src_expected_int.contains(&c.bare_name) {
+                if !src_expected_int.contains(&c.bare_name)
+                    && !filled_bounds.contains(&read_partition_constraint_def(
+                        client,
+                        schema,
+                        &c.bare_name,
+                    ))
+                {
                     let q = format!(
                         "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
                         schema, c.bare_name
@@ -1482,7 +1506,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 }
             }
             for c in tgt_children.iter().rev() {
-                if !src_expected_tgt.contains(&c.bare_name) {
+                if !src_expected_tgt.contains(&c.bare_name)
+                    && !filled_orphans.contains(&c.bare_name)
+                {
                     delete_rows_through_the_imv_root(client, schema, &c.bare_name)
                         .map_err(|e| format!("sync: {}", e))?;
                     let q = format!(
@@ -1894,6 +1920,118 @@ fn drop_bound_collision_orphan(
         }
     }
     Ok(dropped)
+}
+
+/// Whether the query of `view_name` yields a row inside the bounds of its
+/// partition `schema`.`child`. A partition that mirrors no source partition
+/// but is still filled holds rows other source partitions feed (the IMV's
+/// partition column comes from another relation than the one it mirrors): it
+/// is rebuilt, never dropped. `true` when it cannot be told.
+fn query_fills_partition(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    child: &str,
+) -> bool {
+    let exists = client
+        .select(
+            "SELECT to_regclass(format('%I.%I', $1, $2)) IS NOT NULL AS present",
+            Some(1),
+            &[
+                crate::source_truncate::text_arg(schema),
+                crate::source_truncate::text_arg(child),
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("present").ok().flatten())
+        .unwrap_or(true);
+    if !exists {
+        return false;
+    }
+    let bounds = read_partition_constraint_def(client, schema, child);
+    let Some(record) = crate::sql_writer::registry::read_imv(client, view_name) else {
+        return true;
+    };
+    if bounds.is_empty() || record.base_query.is_empty() {
+        return true;
+    }
+    client
+        .select(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM ({}) __src WHERE ({})) AS fills",
+                record.base_query, bounds
+            ),
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("fills").ok().flatten())
+        .unwrap_or(true)
+}
+
+/// Rebuilds, behind the root, the leaves of `view_name` that mirror none of
+/// `mirror_leaves` (the source leaves it mirrors): leaves kept because its
+/// query still fills them. Returns whether any was rebuilt.
+pub(crate) fn rebuild_leaves_mirroring_no_source(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    mirror_leaves: &[String],
+    base_query: &str,
+    end_query: &str,
+) -> Result<bool, String> {
+    let mirrored: std::collections::HashSet<String> = mirror_leaves
+        .iter()
+        .map(|leaf| target_child_name(view_name, leaf))
+        .collect();
+    let unmirrored: Vec<String> = list_partition_tree(client, &quote_identifier(view_name))
+        .into_iter()
+        .filter(|node| node.sub_strategy.is_none() && !mirrored.contains(&node.bare_name))
+        .map(|node| node.bare_name)
+        .collect();
+    let intermediate_leaves: Vec<String> = if end_query.is_empty() {
+        Vec::new()
+    } else {
+        list_partition_tree(client, &intermediate_table_name(view_name))
+            .into_iter()
+            .filter(|node| node.sub_strategy.is_none())
+            .map(|node| node.bare_name)
+            .collect()
+    };
+    for leaf in &unmirrored {
+        let tgt_def = read_partition_constraint_def(client, schema, leaf);
+        if tgt_def.is_empty() {
+            return Err(format!("missing target bound for partition '{}'", leaf));
+        }
+        let tgt_qual = schema_prefix(view_name, leaf);
+        let (int_qual, int_def) = if end_query.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let int_leaf = intermediate_leaves
+                .iter()
+                .find(|int_leaf| read_partition_constraint_def(client, schema, int_leaf) == tgt_def)
+                .ok_or_else(|| {
+                    format!("no intermediate partition holds the bounds of '{}'", leaf)
+                })?;
+            (schema_prefix(view_name, int_leaf), tgt_def.clone())
+        };
+        let (fill_int, fill_tgt) = build_inplace_partition_fill(
+            &int_qual, &tgt_qual, &int_def, &tgt_def, base_query, end_query,
+        );
+        if let Some(fill_int) = fill_int {
+            client
+                .update(&format!("TRUNCATE {}", int_qual), None, &[])
+                .and_then(|_| client.update(&fill_int, None, &[]))
+                .map_err(|e| format!("rebuild of intermediate partition for '{}': {}", leaf, e))?;
+        }
+        client
+            .update(&format!("TRUNCATE {}", tgt_qual), None, &[])
+            .and_then(|_| client.update(&fill_tgt, None, &[]))
+            .map_err(|e| format!("rebuild of partition '{}': {}", leaf, e))?;
+    }
+    Ok(!unmirrored.is_empty())
 }
 
 /// The registered IMV `schema`.`partition` is a partition of, and the
@@ -4185,7 +4323,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 let (schema_opt, _) = split_qualified_name(imv);
                 let schema = schema_opt.unwrap_or("public");
 
-                // The rows of a partition about to go reach the IMV's readers first.
+                // A partition the query still fills is rebuilt with the whole
+                // IMV, not dropped; the rows of the others reach the readers first.
+                let (filled_nodes, to_drop): (BTreeSet<String>, BTreeSet<String>) =
+                    to_drop.into_iter().partition(|node| {
+                        query_fills_partition(client, imv, schema, &target_child_name(imv, node))
+                    });
                 for node in &to_drop {
                     root_stmts.extend(delete_through_the_imv_root_statement(
                         client,
@@ -4213,6 +4356,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     root_stmts.push(format!(
                         "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
                         schema, int
+                    ));
+                }
+                if !filled_nodes.is_empty() {
+                    root_stmts.push(format!(
+                        "PERFORM public.reflex_reconcile({})",
+                        sql_literal_text(imv)
                     ));
                 }
                 // The readers that ignore the IMV's writes did not see the rows
