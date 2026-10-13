@@ -1382,6 +1382,13 @@ extension_sql!(
                 -- object_identity = the altered table — we sync anyway iff
                 -- that table is a partitioned source of a partitioned IMV.
                 _parent := _cmd.object_identity;
+                -- pg_reflex's own trigger toggle around a relocation changes no
+                -- partition: syncing the readers of the toggled IMV re-enters
+                -- this trigger through their own toggles, down the whole chain.
+                IF _toggle_root IS NOT NULL
+                   AND to_regclass(_parent) = to_regclass(_toggle_root) THEN
+                    _parent := NULL;
+                END IF;
             ELSIF _cmd.command_tag = 'CREATE TABLE' THEN
                 -- CREATE TABLE … PARTITION OF parent: look up parent via
                 -- pg_inherits regardless of `object_type` (PG reports
