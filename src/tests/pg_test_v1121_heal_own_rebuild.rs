@@ -657,3 +657,72 @@ fn v1121_push_explicit_reconcile_still_refreshes_the_ignoring_readers() {
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
     assert!(queued.is_empty(), "queued {queued:?}");
 }
+
+fn hor_stale_reasons(prefix: &str) -> Vec<String> {
+    sc_text_rows(&format!(
+        "SELECT name || ': ' || COALESCE(stale_reason, '') FROM reflex_ivm_status() \
+         WHERE known_stale AND name LIKE '{prefix}%' ORDER BY name"
+    ))
+}
+
+/// A reader of an IMV that can no longer be healed (its ignored source's
+/// mapped column retyped) is told to repair that IMV first: a heal remedy
+/// printed there would succeed and never clear the flag. Every remedy printed
+/// for a stale node either converges or names the node that needs repair.
+#[pg_test]
+fn v1121_push_reader_of_an_unhealable_imv_is_pointed_at_it() {
+    probe_db_open("reflex_hor_unheal");
+    for ddl in [
+        "CREATE TABLE un_d (id INT PRIMARY KEY)",
+        "INSERT INTO un_d SELECT generate_series(1, 4)",
+        "CREATE TABLE un_s (plan INT NOT NULL, k INT NOT NULL, v INT NOT NULL) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE un_s_1 PARTITION OF un_s FOR VALUES IN (1)",
+        "CREATE TABLE un_s_2 PARTITION OF un_s FOR VALUES IN (2)",
+        "INSERT INTO un_s SELECT p, k, 10 * p + k FROM generate_series(1, 2) p, generate_series(1, 3) k",
+        "CREATE TABLE un_t (plan INT NOT NULL, k INT NOT NULL, w INT NOT NULL)",
+        "INSERT INTO un_t SELECT p, k, p * k FROM generate_series(1, 2) p, generate_series(1, 3) k",
+    ] {
+        worker_exec(ddl);
+    }
+    for call in [
+        "create_reflex_ivm('un_r1', 'SELECT d.id AS plan, s.k, s.v, t.w FROM un_d AS d \
+           JOIN un_s AS s ON s.plan = d.id JOIN un_t AS t ON t.plan = d.id AND t.k = s.k', \
+           NULL, NULL, 'IMMEDIATE', '!un_t', ARRAY['plan'])",
+        "create_reflex_ivm('un_r3', 'SELECT plan, SUM(v) AS sv FROM un_r1 GROUP BY plan', \
+           'plan', NULL, 'IMMEDIATE')",
+    ] {
+        assert_eq!(rbc_select(call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    worker_exec("CREATE DOMAIN un_dom AS INT");
+    worker_exec("ALTER TABLE un_t ALTER COLUMN plan TYPE un_dom");
+    let flagged = hor_stale_reasons("un_");
+    let remedies = sc_text_rows(
+        "SELECT DISTINCT substring(stale_reason from 'Run SELECT ([^;]*);') FROM reflex_ivm_status() \
+         WHERE known_stale AND name LIKE 'un_%' AND stale_reason ~ 'Run SELECT reflex_heal_ignored_sources'",
+    );
+    for remedy in &remedies {
+        worker_exec(&format!("DO $$ BEGIN PERFORM {remedy}; END $$"));
+    }
+    let after_remedies = hor_stale_reasons("un_");
+    probe_db_close("reflex_hor_unheal");
+
+    assert!(
+        flagged.iter().any(|reason| reason.starts_with("un_r1: ") && reason.contains("Recreate")),
+        "fixture: un_r1 is unhealable after the retype: {flagged:?}"
+    );
+    assert!(
+        flagged.iter().any(|reason| reason.starts_with("un_r3: ")
+            && reason.contains("repair 'un_r1' first")
+            && !reason.contains("reflex_heal_ignored_sources")),
+        "un_r3 must be pointed at un_r1: {flagged:?}"
+    );
+    let unconverged: Vec<&String> = after_remedies
+        .iter()
+        .filter(|reason| reason.contains("Run SELECT reflex_heal_ignored_sources"))
+        .collect();
+    assert!(
+        unconverged.is_empty(),
+        "heal remedies {remedies:?} ran but their findings remain: {unconverged:?}"
+    );
+}

@@ -1029,7 +1029,13 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
         .iter()
         .map(|(imv, heal)| (imv.clone(), heal.stale_reason(imv)))
         .collect();
-    for (imv, reason) in unhealable_reasons_by_imv() {
+    let unhealable = unhealable_reasons_by_imv();
+    let healed_by_the_sweep: Vec<String> = reasons
+        .keys()
+        .filter(|imv| !unhealable.contains_key(*imv))
+        .cloned()
+        .collect();
+    for (imv, reason) in unhealable {
         reasons
             .entry(imv)
             .and_modify(|existing| {
@@ -1050,7 +1056,6 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
                    JOIN public.__reflex_ivm_reference src ON src.name = o.origin \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[o.origin, split_part(o.origin, '.', 2), 'public.' || o.origin] \
-                     OR COALESCE(r.depends_on_imv, ARRAY[]::text[]) @> ARRAY[o.origin] \
                      OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                  UNION \
                  SELECT r.name, x.origin, x.depth + 1 \
@@ -1058,11 +1063,10 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
                    JOIN public.__reflex_ivm_reference src ON src.name = x.name \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.depends_on && ARRAY[x.name, split_part(x.name, '.', 2), 'public.' || x.name] \
-                     OR COALESCE(r.depends_on_imv, ARRAY[]::text[]) @> ARRAY[x.name] \
                      OR r.name = ANY(COALESCE(src.graph_child, ARRAY[]::text[])) \
                   WHERE x.depth < 32 \
              ) \
-             SELECT DISTINCT ON (name) name, origin FROM reach ORDER BY name, depth, origin",
+             SELECT DISTINCT name, origin, depth FROM reach ORDER BY name, depth, origin",
             None,
             &[unsafe { DatumWithOid::new(origins, PgBuiltInOids::TEXTARRAYOID.oid().value()) }],
         ) else {
@@ -1076,19 +1080,29 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
                 ))
             })
             .collect();
+        let mut origins_by_reader: HashMap<String, Vec<String>> = HashMap::new();
         for (name, origin) in reached {
-            if reasons.contains_key(&name) {
-                continue;
+            if !reasons.contains_key(&name) {
+                origins_by_reader.entry(name).or_default().push(origin);
             }
-            let top = top_level_imv(client, &name);
-            reasons.insert(
-                name,
-                format!(
+        }
+        for (name, origins) in origins_by_reader {
+            let needs_repair = origins
+                .iter()
+                .find(|origin| !healed_by_the_sweep.contains(origin));
+            let reason = match needs_repair {
+                Some(origin) => format!(
                     "reads IMV '{origin}', which is known stale after one of its ignored \
-                     sources changed. Run SELECT reflex_heal_ignored_sources('{}');",
-                    top.replace('\'', "''")
+                     sources changed; repair '{origin}' first (see its stale_reason)."
                 ),
-            );
+                None => format!(
+                    "reads IMV '{}', which is known stale after one of its ignored \
+                     sources changed. Run SELECT reflex_heal_ignored_sources('{}');",
+                    origins[0],
+                    top_level_imv(client, &name).replace('\'', "''")
+                ),
+            };
+            reasons.insert(name, reason);
         }
     });
     reasons
