@@ -438,7 +438,15 @@ impl ScChain {
             .collect()
     }
 
+    /// The nodes that do not match their query (outside `except`) and are not
+    /// reported stale, then, after the heal the application runs, the nodes that
+    /// still do not, and any heal left queued. A push leaves the readers that
+    /// ignore a rebuilt IMV behind, reported stale, until that heal.
     fn wrong_nodes(&self, except: &[&str]) -> Vec<String> {
+        sc_settled(|| self.oracle_mismatches(except))
+    }
+
+    fn oracle_mismatches(&self, except: &[&str]) -> Vec<String> {
         let except: Vec<String> = except.iter().map(|node| self.named(node)).collect();
         self.nodes()
             .iter()
@@ -689,11 +697,9 @@ fn v112_sc_cross_plan_dependents_stay_correct_immediate() {
     sc_assert_cross_plan_dependents_stay_correct("reflex_sc_xp_i", "IMMEDIATE");
 }
 
-const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[
-    ("sc_sfv", "partitions"),
-    ("sc_fav__cte_forecast_bounds", "partitions"),
-    ("sc_fav__cte_forecast_sales", "partitions"),
-];
+/// A push refreshes the passthrough only: the sub-IMVs ignoring it are queued
+/// for their heal (1.12.1).
+const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions")];
 
 /// Swaps of populated leaves refresh the passthrough and the two sub-IMVs that
 /// ignore it, once each and within the swapped plans, whatever the number of
@@ -831,9 +837,9 @@ fn v112_sc_unprovable_dependents_are_refreshed_whole_once() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Ordinary writes do not reach the sub-IMVs that ignore the passthrough; the
-/// next swap of a leaf of that plan refreshes them, even one that changes no
-/// row of the passthrough.
+/// Ordinary writes do not reach the sub-IMVs that ignore the passthrough, nor
+/// does the next swap of a leaf of that plan (1.12.1: a push leaves them to
+/// their heal); they report stale, and the heal brings them back.
 #[pg_test]
 fn v112_sc_unchanged_leaf_still_refreshes_the_ignoring_sub_imvs() {
     let chain = ScChain { field_names: true, cross_plan: false };
@@ -841,7 +847,7 @@ fn v112_sc_unchanged_leaf_still_refreshes_the_ignoring_sub_imvs() {
     chain
         .commit("INSERT INTO sc_ss VALUES (3, '2027-02-20', 2027, 1, 1, 5, 5)")
         .expect("insert");
-    let behind_before = chain.wrong_nodes(&[]);
+    let behind_before = chain.oracle_mismatches(&[]);
     chain
         .commit(&sc_swap(3, 1, "SELECT * FROM sc_ss_p_3_2027_01"))
         .expect("swap");
@@ -1608,7 +1614,37 @@ fn sx_open(dbname: &str, mode: &str) {
     assert_eq!(rbc_select("tests.sc_keep_notices()"), "true");
 }
 
+/// See [`ScChain::wrong_nodes`].
+fn sc_settled(oracle: impl Fn() -> Vec<String>) -> Vec<String> {
+    let stale = sc_text_rows("SELECT name FROM reflex_ivm_status() WHERE known_stale");
+    let mut failures: Vec<String> = oracle()
+        .into_iter()
+        .filter(|wrong| {
+            let node = wrong.split(": ").next().unwrap_or_default();
+            !stale.iter().any(|name| name == node)
+        })
+        .map(|wrong| format!("{wrong}, not reported stale"))
+        .collect();
+    worker_exec("SELECT reflex_heal_ignored_sources()");
+    failures.extend(
+        oracle()
+            .into_iter()
+            .map(|wrong| format!("{wrong} after the heal")),
+    );
+    let queued = sc_text_rows(
+        "SELECT imv_name || ':' || partition_key FROM public.__reflex_heal_pending ORDER BY 1",
+    );
+    if !queued.is_empty() {
+        failures.push(format!("still queued after the heal: {queued:?}"));
+    }
+    failures
+}
+
 fn sx_wrong() -> Vec<String> {
+    sc_settled(sx_oracle_mismatches)
+}
+
+fn sx_oracle_mismatches() -> Vec<String> {
     SX_IMVS
         .iter()
         .filter_map(|imv| {
