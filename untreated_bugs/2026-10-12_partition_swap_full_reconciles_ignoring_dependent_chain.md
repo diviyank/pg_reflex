@@ -85,10 +85,17 @@ reason.
    incoming child at a bound collision. The benchmark's `sop_forecast_view` shape is proven
    (its swap timings are unchanged); `sop_last_forecast_view` has the same form (partition
    column projected from the mirrored source, INNER/LEFT joins) but was not run.
-10. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
+10. **A dropped partition reaches the readers that ignore its IMV by key.** They are refreshed
+    on the keys the dropped partitions held (their list bound, or the values read before the
+    drop) when the cascade's proof scopes them by partition column; an unpartitioned grouped
+    reader, or a reader the proof cannot scope, is refreshed whole. The rows of a dropped
+    partition go to the observing readers as one `DELETE` through the IMV's root, which is what a
+    plan drop now costs over the old (wrong) `DROP` (benchmark: a plan 39 s against 17.8 s, a
+    month 21 s against 9 s, with 0 wrong nodes against 7).
+11. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
    node reached both by the cascade and by that COMMIT-time reconcile is refreshed twice:
    `2026-10-02_in_trigger_scoped_reconcile_escalates_to_full_commit_rebuild.md`.
-11. **Not verified in the field.** The cause was reproduced with the field names and shapes on
+12. **Not verified in the field.** The cause was reproduced with the field names and shapes on
    a synthetic chain, not on the tenant. After the upgrade the push should show partition
    refreshes of the three direct dependents only; any `is refreshed whole, not by partition`
    NOTICE on that chain names what is left.
