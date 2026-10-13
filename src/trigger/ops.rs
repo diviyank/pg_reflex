@@ -616,14 +616,10 @@ pub(crate) fn outer_join_secondary_stmts(
         // rows of those values are all a change can reach.
         let full_join_mappings: Option<Vec<(String, String)>> =
             outer_join::holds_full_join(base_query).then(|| {
-                crate::cascade::columns_following(
-                    base_query,
-                    source_table,
-                    source_reference_count(base_query, source_table),
-                )
-                .into_iter()
-                .map(|column| (column.clone(), column))
-                .collect()
+                crate::cascade::columns_following(base_query, source_table)
+                    .into_iter()
+                    .map(|column| (column.clone(), column))
+                    .collect()
             });
         let mappings = match &full_join_mappings {
             Some(aligned) => Some(aligned),
@@ -647,7 +643,7 @@ pub(crate) fn outer_join_secondary_stmts(
                 //   differ from the IMV output name, e.g. b.a_id projected as "id").
                 let alias_pairs: Vec<String> = mappings
                     .iter()
-                    .map(|(t, s)| format!("\"{}\" AS \"{}\"", s, t))
+                    .map(|(t, s)| format!("__t.\"{}\" AS \"{}\"", s, t))
                     .collect();
                 let ap = alias_pairs.join(", ");
                 let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
@@ -655,14 +651,14 @@ pub(crate) fn outer_join_secondary_stmts(
                 let mut sides: Vec<String> = Vec::new();
                 if needs_old {
                     sides.push(format!(
-                        "SELECT {ap} FROM \"{old}\"",
+                        "SELECT {ap} FROM \"{old}\" __t",
                         ap = ap,
                         old = old_tbl
                     ));
                 }
                 if needs_new {
                     sides.push(format!(
-                        "SELECT {ap} FROM \"{new}\"",
+                        "SELECT {ap} FROM \"{new}\" __t",
                         ap = ap,
                         new = new_tbl
                     ));
