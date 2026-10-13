@@ -2188,6 +2188,16 @@ fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &
         ("plan 3 detached and dropped", "ALTER TABLE zs DETACH PARTITION zs_p3; DROP TABLE zs_p3"),
         ("write to plan 1", "INSERT INTO zs VALUES (1, 9, 199)"),
         ("plan 4 detached", "ALTER TABLE zs DETACH PARTITION zs_p4"),
+        (
+            "plan 3 attached empty under another name",
+            "CREATE TABLE zs_p3_new (LIKE zs); ALTER TABLE zs ATTACH PARTITION zs_p3_new FOR VALUES IN (3)",
+        ),
+        (
+            "plan 3 swapped for rows under another name",
+            "CREATE TABLE zs_p3_rows (LIKE zs); INSERT INTO zs_p3_rows VALUES (3, 1, 301); \
+             ALTER TABLE zs DETACH PARTITION zs_p3_new; \
+             ALTER TABLE zs ATTACH PARTITION zs_p3_rows FOR VALUES IN (3); DROP TABLE zs_p3_new",
+        ),
     ] {
         worker_exec(&format!("BEGIN; {statements}; COMMIT"));
         check(label, &mut failures);
