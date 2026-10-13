@@ -528,19 +528,23 @@ fn hor_assert_push_queues_the_ignoring_chain(dbname: &str, mode: &str, field_nam
     let fav = chain.named("sc_fav");
     let whole = format!("{bounds}:(whole IMV)");
     let mut failures = Vec::new();
-    for (label, statements, plans) in [
-        ("one leaf, at COMMIT", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7)), vec![2]),
+    let adya = chain.named("sc_adya");
+    for (label, statements, plans, healed_by) in [
+        ("one leaf, at COMMIT", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7)), vec![2], &fav),
         (
             "one leaf, explicit flush",
             format!("{}; {SC_FLUSH}", sc_swap(1, 3, &sc_leaf_rows(1, 3, 4, 8))),
             vec![1],
+            &adya,
         ),
-        ("every leaf of every plan", hor_every_leaf(5), vec![1, 2, 3, 4]),
-        ("a month leaf dropped", hor_drop_leaf(3, 4), vec![3]),
+        ("every leaf of every plan", hor_every_leaf(5), vec![1, 2, 3, 4], &fav),
+        ("a new plan attached", sc_attach_plan(5, 5), vec![5], &adya),
+        ("a month leaf dropped", hor_drop_leaf(3, 4), vec![3], &fav),
         (
             "a plan detached and dropped",
             "ALTER TABLE sc_ss DETACH PARTITION sc_ss_p_4; DROP TABLE sc_ss_p_4".to_string(),
             vec![4],
+            &fav,
         ),
     ] {
         if let Err(error) = chain.commit(&statements) {
@@ -572,8 +576,14 @@ fn hor_assert_push_queues_the_ignoring_chain(dbname: &str, mode: &str, field_nam
                 failures.push(format!("{label}: {node} not reported stale, {stale:?}"));
             }
         }
+        for wrong in chain.wrong_nodes(&[]) {
+            let node = wrong.split(':').next().unwrap_or_default().to_string();
+            if !stale.contains(&node) {
+                failures.push(format!("{label}: {wrong}, not reported stale"));
+            }
+        }
         if let Err(error) =
-            chain.commit(&format!("SELECT reflex_heal_ignored_sources('public.{fav}')"))
+            chain.commit(&format!("SELECT reflex_heal_ignored_sources('public.{healed_by}')"))
         {
             failures.push(format!("{label}: heal raised {error}"));
             continue;
