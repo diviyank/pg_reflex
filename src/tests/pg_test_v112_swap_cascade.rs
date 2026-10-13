@@ -594,8 +594,6 @@ fn sc_swap_scenarios() -> Vec<ScStep> {
             not_compared: &[],
         },
         sc_step("heal of the ignored change", "SELECT reflex_heal_ignored_sources()".to_string()),
-        // The dependents of a mirror are not told of a partition it drops:
-        // untreated_bugs/2026-10-10_detach_partition_leaves_dependents_of_partition_mirroring_imvs_stale.md
         ScStep {
             label: "leaf swap then detach of its plan",
             statements: format!(
@@ -603,7 +601,7 @@ fn sc_swap_scenarios() -> Vec<ScStep> {
                 sc_swap(4, 1, &sc_leaf_rows(4, 1, 4, 3))
             ),
             compared: true,
-            not_compared: &["sc_fdya", "sc_fav__cte_forecast_bounds"],
+            not_compared: &[],
         },
     ]
 }
@@ -1391,6 +1389,38 @@ const SX_IMVS: &[SxImv] = &[
         ignore: "!mv,!zz_tot",
         partition_by: &["plan", "d"],
     },
+    // Readers of the passthrough over ys that observe it.
+    SxImv { name: "o_flat", sql: "SELECT v.plan, v.k, v.q FROM {yv} AS v", keys: "plan, k", ignore: "", partition_by: &[] },
+    SxImv { name: "o_pass", sql: "SELECT v.plan, v.k, v.q FROM {yv} AS v", keys: "plan, k", ignore: "", partition_by: &["plan"] },
+    SxImv { name: "o_agg", sql: SX_PLAN_SUMS_Y, keys: "plan", ignore: "", partition_by: &[] },
+    SxImv { name: "o_agg_dep", sql: "SELECT g.plan, g.sq FROM {o_agg} AS g", keys: "plan", ignore: "", partition_by: &[] },
+    // A dependent reached by keys whose partition column has another type than
+    // the rebuilt IMV's: numeric into integer, varchar into text, timestamp
+    // into timestamptz.
+    SxImv { name: "tn_v", sql: "SELECT s.c, s.k, s.q FROM tn_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tn_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tn_v} AS v JOIN tn_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tn_v",
+        partition_by: &["c"],
+    },
+    SxImv { name: "tt_v", sql: "SELECT s.c, s.k, s.q FROM tt_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tt_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tt_v} AS v JOIN tt_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tt_v",
+        partition_by: &["c"],
+    },
+    SxImv { name: "tz_v", sql: "SELECT s.c, s.k, s.q FROM tz_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tz_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tz_v} AS v JOIN tz_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tz_v",
+        partition_by: &["c"],
+    },
 ];
 
 fn sx_query(imv: &SxImv, inline: bool) -> String {
@@ -1490,6 +1520,38 @@ fn sx_open(dbname: &str, mode: &str) {
            FROM generate_series(0, 3) day, generate_series(1, 2) k",
         "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
         "INSERT INTO zmap VALUES (1, 1), (1, 2)",
+        "CREATE TABLE tn_s (c NUMERIC NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tn_s_p1 PARTITION OF tn_s FOR VALUES IN (1.0)",
+        "CREATE TABLE tn_s_p2 PARTITION OF tn_s FOR VALUES IN (2.0)",
+        "INSERT INTO tn_s SELECT p + 0.0, k, p * 100 + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+        "CREATE TABLE tn_a (c INT NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tn_a_p1 PARTITION OF tn_a FOR VALUES IN (1)",
+        "CREATE TABLE tn_a_p2 PARTITION OF tn_a FOR VALUES IN (2)",
+        "INSERT INTO tn_a SELECT p, k, p + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+        "CREATE TABLE tt_s (c VARCHAR(5) NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tt_s_a PARTITION OF tt_s FOR VALUES IN ('a ')",
+        "CREATE TABLE tt_s_b PARTITION OF tt_s FOR VALUES IN ('b')",
+        "INSERT INTO tt_s SELECT c, k, k * 7 FROM unnest(ARRAY['a ', 'b']) c, generate_series(1, 4) k",
+        "CREATE TABLE tt_a (c TEXT NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tt_a_a PARTITION OF tt_a FOR VALUES IN ('a ')",
+        "CREATE TABLE tt_a_b PARTITION OF tt_a FOR VALUES IN ('b')",
+        "INSERT INTO tt_a SELECT c, k, k FROM unnest(ARRAY['a ', 'b']) c, generate_series(1, 4) k",
+        "CREATE TABLE tz_s (c TIMESTAMP NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tz_s_1 PARTITION OF tz_s FOR VALUES IN ('2027-01-01 00:00')",
+        "CREATE TABLE tz_s_2 PARTITION OF tz_s FOR VALUES IN ('2027-02-01 00:00')",
+        "INSERT INTO tz_s SELECT c, k, k * 3 FROM unnest(ARRAY['2027-01-01'::timestamp, '2027-02-01']) c, \
+           generate_series(1, 4) k",
+        "CREATE TABLE tz_a (c TIMESTAMPTZ NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tz_a_1 PARTITION OF tz_a FOR VALUES IN ('2027-01-01 00:00')",
+        "CREATE TABLE tz_a_2 PARTITION OF tz_a FOR VALUES IN ('2027-02-01 00:00')",
+        "INSERT INTO tz_a SELECT c, k, k FROM unnest(ARRAY['2027-01-01'::timestamptz, '2027-02-01']) c, \
+           generate_series(1, 4) k",
     ]
     .iter()
     .map(|ddl| ddl.to_string())
@@ -1791,6 +1853,48 @@ fn sx_steps() -> Vec<SxStep> {
                 sx_swap_month(2, 1, &sx_ms_rows(2, 1, 1, 4))
             ),
         ),
+        SxStep {
+            refreshed: &[("tn_d", "full")],
+            ..step(
+                "numeric key into an integer partition column",
+                sx_swap("tn_s", "tn_s_p1", "FOR VALUES IN (1.0)", "SELECT c, k, q + 11 FROM tn_s_p1"),
+            )
+        },
+        SxStep {
+            refreshed: &[("tt_d", "full")],
+            ..step(
+                "varchar key with a trailing space into a text partition column",
+                sx_swap("tt_s", "tt_s_a", "FOR VALUES IN ('a ')", "SELECT c, k, q + 1 FROM tt_s_a"),
+            )
+        },
+        SxStep {
+            refreshed: &[("tz_d", "full")],
+            ..step(
+                "timestamp key into a timestamptz partition column",
+                sx_swap(
+                    "tz_s",
+                    "tz_s_1",
+                    "FOR VALUES IN ('2027-01-01 00:00')",
+                    "SELECT c, k, q + 1 FROM tz_s_1",
+                ),
+            )
+        },
+        step(
+            "listed leaf swapped for rows of other keys",
+            sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT plan, k + 100, q FROM ys_p1"),
+        ),
+        step(
+            "listed leaf swapped for an empty table",
+            sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT * FROM ys WHERE FALSE"),
+        ),
+        step(
+            "default leaf swapped for an empty table",
+            sx_swap("ys", "ys_def", "DEFAULT", "SELECT * FROM ys WHERE FALSE"),
+        ),
+        step(
+            "leaf with rows detached and dropped",
+            "ALTER TABLE ys DETACH PARTITION ys_p5; DROP TABLE ys_p5".to_string(),
+        ),
     ]
 }
 
@@ -1863,4 +1967,262 @@ fn v112_sc_shapes_stay_correct_immediate() {
 #[pg_test]
 fn v112_sc_shapes_stay_correct_deferred() {
     sx_assert_shapes_stay_correct("reflex_sx_d", "DEFERRED");
+}
+
+/// A partition reconcile run from inside a statement's trigger (here a user
+/// trigger; the hot-partition dispatch of an IMMEDIATE IMV is the internal one)
+/// reaches a DEFERRED aggregate by key. That refresh cannot run while the
+/// statement may still stage a delta, so it is left to the COMMIT-time
+/// reconcile, which must find it listed.
+#[pg_test]
+fn v112_sc_group_refresh_inside_a_trigger_is_left_to_commit() {
+    probe_db_open("reflex_sc_hot");
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE hs (id INT NOT NULL, region TEXT NOT NULL, amount INT NOT NULL) \
+           PARTITION BY LIST (region)",
+        "CREATE TABLE hs_a PARTITION OF hs FOR VALUES IN ('A')",
+        "CREATE TABLE hs_b PARTITION OF hs FOR VALUES IN ('B')",
+        "INSERT INTO hs SELECT g, r, g FROM unnest(ARRAY['A', 'B']) r, generate_series(1, 20) g",
+        "CREATE TABLE zr (r TEXT PRIMARY KEY, w INT NOT NULL)",
+        "INSERT INTO zr VALUES ('A', 1), ('B', 2)",
+        "CREATE TABLE kick (n INT)",
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+    ] {
+        worker_exec(ddl);
+    }
+    for call in [
+        "create_reflex_ivm('hv', 'SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs \
+           GROUP BY region', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['region'])",
+        "create_reflex_ivm('hg', 'SELECT v.region, SUM(v.total) AS t, SUM(z.w) AS sw \
+           FROM hv AS v JOIN zr AS z ON z.r = v.region GROUP BY region', \
+           NULL, NULL, 'DEFERRED', '!hv', ARRAY[]::text[])",
+    ] {
+        assert_eq!(rbc_select(call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    for ddl in [
+        "CREATE FUNCTION kick_reconcile() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           BEGIN PERFORM public.reflex_reconcile_partition('hv', 'A'); RETURN NULL; END $$",
+        "CREATE TRIGGER kick_reconcile AFTER INSERT ON kick \
+           FOR EACH STATEMENT EXECUTE FUNCTION kick_reconcile()",
+        "CREATE FUNCTION sc_note_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           DECLARE stack TEXT; BEGIN GET DIAGNOSTICS stack = PG_CONTEXT; \
+             INSERT INTO sc_trace (name, context) VALUES (NEW.name, stack); RETURN NULL; END $$",
+        "CREATE TRIGGER sc_note_refresh AFTER UPDATE OF last_update_date \
+           ON public.__reflex_ivm_reference FOR EACH ROW EXECUTE FUNCTION sc_note_refresh()",
+    ] {
+        worker_exec(ddl);
+    }
+    let outcome = chain
+        .commit("UPDATE hs SET amount = amount + 7 WHERE region = 'A'; INSERT INTO kick VALUES (1)");
+    let refreshes = chain.refreshes();
+    let mismatches = rbc_mismatch(
+        "hg",
+        "SELECT v.region, SUM(v.total) AS t, SUM(z.w) AS sw FROM \
+           (SELECT region, SUM(amount) AS total FROM hs GROUP BY region) AS v \
+           JOIN zr AS z ON z.r = v.region GROUP BY region",
+    );
+    probe_db_close("reflex_sc_hot");
+    assert_eq!(outcome, Ok(()));
+    assert!(
+        refreshes.iter().any(|(node, kind)| node == "hg" && kind == "full"),
+        "the key refresh of hg is left to the COMMIT-time reconcile: {refreshes:?}"
+    );
+    assert_eq!(mismatches, 0, "hg");
+}
+
+/// Detaching source partitions removes the rows of the IMVs that mirror them;
+/// the IMVs reading those lose the rows too, whether they observe them or are
+/// refreshed for them.
+fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE s (id INT NOT NULL, g TEXT NOT NULL, v INT) PARTITION BY LIST (g)",
+        "CREATE TABLE s_pa PARTITION OF s FOR VALUES IN ('a', 'b')",
+        "CREATE TABLE s_pc PARTITION OF s FOR VALUES IN ('c')",
+        "CREATE TABLE s_pd PARTITION OF s FOR VALUES IN ('d')",
+        "CREATE TABLE s_pe PARTITION OF s FOR VALUES IN ('e')",
+        "CREATE TABLE s_pf PARTITION OF s FOR VALUES IN ('f')",
+        "INSERT INTO s VALUES (1,'a',1),(2,'a',2),(3,'b',5),(4,'c',7),(5,'d',9),(6,'e',11),(8,'f',17)",
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+    ] {
+        worker_exec(ddl);
+    }
+    let mode = sql_lit(mode);
+    let imvs = [
+        ("agg", "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM s GROUP BY g", "NULL", "NULL", "ARRAY['g']"),
+        ("keyed", "SELECT id, g, v FROM s", "'id, g'", "NULL", "ARRAY['g']"),
+        ("dep_agg", "SELECT COUNT(*) AS n, SUM(sv) AS t FROM agg", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("dep_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("ign_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "'!keyed'", "ARRAY[]::text[]"),
+        ("dep_of_dep", "SELECT COUNT(*) AS n, SUM(c) AS t FROM dep_keyed", "NULL", "NULL", "ARRAY[]::text[]"),
+    ];
+    for (name, sql, keys, ignore, partition_by) in imvs {
+        let call = format!(
+            "create_reflex_ivm('{name}', {}, {keys}, NULL, {mode}, {ignore}, {partition_by})",
+            sql_lit(sql)
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let fresh = |name: &str| match name {
+        "agg" => "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM s GROUP BY g".to_string(),
+        "keyed" => "SELECT id, g, v FROM s".to_string(),
+        "dep_agg" => {
+            "SELECT COUNT(*) AS n, SUM(sv) AS t FROM (SELECT SUM(v) AS sv FROM s GROUP BY g) x"
+                .to_string()
+        }
+        "dep_of_dep" => {
+            "SELECT COUNT(*) AS n, SUM(c) AS t FROM (SELECT COUNT(*) AS c FROM s GROUP BY g) x"
+                .to_string()
+        }
+        _ => "SELECT g, COUNT(*) AS c FROM s GROUP BY g".to_string(),
+    };
+    let mut failures = Vec::new();
+    // ign_keyed is told nothing of a write to keyed, by its ignore list: the
+    // step that writes is checked on the IMVs that observe the write.
+    let observing_the_write = |name: &&str| *name != "ign_keyed";
+    for (label, statements, write) in [
+        ("detach", "ALTER TABLE s DETACH PARTITION s_pa", false),
+        ("detach and drop", "ALTER TABLE s DETACH PARTITION s_pc; DROP TABLE s_pc", false),
+        ("detach and sync by hand", "ALTER TABLE s DETACH PARTITION s_pf; SELECT reflex_sync_partitions('keyed', true); SELECT reflex_sync_partitions('agg', true)", false),
+        ("detach and write", "ALTER TABLE s DETACH PARTITION s_pd; INSERT INTO s VALUES (7, 'e', 13)", true),
+        ("two detaches", "ALTER TABLE s DETACH PARTITION s_pe; ALTER TABLE s ATTACH PARTITION s_pa FOR VALUES IN ('a', 'b'); ALTER TABLE s DETACH PARTITION s_pa", false),
+    ] {
+        if let Err(error) = chain.commit(statements) {
+            failures.push(format!("{label}: raised {error}"));
+            continue;
+        }
+        for name in imvs.map(|(name, ..)| name).iter().filter(|name| !write || observing_the_write(name)) {
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            if mismatches != 0 {
+                failures.push(format!(
+                    "{label}: {name}: {mismatches} mismatches; holds {:?}, query {:?}",
+                    sc_text_rows(&format!("SELECT to_jsonb(t)::text AS v FROM {name} t ORDER BY 1")),
+                    sc_text_rows(&format!(
+                        "SELECT to_jsonb(t)::text AS v FROM ({}) t ORDER BY 1",
+                        fresh(name)
+                    )),
+                ));
+                rbc_select(&format!("reflex_reconcile('{name}')"));
+            }
+        }
+        if write {
+            rbc_select("reflex_reconcile('ign_keyed')");
+        }
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_detached_rows_reach_every_reader_immediate() {
+    sc_assert_detached_rows_reach_every_reader("reflex_sc_detach_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_detached_rows_reach_every_reader_deferred() {
+    sc_assert_detached_rows_reach_every_reader("reflex_sc_detach_d", "DEFERRED");
+}
+
+/// An IMV partitioned by a column it takes from a joined table holds, in the
+/// partition named after a source partition, rows that other source partitions
+/// feed. Those rows outlive the source partition, through the drop and through
+/// every reconcile, and the IMVs reading it follow.
+fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    for ddl in [
+        "CREATE TABLE zs (plan INT NOT NULL, k INT NOT NULL, q INT) PARTITION BY LIST (plan)",
+        "CREATE TABLE zs_p1 PARTITION OF zs FOR VALUES IN (1)",
+        "CREATE TABLE zs_p2 PARTITION OF zs FOR VALUES IN (2)",
+        "CREATE TABLE zs_p3 PARTITION OF zs FOR VALUES IN (3)",
+        "CREATE TABLE zs_p4 PARTITION OF zs FOR VALUES IN (4)",
+        "INSERT INTO zs SELECT p, k, p * 10 + k FROM generate_series(1, 4) p, generate_series(1, 4) k",
+        "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
+        "INSERT INTO zmap VALUES (1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (4, 4), (4, 1)",
+    ] {
+        worker_exec(ddl);
+    }
+    let mode = sql_lit(mode);
+    let mapped = "SELECT m.plan, v.k, v.q FROM zv AS v JOIN zmap AS m ON m.src_plan = v.plan";
+    let imvs = [
+        ("zv", "SELECT s.plan, s.k, s.q FROM zs AS s", "'plan, k'", "NULL", "ARRAY['plan']"),
+        ("zx_ign", mapped, "'plan, k, q'", "'!zv'", "ARRAY['plan']"),
+        ("zx_obs", mapped, "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_direct", "SELECT m.plan, v.k, v.q FROM zs AS v JOIN zmap AS m ON m.src_plan = v.plan", "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_agg", "SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM zx_obs AS x GROUP BY x.plan", "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_tot", "SELECT COUNT(*) AS n, SUM(x.q) AS t FROM zx_ign AS x", "NULL", "NULL", "ARRAY[]::text[]"),
+    ];
+    for (name, sql, keys, ignore, partition_by) in imvs {
+        let call = format!(
+            "create_reflex_ivm('{name}', {}, {keys}, NULL, {mode}, {ignore}, {partition_by})",
+            sql_lit(sql)
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let mapped_fresh = "SELECT m.plan, v.k, v.q FROM zs AS v JOIN zmap AS m ON m.src_plan = v.plan";
+    let fresh = |name: &str| match name {
+        "zv" => "SELECT s.plan, s.k, s.q FROM zs AS s".to_string(),
+        "zx_agg" => format!("SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM ({mapped_fresh}) x GROUP BY x.plan"),
+        "zx_tot" => format!("SELECT COUNT(*) AS n, SUM(x.q) AS t FROM ({mapped_fresh}) x"),
+        _ => mapped_fresh.to_string(),
+    };
+    let mut failures = Vec::new();
+    let check = |label: &str, failures: &mut Vec<String>| {
+        for (name, ..) in imvs {
+            // An ordinary write to zv does not reach zx_ign, by its ignore list.
+            if label == "write to plan 1" && ["zx_ign", "zx_tot"].contains(&name) {
+                continue;
+            }
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            if mismatches != 0 {
+                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
+                rbc_select(&format!("reflex_reconcile('{name}')"));
+            }
+        }
+    };
+    check("after create", &mut failures);
+    for (label, statements) in [
+        ("plan 3 detached and dropped", "ALTER TABLE zs DETACH PARTITION zs_p3; DROP TABLE zs_p3"),
+        ("write to plan 1", "INSERT INTO zs VALUES (1, 9, 199)"),
+        ("plan 4 detached", "ALTER TABLE zs DETACH PARTITION zs_p4"),
+        (
+            "plan 3 attached empty under another name",
+            "CREATE TABLE zs_p3_new (LIKE zs); ALTER TABLE zs ATTACH PARTITION zs_p3_new FOR VALUES IN (3)",
+        ),
+        (
+            "plan 3 swapped for rows under another name",
+            "CREATE TABLE zs_p3_rows (LIKE zs); INSERT INTO zs_p3_rows VALUES (3, 1, 301); \
+             ALTER TABLE zs DETACH PARTITION zs_p3_new; \
+             ALTER TABLE zs ATTACH PARTITION zs_p3_rows FOR VALUES IN (3); DROP TABLE zs_p3_new",
+        ),
+    ] {
+        worker_exec(&format!("BEGIN; {statements}; COMMIT"));
+        check(label, &mut failures);
+        if label == "write to plan 1" {
+            rbc_select("reflex_reconcile('zx_ign')");
+            check("reconcile of zx_ign after the write", &mut failures);
+        }
+    }
+    for name in ["zv", "zx_ign", "zx_obs", "zx_direct", "zx_agg", "zx_tot"] {
+        let result = rbc_select(&format!("reflex_reconcile('{name}')"));
+        if !result.starts_with("RECONCILED") {
+            failures.push(format!("reconcile of {name} returned {result}"));
+        }
+        check(&format!("after reconcile of {name}"), &mut failures);
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_partitions_fed_through_a_join_keep_their_rows_immediate() {
+    sc_assert_partitions_fed_through_a_join_keep_their_rows("reflex_sc_fedjoin_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_partitions_fed_through_a_join_keep_their_rows_deferred() {
+    sc_assert_partitions_fed_through_a_join_keep_their_rows("reflex_sc_fedjoin_d", "DEFERRED");
 }
