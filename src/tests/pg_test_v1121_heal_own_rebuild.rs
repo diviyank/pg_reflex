@@ -589,7 +589,7 @@ fn hor_assert_push_queues_the_ignoring_chain(dbname: &str, mode: &str, field_nam
                 failures.push(format!("{label}: {node} not reported stale, {stale:?}"));
             }
         }
-        for wrong in chain.wrong_nodes(&[]) {
+        for wrong in chain.oracle_mismatches(&[]) {
             let node = wrong.split(':').next().unwrap_or_default().to_string();
             if !stale.contains(&node) {
                 failures.push(format!("{label}: {wrong}, not reported stale"));
@@ -600,6 +600,15 @@ fn hor_assert_push_queues_the_ignoring_chain(dbname: &str, mode: &str, field_nam
         {
             failures.push(format!("{label}: heal raised {error}"));
             continue;
+        }
+        for wrong in chain.oracle_mismatches(&[]) {
+            failures.push(format!("{label}, after the heal of {healed_by} alone: {wrong}"));
+        }
+        let queued = hor_queued_keys();
+        if !queued.is_empty() {
+            failures.push(format!(
+                "{label}, after the heal of {healed_by} alone: still queued {queued:?}"
+            ));
         }
         for wrong in chain.wrong_nodes(&[]) {
             failures.push(format!("{label}, healed: {wrong}"));
