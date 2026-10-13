@@ -1941,9 +1941,9 @@ fn delete_through_the_imv_root_statement(
 /// Deletes the rows of `schema`.`partition`, a partition of an IMV, through the
 /// IMV's root before the partition is dropped, so that the IMVs reading the IMV
 /// receive the rows that leave as DML. Does nothing for a relation that is not
-/// a partition of a registered IMV. When no write to that IMV reaches a reader
-/// (the auto-sync of an ATTACH), the IMV is recorded so that a partition of it
-/// rebuilt later in the transaction is refreshed as replaced, not diffed.
+/// a partition of a registered IMV. When no write to that IMV reaches a reader,
+/// the IMV is recorded so that a partition of it rebuilt later in the
+/// transaction is refreshed as replaced, not diffed.
 fn delete_rows_through_the_imv_root(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
@@ -4185,10 +4185,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 let (schema_opt, _) = split_qualified_name(imv);
                 let schema = schema_opt.unwrap_or("public");
 
-                // Sync the IMV's partition tree against the source ONCE per flush
-                // here, then drive the per-leaf reconciles with skip_sync => true
-                // so they don't each re-walk the whole tree. This also creates the
-                // (empty) mirror partitions for the skipped empty leaves above.
+                // The rows of a partition about to go reach the IMV's readers first.
                 for node in &to_drop {
                     root_stmts.extend(delete_through_the_imv_root_statement(
                         client,
@@ -4196,6 +4193,10 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         &target_child_name(imv, node),
                     ));
                 }
+                // Sync the IMV's partition tree against the source ONCE per flush
+                // here, then drive the per-leaf reconciles with skip_sync => true
+                // so they don't each re-walk the whole tree. This also creates the
+                // (empty) mirror partitions for the skipped empty leaves above.
                 if !fill_node.is_empty() || !to_drop.is_empty() {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_sync_partitions({}, true)",
@@ -4214,9 +4215,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         schema, int
                     ));
                 }
-                // The rows of a dropped partition reach the IMV's observing
-                // readers as a DELETE; the readers that ignore its writes are
-                // caught up whole.
+                // The readers that ignore the IMV's writes did not see the rows
+                // of the dropped partitions leave: they are caught up whole.
                 if !to_drop.is_empty() {
                     for dependent in crate::reconcile::ignoring_dependents(imv) {
                         root_stmts.push(format!(
