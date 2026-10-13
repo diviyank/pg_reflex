@@ -569,6 +569,20 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                         return "ERROR: partition reconcile failed";
                     }
                 };
+                let all_diffed = match crate::partition::rebuild_leaves_mirroring_no_source(
+                    client,
+                    view_name,
+                    &schema,
+                    &mirror_leaves,
+                    &base_query,
+                    &end_query,
+                ) {
+                    Ok(rebuilt_any) => all_diffed && !rebuilt_any,
+                    Err(e) => {
+                        warning!("pg_reflex: reconcile of '{}' failed: {}", view_name, e);
+                        return "ERROR: partition reconcile failed";
+                    }
+                };
 
                 // ANALYZE the parents so the planner sees the freshly
                 // attached children's stats. Passthrough IMVs have no
