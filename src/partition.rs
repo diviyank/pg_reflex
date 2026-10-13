@@ -2586,17 +2586,21 @@ fn rebuild_partitions_and_queue_dependents(
         let mut keys_of_changed_rows =
             KeysOfRebuiltPartitions::of(client, &schema, &to_process, part_col, partition_keys);
         keys_of_changed_rows.add_the_keys_held(client);
-        // Every ignoring reader in `children` is queued below, whichever list
-        // the rebuild leaves to queue.
+        // A rebuild run by the partition flush leaves the IMVs ignoring this one
+        // to their heal: they are queued below, not refreshed. Any other rebuild
+        // refreshes them, and every ignoring reader in `children` is queued below,
+        // whichever list the rebuild leaves to queue.
+        let push = crate::heal::push_rebuild_in_progress();
         let ignoring_readers: Vec<String> = crate::reconcile::ignoring_dependents(view_name)
             .into_iter()
-            .filter(|reader| children.contains(reader))
+            .filter(|reader| push || children.contains(reader))
             .collect();
         let covered = crate::heal::HealsCoveredByRebuild::begin(
             client,
             view_name,
             part_col,
             &ignoring_readers,
+            push,
         );
         let rebuilt = rebuild_mirror_leaves(
             client,
@@ -2630,6 +2634,16 @@ fn rebuild_partitions_and_queue_dependents(
         } else {
             children
         };
+        let keys = keys_of_changed_rows.listed();
+        let children: Vec<String> = if push {
+            crate::heal::queue_heals(client, view_name, Some(part_col), &ignoring_readers, &keys);
+            children
+                .into_iter()
+                .filter(|child| !ignoring_readers.contains(child))
+                .collect()
+        } else {
+            children
+        };
 
         crate::cascade::queue_dependents(
             client,
@@ -2638,7 +2652,7 @@ fn rebuild_partitions_and_queue_dependents(
                 partition_columns: &part_cols,
                 schema: &schema,
                 partitions: &to_process,
-                keys: keys_of_changed_rows.listed(),
+                keys,
             },
             &children,
         );
@@ -4536,7 +4550,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     ));
                 }
                 // The readers that ignore the IMV's writes did not see the rows
-                // of the dropped partitions leave: they are caught up on the
+                // of the dropped partitions leave: their heal is queued on the
                 // keys those rows held (read above, before the drop).
                 let dropped_rows_held_no_key = matches!(&dropped_keys, Ok(keys) if keys.is_empty());
                 if !to_drop.is_empty() && !rebuilt_whole && !dropped_rows_held_no_key {
@@ -4548,8 +4562,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         keys: dropped_keys.clone(),
                     };
                     for dependent in crate::reconcile::ignoring_dependents(imv) {
-                        root_stmts.push(crate::cascade::catch_up_statement(
-                            client, &dependent, &rebuilt,
+                        root_stmts.push(crate::heal::heal_queue_statement(
+                            client,
+                            rebuilt.view_name,
+                            rebuilt.partition_columns.first().map(String::as_str),
+                            &dependent,
+                            &rebuilt.keys,
                         ));
                     }
                 }
@@ -4722,10 +4740,14 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 .map(|s| format!("{};", s))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let push = crate::heal::PUSH_REBUILD_GUC;
             let do_block = format!(
                 "DO $_reflex_part_sp$ \
+                 DECLARE _push_before TEXT := COALESCE(current_setting('{push}', true), ''); \
                  BEGIN \
+                   PERFORM set_config('{push}', 'on', true); \
                    \n{body}\n \
+                   PERFORM set_config('{push}', _push_before, true); \
                  EXCEPTION WHEN OTHERS THEN \
                    UPDATE public.__reflex_partition_pending \
                       SET last_error = left(SQLERRM, 2000), \
