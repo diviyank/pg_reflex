@@ -756,7 +756,8 @@ fn v112_sc_leaf_swaps_stay_within_their_plans_short_names() {
 
 /// A plan the chain has never seen reaches every node through partitions no
 /// row diff can describe: the passthrough is refreshed once, for that plan
-/// only, and the sub-IMVs ignoring it are queued for their heal (1.12.1).
+/// only, and the sub-IMVs reading and ignoring it are queued for their heal,
+/// their readers left to it (1.12.1).
 fn sc_assert_new_plan_refreshes_each_node_once(dbname: &str, field_names: bool, explicit: bool) {
     let chain = ScChain { field_names, cross_plan: false };
     sc_open(dbname, "DEFERRED", chain);
@@ -787,19 +788,25 @@ fn sc_assert_new_plan_refreshes_each_node_once(dbname: &str, field_names: bool, 
         refreshes.contains(&(chain.named("sc_sfv"), "partitions".to_string())),
         "sc_sfv not refreshed by partition: {refreshes:?}"
     );
-    for node in ["sc_fav", "sc_fav__cte_forecast_sales", "sc_fav__cte_history_sales"] {
+    for node in [
+        "sc_fav",
+        "sc_fav__cte_forecast_sales",
+        "sc_fav__cte_forecast_bounds",
+        "sc_fav__cte_history_sales",
+    ] {
         assert!(
             !refreshes.iter().any(|(refreshed, _)| *refreshed == chain.named(node)),
             "{node} ignores the passthrough but was refreshed: {refreshes:?}"
         );
     }
-    for node in ["sc_fav", "sc_fav__cte_forecast_sales", "sc_fav__cte_history_sales"] {
-        let prefix = format!("{}:", chain.named(node));
-        assert!(
-            queued.iter().any(|entry| entry.starts_with(&prefix)),
-            "{node} not queued for its heal: {queued:?}"
-        );
-    }
+    assert_eq!(
+        queued,
+        vec![
+            format!("{}:(whole IMV)", chain.named("sc_fav__cte_forecast_bounds")),
+            format!("{}:5", chain.named("sc_fav__cte_forecast_sales")),
+        ],
+        "the sub-IMVs reading the passthrough are queued for their heal"
+    );
 }
 
 #[pg_test]
