@@ -2586,7 +2586,19 @@ fn rebuild_partitions_and_queue_dependents(
         let mut keys_of_changed_rows =
             KeysOfRebuiltPartitions::of(client, &schema, &to_process, part_col, partition_keys);
         keys_of_changed_rows.add_the_keys_held(client);
-        let all_diffed = rebuild_mirror_leaves(
+        // Every ignoring reader in `children` is queued below, whichever list
+        // the rebuild leaves to queue.
+        let ignoring_readers: Vec<String> = crate::reconcile::ignoring_dependents(view_name)
+            .into_iter()
+            .filter(|reader| children.contains(reader))
+            .collect();
+        let covered = crate::heal::HealsCoveredByRebuild::begin(
+            client,
+            view_name,
+            part_col,
+            &ignoring_readers,
+        );
+        let rebuilt = rebuild_mirror_leaves(
             client,
             view_name,
             &schema,
@@ -2595,8 +2607,9 @@ fn rebuild_partitions_and_queue_dependents(
             &end_query,
             unlogged,
             true,
-        )
-        .map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
+        );
+        covered.end(client);
+        let all_diffed = rebuilt.map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
         keys_of_changed_rows.add_the_keys_held(client);
 
         // Update last_update_date.

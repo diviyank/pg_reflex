@@ -358,6 +358,11 @@ extension_sql!(
     -- subtransaction and writes nothing when a mapped or watched column is
     -- gone or the key was retyped; reflex_ivm_status derives that instead,
     -- since every writer of the source would contend on the registry row.
+    --
+    -- 1.12.1: while pg_reflex rebuilds partitions of an IMV, it names in
+    -- pg_reflex.heal_covered_by_rebuild that IMV and the readers ignoring it that
+    -- the same rebuild refreshes on every key it touched (src/heal.rs,
+    -- HealsCoveredByRebuild); its writes queue nothing for those.
     CREATE OR REPLACE FUNCTION public.__reflex_heal_on_ignored_change()
     RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp SET extra_float_digits = 3 AS $fn$
@@ -366,6 +371,7 @@ extension_sql!(
         _key TEXT;
         _keys TEXT;
         _cols TEXT;
+        _covered JSONB := NULLIF(current_setting('pg_reflex.heal_covered_by_rebuild', true), '')::jsonb;
     BEGIN
         IF TG_OP = 'TRUNCATE' THEN
             UPDATE public.__reflex_ivm_reference r
@@ -395,6 +401,7 @@ extension_sql!(
              WHERE COALESCE(r.enabled, TRUE)
                AND to_regclass(k.value->>'relation') = TG_RELID
         LOOP
+            CONTINUE WHEN (_covered->>'relid')::oid = TG_RELID AND _covered->'imvs' ? _h.name;
             CONTINUE WHEN EXISTS (
                 SELECT 1 FROM unnest(_h.watched || _h.source_column) AS c
                  WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a

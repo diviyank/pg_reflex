@@ -319,6 +319,93 @@ pub(crate) fn install_heal_triggers(
     installed
 }
 
+const COVERED_BY_REBUILD_GUC: &str = "pg_reflex.heal_covered_by_rebuild";
+
+/// Tells the heal trigger, until [`HealsCoveredByRebuild::end`], that writes to
+/// `view_name` are pg_reflex's rebuild of some of its partitions, after which
+/// that rebuild refreshes `refreshed_readers` on every key of the rebuilt
+/// partitions (the dependent cascade, `crate::cascade`). A heal queued for such a
+/// write would rebuild again what the cascade just rebuilt.
+///
+/// Only the readers whose heal it provably subsumes are named: a heal queues the
+/// values of the reader's mapped column in the changed rows, so that column must
+/// be `view_name`'s first partition column (every changed row lies in a rebuilt
+/// partition, whose keys the cascade refreshes), and the reader must have that
+/// single partition level (a refresh of its partitions by the rebuilt ones then
+/// still spans each whole key). Any other reader keeps its heal.
+pub(crate) struct HealsCoveredByRebuild {
+    previous: String,
+}
+
+impl HealsCoveredByRebuild {
+    pub(crate) fn begin(
+        client: &mut pgrx::spi::SpiClient<'_>,
+        view_name: &str,
+        partition_column: &str,
+        refreshed_readers: &[String],
+    ) -> Self {
+        let previous = client
+            .select(
+                &format!("SELECT current_setting('{COVERED_BY_REBUILD_GUC}', true) AS v"),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|mut rows| rows.next())
+            .and_then(|row| row.get_by_name::<String, _>("v").ok().flatten())
+            .unwrap_or_default();
+        client
+            .update(
+                &format!(
+                    "SELECT set_config('{COVERED_BY_REBUILD_GUC}', COALESCE(( \
+                         SELECT jsonb_build_object('relid', to_regclass($1)::oid, \
+                                                   'imvs', jsonb_agg(DISTINCT r.name))::text \
+                           FROM public.__reflex_ivm_reference r \
+                          CROSS JOIN LATERAL jsonb_each( \
+                                COALESCE(r.aggregations->'ignore_heal_keys', '{{}}'::jsonb)) k \
+                          WHERE COALESCE(r.enabled, TRUE) \
+                            AND r.name = ANY($3::text[]) \
+                            AND array_length(r.partition_columns, 1) = 1 \
+                            AND to_regclass(k.value->>'relation') = to_regclass($1) \
+                            AND k.value->>'source_column' = $2 \
+                         HAVING count(*) > 0), ''), true)"
+                ),
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            partition_column.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            refreshed_readers.to_vec(),
+                            PgBuiltInOids::TEXTARRAYOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage of '{view_name}': {e}"));
+        HealsCoveredByRebuild { previous }
+    }
+
+    pub(crate) fn end(self, client: &mut pgrx::spi::SpiClient<'_>) {
+        client
+            .update(
+                &format!("SELECT set_config('{COVERED_BY_REBUILD_GUC}', $1, true)"),
+                None,
+                &[unsafe {
+                    DatumWithOid::new(self.previous, PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage reset: {e}"));
+    }
+}
+
 /// One heal attempt: the IMV, what the partition reconcile returned, and how long
 /// it took.
 pub(crate) struct HealResult {
