@@ -245,3 +245,68 @@ fn v1121_hor_readers_outside_the_coverage_keep_their_heal() {
     probe_db_close("reflex_hor_out");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+fn hor_registry_flag(chain: &ScChain, imv: &str) -> (bool, String) {
+    let row = sc_text_rows(&chain.named(&format!(
+        "SELECT COALESCE(known_stale, FALSE)::text || '|' || COALESCE(stale_reason, '') \
+         FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+    )));
+    let row = row.first().cloned().unwrap_or_default();
+    let (stale, reason) = row.split_once('|').unwrap_or(("false", ""));
+    (stale == "true", reason.to_string())
+}
+
+/// The flush's refresh of a covered reader returns an error (here: the reader
+/// is disabled by another trigger once the cascade has queued it, so both its
+/// partition refresh and its whole refresh refuse). The reader, whose heal the
+/// flush skipped, is left behind: it must be flagged stale with a remedy that,
+/// once the cause is cleared, brings it back and clears the flag.
+#[pg_test]
+fn v1121_hor_failed_refresh_of_a_covered_reader_flags_it_stale() {
+    let chain = ScChain { field_names: false, cross_plan: false };
+    sc_open("reflex_hor_fail", "IMMEDIATE", chain);
+    let reader = hor_forecast_sales(&chain);
+    chain.exec(&format!(
+        "CREATE FUNCTION hor_disable_reader() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           BEGIN UPDATE public.__reflex_ivm_reference SET enabled = FALSE \
+                  WHERE name = '{reader}'; RETURN NULL; END $$"
+    ));
+    chain.exec(
+        "CREATE TRIGGER hor_disable_reader AFTER UPDATE OF last_update_date \
+           ON public.__reflex_ivm_reference FOR EACH ROW \
+           WHEN (NEW.name = 'sc_fav__cte_forecast_bounds') \
+           EXECUTE FUNCTION hor_disable_reader()",
+    );
+    let flushed = chain.commit(&format!(
+        "{}; {SC_FLUSH}",
+        sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7))
+    ));
+    let behind = chain.wrong_nodes(&[]);
+    let (flagged, reason) = hor_registry_flag(&chain, &reader);
+    let queued = hor_queued_keys();
+
+    chain.exec("DROP TRIGGER hor_disable_reader ON public.__reflex_ivm_reference");
+    chain.exec(&format!(
+        "UPDATE public.__reflex_ivm_reference SET enabled = TRUE WHERE name = '{reader}'"
+    ));
+    let remedy = format!("SELECT reflex_reconcile('{reader}')");
+    let remedied = chain.commit(&remedy);
+    let (flagged_after, _) = hor_registry_flag(&chain, &reader);
+    let wrong_after = chain.wrong_nodes(&[]);
+    probe_db_close("reflex_hor_fail");
+
+    flushed.expect("swap and flush");
+    assert!(
+        behind.iter().any(|node| node.starts_with(&format!("{reader}:"))),
+        "fixture: the failed refresh leaves the reader behind: {behind:?}"
+    );
+    assert!(
+        flagged || queued.iter().any(|row| row.starts_with(&format!("{reader}:"))),
+        "the reader is wrong and neither flagged stale nor queued: {behind:?}"
+    );
+    assert!(flagged, "the reader must be flagged stale, queued {queued:?}");
+    assert!(reason.contains(&remedy), "the reason must print the remedy: {reason}");
+    remedied.expect("remedy");
+    assert!(!flagged_after, "the printed remedy must clear the flag");
+    assert!(wrong_after.is_empty(), "{}", wrong_after.join(", "));
+}
