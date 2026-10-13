@@ -867,6 +867,35 @@ pub(crate) fn partitions_follow_source(
     })
 }
 
+/// The output columns of `sql_query` each proven, by
+/// [`unproven_partition_alignment`], to take its value from the `source` row a
+/// row is built on: a change to the rows of `source` holding some values of
+/// these columns can only change the output rows holding the same values.
+/// `reads` is how many times the query reads `source`.
+pub(crate) fn columns_following(sql_query: &str, source: &str, reads: usize) -> Vec<String> {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql_query) else {
+        return Vec::new();
+    };
+    let Some(select) = crate::sql_analyzer::top_level_select(&statements) else {
+        return Vec::new();
+    };
+    let depends_on = vec![source.to_string(); reads];
+    select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(folded(alias)),
+            SelectItem::UnnamedExpr(expr) => qualified_column(expr)
+                .map(|(_, column)| column)
+                .or_else(|| unqualified_column(expr)),
+            _ => None,
+        })
+        .filter(|column| {
+            unproven_partition_alignment(sql_query, &depends_on, source, column).is_none()
+        })
+        .collect()
+}
+
 /// Why a change to the rows of `source` that hold some values of
 /// `partition_column` could change rows of the dependent that hold other values
 /// of its own `partition_column`; `None` when the dependent's query shows it

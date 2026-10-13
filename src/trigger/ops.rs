@@ -608,15 +608,29 @@ pub(crate) fn outer_join_secondary_stmts(
     let qv = quote_identifier(view_name);
 
     if plan.is_passthrough {
-        match plan.passthrough_key_mappings.get(source_table) {
+        // A FULL JOIN delta surfaces unmatched rows from the OTHER side that
+        // keyed scoping on this source's join keys cannot capture. It is
+        // scoped only by the output columns proven to carry the source row's
+        // value (`COALESCE` over the two columns the FULL JOIN equates): a
+        // source row only matches other-side rows of its own values, so the
+        // rows of those values are all a change can reach.
+        let full_join_mappings: Option<Vec<(String, String)>> =
+            outer_join::holds_full_join(base_query).then(|| {
+                crate::cascade::columns_following(
+                    base_query,
+                    source_table,
+                    source_reference_count(base_query, source_table),
+                )
+                .into_iter()
+                .map(|column| (column.clone(), column))
+                .collect()
+            });
+        let mappings = match &full_join_mappings {
+            Some(aligned) => Some(aligned),
+            None => plan.passthrough_key_mappings.get(source_table),
+        };
+        match mappings {
             Some(mappings) if !mappings.is_empty() => {
-                if outer_join::holds_full_join(base_query) {
-                    // A FULL JOIN delta surfaces unmatched rows from the OTHER
-                    // side that keyed scoping (on this secondary's join keys)
-                    // cannot capture — keep the safe full rebuild.
-                    stmts.push(rebuild_target_stmt(view_name, base_query));
-                    return;
-                }
                 let target_cols: Vec<String> =
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 // Changed secondary join keys, drawn only from the transition
