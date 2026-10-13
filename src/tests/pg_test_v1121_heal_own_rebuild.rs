@@ -475,3 +475,162 @@ fn v1121_hor_write_to_another_relation_inside_the_rebuild_still_queues() {
     assert!(!healed.starts_with("ERROR"), "{healed}");
     assert_eq!(hor_rl_mismatch(fresh), 0, "R must match its query after the heal sweep");
 }
+
+// Honour `ignore_sources` on the push path. A change of the source's partitions
+// (a leaf swapped, a leaf or a plan dropped) rebuilds the passthrough through the
+// partition flush; the sub-IMVs of `sc_fav` that ignore the passthrough are not
+// refreshed but queued for their heal: `forecast_sales` (mapped on plan) on the
+// affected plans, `forecast_bounds` (no mapping) whole. They and their readers
+// report stale until the application heals `sc_fav`, which brings every node of
+// the chain back to its query.
+
+fn hor_untouched_ignoring_chain(chain: &ScChain) -> Vec<String> {
+    [
+        "sc_fav__cte_forecast_bounds",
+        "sc_fav__cte_date_limits",
+        "sc_fav__cte_forecast_sales",
+        "sc_fav",
+    ]
+    .iter()
+    .filter_map(|node| {
+        let node = chain.named(node);
+        let written = worker_scalar_i64(&format!(
+            "SELECT count(*)::int8 FROM {node} \
+             WHERE xmin::text::int8 >= (SELECT id::int8 FROM sc_xact)"
+        ));
+        (written != 0).then(|| format!("{node}: {written} rows written"))
+    })
+    .collect()
+}
+
+fn hor_drop_leaf(plan: i32, month: i32) -> String {
+    let leaf = sc_leaf(plan, month);
+    format!("ALTER TABLE sc_ss_p_{plan} DETACH PARTITION {leaf}; DROP TABLE {leaf}")
+}
+
+fn hor_every_leaf(bump: i32) -> String {
+    SC_PLANS
+        .iter()
+        .flat_map(|plan| {
+            SC_MONTHS
+                .iter()
+                .map(move |month| sc_swap(*plan, *month, &sc_leaf_rows(*plan, *month, 4, bump)))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn hor_assert_push_queues_the_ignoring_chain(dbname: &str, mode: &str, field_names: bool) {
+    let chain = ScChain { field_names, cross_plan: false };
+    sc_open(dbname, mode, chain);
+    let sales = chain.named("sc_fav__cte_forecast_sales");
+    let bounds = chain.named("sc_fav__cte_forecast_bounds");
+    let fav = chain.named("sc_fav");
+    let whole = format!("{bounds}:(whole IMV)");
+    let mut failures = Vec::new();
+    for (label, statements, plans) in [
+        ("one leaf, at COMMIT", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7)), vec![2]),
+        (
+            "one leaf, explicit flush",
+            format!("{}; {SC_FLUSH}", sc_swap(1, 3, &sc_leaf_rows(1, 3, 4, 8))),
+            vec![1],
+        ),
+        ("every leaf of every plan", hor_every_leaf(5), vec![1, 2, 3, 4]),
+        ("a month leaf dropped", hor_drop_leaf(3, 4), vec![3]),
+        (
+            "a plan detached and dropped",
+            "ALTER TABLE sc_ss DETACH PARTITION sc_ss_p_4; DROP TABLE sc_ss_p_4".to_string(),
+            vec![4],
+        ),
+    ] {
+        if let Err(error) = chain.commit(&statements) {
+            failures.push(format!("{label}: raised {error}"));
+            continue;
+        }
+        let refreshed: Vec<String> = chain
+            .refreshes()
+            .into_iter()
+            .filter(|(node, _)| node.starts_with(&fav))
+            .map(|(node, kind)| format!("{node}:{kind}"))
+            .collect();
+        if !refreshed.is_empty() {
+            failures.push(format!("{label}: the push refreshed {refreshed:?}"));
+        }
+        for written in hor_untouched_ignoring_chain(&chain) {
+            failures.push(format!("{label}: {written}"));
+        }
+        let mut expected: Vec<String> = vec![whole.clone()];
+        expected.extend(plans.iter().map(|plan| format!("{sales}:{plan}")));
+        expected.sort();
+        let queued = hor_queued_keys();
+        if queued != expected {
+            failures.push(format!("{label}: queued {queued:?}, want {expected:?}"));
+        }
+        let stale = hor_stale_imvs();
+        for node in [&sales, &bounds, &fav] {
+            if !stale.contains(node) {
+                failures.push(format!("{label}: {node} not reported stale, {stale:?}"));
+            }
+        }
+        if let Err(error) =
+            chain.commit(&format!("SELECT reflex_heal_ignored_sources('public.{fav}')"))
+        {
+            failures.push(format!("{label}: heal raised {error}"));
+            continue;
+        }
+        for wrong in chain.wrong_nodes(&[]) {
+            failures.push(format!("{label}, healed: {wrong}"));
+        }
+        let queued = hor_queued_keys();
+        if !queued.is_empty() {
+            failures.push(format!("{label}, healed: still queued {queued:?}"));
+        }
+        let stale = hor_stale_imvs();
+        if !stale.is_empty() {
+            failures.push(format!("{label}, healed: still stale {stale:?}"));
+        }
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "{mode}\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v1121_push_queues_the_ignoring_chain_immediate() {
+    hor_assert_push_queues_the_ignoring_chain("reflex_push_imm", "IMMEDIATE", false);
+}
+
+#[pg_test]
+fn v1121_push_queues_the_ignoring_chain_deferred_field_names() {
+    hor_assert_push_queues_the_ignoring_chain("reflex_push_def", "DEFERRED", true);
+}
+
+/// An explicit partition reconcile of the passthrough is not a push: it
+/// refreshes the sub-IMVs ignoring it, and queues nothing.
+#[pg_test]
+fn v1121_push_explicit_reconcile_still_refreshes_the_ignoring_readers() {
+    let chain = ScChain { field_names: false, cross_plan: false };
+    sc_open("reflex_push_expl", "IMMEDIATE", chain);
+    let committed = chain.commit(
+        "ALTER TABLE sc_ss DISABLE TRIGGER USER; \
+         UPDATE sc_ss SET qty = qty + 3 WHERE plan = 2; \
+         ALTER TABLE sc_ss ENABLE TRIGGER USER; \
+         SELECT reflex_reconcile_partition('sc_sfv', '2')",
+    );
+    let refreshed: Vec<String> = chain
+        .refreshes()
+        .into_iter()
+        .map(|(node, kind)| format!("{node}:{kind}"))
+        .collect();
+    let wrong = chain.wrong_nodes(&[]);
+    let queued = hor_queued_keys();
+    probe_db_close("reflex_push_expl");
+
+    committed.expect("drift and explicit reconcile");
+    assert!(
+        refreshed.iter().any(|r| r.starts_with("sc_fav__cte_forecast_sales:"))
+            && refreshed.iter().any(|r| r.starts_with("sc_fav__cte_forecast_bounds:")),
+        "the explicit reconcile must refresh the ignoring sub-IMVs: {refreshed:?}"
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join(", "));
+    assert!(queued.is_empty(), "queued {queued:?}");
+}
