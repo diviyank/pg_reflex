@@ -4,6 +4,25 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.12.1] — 2026-10-13
+
+A performance release for partition swaps of a source read by a chain of IMVs. A push that swaps leaves of a partitioned source no longer refreshes, at COMMIT, the IMVs that list the rebuilt partition-mirroring IMV in their `ignored_sources`: their affected partitions are queued as stale and rebuilt by `reflex_heal_ignored_sources`, `reflex_scheduled_reconcile` or `reflex_doctor(fix => TRUE)`. A FULL JOIN passthrough refreshes only the changed join keys, and an aggregate IMV without a unique index is diffed by its groups. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.1';`
+
+**Changed**
+
+- A partition swap honours `ignored_sources`: the IMVs ignoring the rebuilt IMV are queued (by key, or whole without a heal mapping) instead of refreshed; `reflex_ivm_status` reports every IMV the queue leaves wrong, with the remedy `reflex_heal_ignored_sources('<imv>')`; a named heal also heals what the IMV reads and its generated sub-IMVs. Explicit reconcile and rebuild calls still refresh them. With 100 k-row leaves one swapped leaf commits in 2.9 s instead of 25.2 s (12.1 → 2.6 s per leaf); the work moves to the heal (18.5 s), it does not go away.
+- A FULL JOIN passthrough rebuilds only the rows of the changed join keys when the alignment proof accepts the pair (same type, type modifier and collation, each source read once, later joins LEFT); otherwise the whole rebuild stays.
+- An aggregate IMV without a unique index is diffed by its GROUP BY columns when no group repeats, else by whole rows.
+- The ignored-source heal trigger no longer compares whole transition tables for readers the partition flush queued directly.
+
+**Fixed**
+
+- A dependent whose refresh after a rebuild returns an error is flagged `known_stale` with the remedy `reflex_reconcile('<imv>')`; it was left with a WARNING only.
+
+**Migration**
+
+- [`sql/pg_reflex--1.12.0--1.12.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.12.0--1.12.1.sql) — replaces `__reflex_heal_on_ignored_change()`; no registry, table or signature change. Applications needing the ignoring IMVs fresh after a push call `reflex_heal_ignored_sources('<imv>')` (base-db 6.7.7 `refresh-views` does). See [Upgrading to 1.12.1](getting-started/upgrading.md#upgrading-to-1121).
+
 ## [1.12.0] — 2026-10-13
 
 A correctness release for what `create_reflex_ivm` accepts and for how an accepted IMV is maintained: maintenance SQL built from the query text, aggregates and HAVING, joins, subqueries, CTEs, column types, identifier spelling and partitioned sources. A shape that cannot be maintained incrementally is now recomputed in full on the writes concerned; a shape that cannot be maintained at all is refused at create with the rewrite. It also refuses the sources pg_reflex cannot follow (a partition, an inheritance member, two tables whose triggers would share names) and expressions it writes back with another meaning, keeps one schema's partition maintenance from waiting on another's locks, refreshes each IMV built on a rebuilt partitioned IMV once per swap, and no longer suspends a partitioned source for a transient lock error. Several definitions 1.11.5 created are refused and several shapes are slower. Stored plans, source spellings and per-source trigger functions are generated at create time, so **recreate every IMV after the update**: see [Upgrading to 1.12.0](getting-started/upgrading.md#upgrading-to-1120). `ALTER EXTENSION pg_reflex UPDATE TO '1.12.0';` is **required by the new library**: until it runs, every transaction that changes the partitions of a source fails at COMMIT.

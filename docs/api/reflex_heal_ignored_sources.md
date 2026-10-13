@@ -30,6 +30,10 @@ SELECT reflex_heal_ignored_sources('sop_forecast_view');
 -- HEALED 1 IMVs
 ```
 
+## Partition swaps of a source (1.12.1+)
+
+When the partition flush rebuilds a partition-mirroring IMV because partitions of its source were attached, detached, dropped or swapped, the IMVs that list it in `ignore_sources` are not refreshed in that COMMIT. Their affected partitions (keys before and after the rebuild, and those of dropped partitions) are queued here; an IMV with no heal mapping onto the rebuilt IMV's partition column is queued whole and rebuilt whole by the heal. `reflex_ivm_status` reports every IMV the queue leaves wrong, including the parent and sibling sub-IMVs of a generated CTE sub-IMV and their readers. `reflex_heal_ignored_sources('<imv>')` heals the queued IMVs `<imv>` reads, its generated sub-IMVs and `<imv>` itself, deepest first. An explicit `reflex_reconcile`, `reflex_reconcile_partition` or `reflex_rebuild_imv` still refreshes the ignoring IMVs.
+
 ## Behaviour
 
 - IMVs are healed shallowest first. Each one's queued keys are rebuilt by one partition reconcile, in its own subtransaction. A key with no matching IMV partition has no rows to rebuild and is drained.
