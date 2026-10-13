@@ -1926,6 +1926,7 @@ mod tests {
     include!("tests/pg_test_v112_create_rejections.rs");
     include!("tests/pg_test_v112_swap_cascade.rs");
     include!("tests/pg_test_v112_transient_suspension.rs");
+    include!("tests/pg_test_v112_commit_flush_errors.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
