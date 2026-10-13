@@ -735,3 +735,70 @@ fn v1121_push_reader_of_an_unhealable_imv_is_pointed_at_it() {
         "heal remedies {remedies:?} ran but their findings remain: {unconverged:?}"
     );
 }
+
+fn hor_dflt_mismatch(imv: &str, fresh: &str) -> i64 {
+    worker_scalar_i64(&format!(
+        "SELECT count(*)::int8 FROM ((SELECT x::text FROM {imv} x EXCEPT ALL SELECT x::text FROM ({fresh}) x) \
+         UNION ALL (SELECT x::text FROM ({fresh}) x EXCEPT ALL SELECT x::text FROM {imv} x)) o"
+    ))
+}
+
+/// A push rebuilding a partition whose bound lists no key (a leaf under the
+/// DEFAULT) queues the heal on the keys its rows held before the rebuild as
+/// well as after it: the plan whose rows left the partition is healed too.
+#[pg_test]
+fn v1121_push_queues_the_keys_a_default_partition_held_before_its_rebuild() {
+    probe_db_open("reflex_push_dflt");
+    for ddl in [
+        "CREATE TABLE hd_d (id INT PRIMARY KEY)",
+        "INSERT INTO hd_d SELECT generate_series(1, 9)",
+        "CREATE TABLE hd_s (plan INT NOT NULL, m INT NOT NULL, k INT NOT NULL, v INT NOT NULL) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE hd_s_1 PARTITION OF hd_s FOR VALUES IN (1) PARTITION BY LIST (m)",
+        "CREATE TABLE hd_s_1_m1 PARTITION OF hd_s_1 FOR VALUES IN (1)",
+        "CREATE TABLE hd_s_def PARTITION OF hd_s DEFAULT PARTITION BY LIST (m)",
+        "CREATE TABLE hd_s_def_m1 PARTITION OF hd_s_def FOR VALUES IN (1)",
+        "CREATE TABLE hd_s_def_m2 PARTITION OF hd_s_def FOR VALUES IN (2)",
+        "INSERT INTO hd_s SELECT pm.p, pm.m, k, 10 * pm.p + k \
+           FROM (VALUES (1, 1), (6, 1), (7, 1), (8, 2)) AS pm(p, m), generate_series(1, 3) k",
+    ] {
+        worker_exec(ddl);
+    }
+    for call in [
+        "create_reflex_ivm('hd_x', 'SELECT plan, m, k, v FROM hd_s', 'plan, m, k', NULL, \
+           'IMMEDIATE', NULL, ARRAY['plan', 'm'])",
+        "create_reflex_ivm('hd_r', 'SELECT d.id AS plan, x.m, x.k, x.v FROM hd_d AS d \
+           JOIN hd_x AS x ON x.plan = d.id', 'plan, m, k', NULL, 'IMMEDIATE', '!hd_x', \
+           ARRAY['plan'])",
+    ] {
+        assert_eq!(rbc_select(call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let fresh = "SELECT d.id AS plan, s.m, s.k, s.v FROM hd_d AS d JOIN hd_s AS s ON s.plan = d.id";
+    let right_before = hor_dflt_mismatch("hd_r", fresh);
+    worker_exec(
+        "CREATE TABLE hd_new (LIKE hd_s_def INCLUDING DEFAULTS); \
+         INSERT INTO hd_new SELECT 7, 1, k, 500 + k FROM generate_series(1, 3) k; \
+         ALTER TABLE hd_s_def DETACH PARTITION hd_s_def_m1; \
+         ALTER TABLE hd_s_def ATTACH PARTITION hd_new FOR VALUES IN (1); \
+         DROP TABLE hd_s_def_m1; \
+         ALTER TABLE hd_new RENAME TO hd_s_def_m1",
+    );
+    let passthrough_wrong = hor_dflt_mismatch("hd_x", "SELECT plan, m, k, v FROM hd_s");
+    let queued = hor_queued_keys();
+    let stale = hor_stale_imvs();
+    worker_exec("DO $$ BEGIN PERFORM reflex_heal_ignored_sources('hd_r'); END $$");
+    let wrong_after_the_heal = hor_dflt_mismatch("hd_r", fresh);
+    let queued_after_the_heal = hor_queued_keys();
+    probe_db_close("reflex_push_dflt");
+
+    assert_eq!(right_before, 0, "fixture: hd_r right before the push");
+    assert_eq!(passthrough_wrong, 0, "the push rebuilds hd_x");
+    assert_eq!(
+        queued,
+        vec!["hd_r:6".to_string(), "hd_r:7".to_string()],
+        "the heal is queued on the plans the DEFAULT leaf held before and after"
+    );
+    assert!(stale.contains(&"hd_r".to_string()), "hd_r reported stale: {stale:?}");
+    assert_eq!(wrong_after_the_heal, 0, "hd_r right after its heal");
+    assert!(queued_after_the_heal.is_empty(), "still queued {queued_after_the_heal:?}");
+}
