@@ -491,6 +491,8 @@ fn scope_of(
 /// Choosing runs inside the partition rebuild, where an ERROR it raised would
 /// escape into the rebuild: it runs in its own subtransaction, and any error but
 /// a cancel or shutdown chooses none, leaving every reader to its COMMIT flush.
+/// That subtransaction has written nothing, so SPI reads on the active snapshot:
+/// a statement snapshot taken inside it shows the rows the diff just staged.
 pub(crate) fn aggregates_refreshed_by_group(
     client: &pgrx::spi::SpiClient<'_>,
     rebuilt: &RebuiltRows<'_>,
@@ -501,7 +503,9 @@ pub(crate) fn aggregates_refreshed_by_group(
         std::panic::AssertUnwindSafe(|| choose_aggregates(client, rebuilt, readers, diffed_rows));
     pgrx::PgTryBuilder::new(move || {
         let subxact = crate::partition::SubTransaction::begin();
+        let snapshot = StatementSnapshot::take();
         let chosen = choose();
+        drop(snapshot);
         subxact.release();
         chosen
     })
