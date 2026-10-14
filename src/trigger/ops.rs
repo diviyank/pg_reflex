@@ -3,7 +3,7 @@ use super::*;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
-    quote_identifier, split_qualified_name,
+    quote_identifier, split_qualified_name, staging_delta_table_name,
 };
 use crate::sql_writer::identifier::{replace_source_with_transition, token_names_source};
 
@@ -319,8 +319,11 @@ pub(crate) fn aggregate_update_stmts(
                     view_name,
                     plan,
                     orig_base_query,
-                    &delta_old,
-                    &delta_new,
+                    &scoped_delta_query(
+                        base_query,
+                        source_table,
+                        &staging_delta_table_name(source_table),
+                    ),
                     intermediate_tbl,
                     affected_tbl,
                     cols,

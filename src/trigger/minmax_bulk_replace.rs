@@ -31,8 +31,14 @@ pub(crate) fn may_replace_large_deltas(plan: &AggregationPlan, netted_delta: boo
 /// each part gets its own EXECUTE, since every caller splits the returned SQL
 /// on that separator.
 ///
-/// Both fill `affected_tbl` with those groups, so the epilogue that follows
-/// brings their target rows in line either way. The replacement deletes the
+/// `staged_delta` is the base query over every row staged for the source, old
+/// and new side, before netting: netting the delta costs as much as aggregating
+/// it, and the groups of the un-netted rows are a superset of those the netted
+/// delta touches. Replacing a group the delta leaves unchanged is still exact,
+/// so the superset only costs speed, and so does counting rows that net out.
+///
+/// Both paths fill `affected_tbl` with the groups they maintain, so the epilogue
+/// that follows brings their target rows in line either way. The replacement deletes the
 /// groups' intermediate rows and inserts the base query scoped to them: every
 /// aggregate column and `__ivm_count` come from the source, a group the source
 /// no longer holds is not reinserted, and a new one is. It runs when the staged
@@ -51,8 +57,7 @@ pub(crate) fn build_min_max_bulk_replace_sql(
     view_name: &str,
     plan: &AggregationPlan,
     orig_base_query: &str,
-    delta_old: &str,
-    delta_new: &str,
+    staged_delta: &str,
     intermediate_tbl: &str,
     affected_tbl: &str,
     group_cols: &[String],
@@ -112,9 +117,7 @@ pub(crate) fn build_min_max_bulk_replace_sql(
              IF __reflex_replace THEN\n\
                  TRUNCATE {affected};\n\
                  WITH __reflex_delta AS MATERIALIZED (\n\
-                          SELECT {cols}, __ivm_count FROM ({delta_old}) __reflex_old\n\
-                          UNION ALL\n\
-                          SELECT {cols}, __ivm_count FROM ({delta_new}) __reflex_new),\n\
+                          SELECT {cols}, __ivm_count FROM ({staged_delta}) __reflex_staged_rows),\n\
                       __reflex_groups AS (\n\
                           INSERT INTO {affected} SELECT DISTINCT {cols} FROM __reflex_delta)\n\
                  SELECT COALESCE(sum(__ivm_count), 0) INTO __reflex_staged FROM __reflex_delta;\n\
