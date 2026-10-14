@@ -319,3 +319,102 @@ fn v1122_psr_rebuild_inside_a_trigger_leaves_the_aggregate_to_its_flush() {
     assert_eq!(mismatches, 0, "hg");
     assert!(refreshes.is_empty(), "hg is left to its COMMIT flush: {refreshes:?}");
 }
+
+/// A leaf of `plan` whose rows of the products up to `products_upto` change by `by`.
+fn psr_products_changed(plan: i32, month: i32, products_upto: i32, by: i32) -> String {
+    sc_swap(
+        plan,
+        month,
+        &format!(
+            "SELECT plan, d, yr, product, loc, \
+               qty + CASE WHEN product <= {products_upto} THEN {by} ELSE 0 END, base \
+             FROM sc_ss_p_{plan}_2027_{month:02}"
+        ),
+    )
+}
+
+/// What the churn guard weighs is the push's own diff: rows staged in the
+/// transaction before it, for another plan, do not make a one-product push
+/// (24 rows against 240) rescan its plan (review P1a).
+#[pg_test]
+fn v1122_psr_rows_staged_before_a_push_do_not_count_as_its_churn() {
+    let chain = psr_open("reflex_psr_p1a");
+    let statements = format!(
+        "UPDATE sc_ss SET qty = qty + 1 WHERE plan = 3; SELECT reflex_flush_deferred('sc_ss'); \
+         {}; {SC_FLUSH}",
+        psr_products_changed(2, 2, 1, 3)
+    );
+    let outcome = psr_commit(&chain, &statements);
+    let refreshes = [psr_refreshes_of(&chain, "sc_fdya"), psr_refreshes_of(&chain, "psr_sum")];
+    let wrong = psr_wrong(&chain);
+    probe_db_close("reflex_psr_p1a");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(refreshes, [Vec::<String>::new(), Vec::new()], "[sc_fdya, psr_sum] refreshes");
+}
+
+/// A push that qualifies does not make a later low-churn push of another plan
+/// in the same transaction qualify (review P1a2).
+#[pg_test]
+fn v1122_psr_an_earlier_push_does_not_count_as_a_later_ones_churn() {
+    let chain = psr_open("reflex_psr_p1a2");
+    let statements = format!(
+        "{}; {SC_FLUSH}; {}; {SC_FLUSH}",
+        sc_swap(3, 2, &sc_leaf_rows(3, 2, 4, 7)),
+        psr_products_changed(2, 2, 1, 3)
+    );
+    let outcome = psr_commit(&chain, &statements);
+    let refreshes = [psr_refreshes_of(&chain, "sc_fdya"), psr_refreshes_of(&chain, "psr_sum")];
+    let wrong = psr_wrong(&chain);
+    probe_db_close("reflex_psr_p1a2");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let once = vec!["groups".to_string()];
+    assert_eq!(refreshes, [once.clone(), once], "only plan 3's push refreshes the aggregates");
+}
+
+/// Four low-churn pushes of one plan in one transaction, each below the guard
+/// alone, stay below it together (review P1b).
+#[pg_test]
+fn v1122_psr_repeated_low_churn_pushes_stay_low_churn() {
+    let chain = psr_open("reflex_psr_p1b");
+    let statements = (1..=4)
+        .map(|month| format!("{}; {SC_FLUSH}", psr_products_changed(2, month, 2, 3)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let outcome = psr_commit(&chain, &statements);
+    let refreshes = [psr_refreshes_of(&chain, "sc_fdya"), psr_refreshes_of(&chain, "psr_sum")];
+    let wrong = psr_wrong(&chain);
+    probe_db_close("reflex_psr_p1b");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(refreshes, [Vec::<String>::new(), Vec::new()], "[sc_fdya, psr_sum] refreshes");
+}
+
+/// F5: the guard weighs the rows the push's diff wrote, not the rows staged in
+/// the transaction. A plan-3 write staged before a whole-leaf push of plan 2
+/// (120 diff rows against 240) adds 480 staged rows: counting them would also
+/// pick a push whose own diff is far below the threshold, which the second
+/// push of this transaction is (4 rows updated: 8 diff rows against 240).
+#[pg_test]
+fn v1122_psr_the_guard_weighs_the_diff_not_the_staging_table() {
+    let chain = psr_open("reflex_psr_f5");
+    let statements = format!(
+        "UPDATE sc_ss SET qty = qty + 1 WHERE plan = 3; SELECT reflex_flush_deferred('sc_ss'); \
+         {}; {SC_FLUSH}; {}; {SC_FLUSH}",
+        sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7)),
+        sc_swap(1, 3, "SELECT plan, d, yr, product, loc, \
+           qty + CASE WHEN product = 1 AND loc = 1 THEN 3 ELSE 0 END, base FROM sc_ss_p_1_2027_03")
+    );
+    let outcome = psr_commit(&chain, &statements);
+    let refreshes = psr_refreshes_of(&chain, "psr_sum");
+    let wrong = psr_wrong(&chain);
+    probe_db_close("reflex_psr_f5");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(
+        refreshes,
+        vec!["groups".to_string()],
+        "plan 2's whole-leaf push is refreshed by group, plan 1's 4-row push is not"
+    );
+}
