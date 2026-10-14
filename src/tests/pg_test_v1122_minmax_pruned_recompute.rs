@@ -228,7 +228,7 @@ fn v1122_minmax_recompute_null_key_keeps_exists() {
 #[pg_test]
 fn v1122_minmax_recompute_float_key_keeps_exists() {
     let p = "mmp_float";
-    mmp_source(p, &["1", "2"], "FLOAT8", "0.1 * k + 0.2", 3);
+    mmp_source(p, &["1", "2"], "FLOAT8", "0.1::float8 * k + 0.2::float8", 3);
     mmp_create(p, MMP_DATES, "plan, key_column", "DEFERRED");
     let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
     Spi::run("SET LOCAL extra_float_digits = -14").expect("short float output");
