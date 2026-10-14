@@ -433,6 +433,7 @@ fn test_ucc_imv_created_later_reads_a_previously_unread_column() {
     assert_imv_correct("ucc13_by_note", by_note);
 
     let by_extra = "SELECT extra, COUNT(*) AS n FROM ucc13_src GROUP BY extra";
+    ucc_flush("ucc13_src");
     ucc_create("ucc13_by_extra", by_extra, None, "DEFERRED");
     ucc_assert_captured("ucc13_src", "UPDATE ucc13_src SET extra = id % 2");
     ucc_flush("ucc13_src");
