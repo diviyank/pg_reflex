@@ -2615,7 +2615,7 @@ fn rebuild_partitions_and_queue_dependents(
         if let Some(covered) = covered {
             covered.end(client);
         }
-        let all_diffed = rebuilt.map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
+        let diffed_rows = rebuilt.map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
         keys_of_changed_rows.add_the_keys_held(client);
 
         // Update last_update_date.
@@ -2627,16 +2627,37 @@ fn rebuild_partitions_and_queue_dependents(
             }],
         );
 
-        // Observing dependents already received every leaf's change as DML when
-        // all leaves were diffed; only the ignoring ones still need a refresh.
-        let children: Vec<String> = if all_diffed && origin_triggers_fire(client) {
-            crate::reconcile::ignoring_dependents(view_name)
-        } else {
-            children
+        let rebuilt_rows = crate::cascade::RebuiltRows {
+            view_name,
+            partition_columns: &part_cols,
+            schema: &schema,
+            partitions: &to_process,
+            keys: keys_of_changed_rows.listed(),
         };
-        let keys = keys_of_changed_rows.listed();
+        // Observing dependents already received every leaf's change as DML when
+        // all leaves were diffed; only the ignoring ones still need a refresh,
+        // and the aggregates a refresh of their groups serves better.
+        let children: Vec<String> = match diffed_rows {
+            Some(diffed_rows) if origin_triggers_fire(client) => {
+                let mut unreached = crate::reconcile::ignoring_dependents(view_name);
+                unreached.extend(crate::cascade::aggregates_refreshed_by_group(
+                    client,
+                    &rebuilt_rows,
+                    &children,
+                    diffed_rows,
+                ));
+                unreached
+            }
+            _ => children,
+        };
         let children: Vec<String> = if push {
-            crate::heal::queue_heals(client, view_name, Some(part_col), &ignoring_readers, &keys);
+            crate::heal::queue_heals(
+                client,
+                view_name,
+                Some(part_col),
+                &ignoring_readers,
+                &rebuilt_rows.keys,
+            );
             children
                 .into_iter()
                 .filter(|child| !ignoring_readers.contains(child))
@@ -2645,17 +2666,7 @@ fn rebuild_partitions_and_queue_dependents(
             children
         };
 
-        crate::cascade::queue_dependents(
-            client,
-            &crate::cascade::RebuiltRows {
-                view_name,
-                partition_columns: &part_cols,
-                schema: &schema,
-                partitions: &to_process,
-                keys,
-            },
-            &children,
-        );
+        crate::cascade::queue_dependents(client, &rebuilt_rows, &children);
 
         Ok(format!(
             "RECONCILED partitions: {}",
@@ -2957,10 +2968,10 @@ fn leaf_is_diffable(
         && crate::rebuild_diff::target_propagates(client, view_name)
 }
 
-/// Rebuild the mirror leaves of `view_name` that mirror `src_children`, and
-/// report whether EVERY one reached the dependents as DML
-/// ([`SwapOutcome::Diffed`]) — the caller then cascades only to the ignoring
-/// dependents.
+/// Rebuild the mirror leaves of `view_name` that mirror `src_children`. When
+/// EVERY one reached the dependents as DML ([`SwapOutcome::Diffed`]) — the
+/// caller then cascades only to the ignoring dependents — returns the rows their
+/// diffs staged for a DEFERRED reader; `None` otherwise.
 ///
 /// The leaves that must be swapped or filled behind the root (empty, fresh, or
 /// a target nothing observes) go first. Only when none of them changed
@@ -2969,7 +2980,7 @@ fn leaf_is_diffable(
 /// observer from scratch while the diffed leaves' rows are still staged for
 /// it, and the COMMIT flush applies them a second time.
 ///
-/// `allow_diff = false` swaps every leaf (and so reports `false`).
+/// `allow_diff = false` swaps every leaf (and so returns `None`).
 ///
 /// Errors carry the source child they occurred on.
 #[allow(clippy::too_many_arguments)]
@@ -2982,7 +2993,7 @@ pub(crate) fn rebuild_mirror_leaves(
     end_query: &str,
     unlogged: bool,
     allow_diff: bool,
-) -> Result<bool, (String, String)> {
+) -> Result<Option<u64>, (String, String)> {
     let (diffable, behind_root): (Vec<&String>, Vec<&String>) =
         src_children.iter().partition(|src| {
             let tgt_bare = target_child_name(view_name, src);
@@ -2993,23 +3004,34 @@ pub(crate) fn rebuild_mirror_leaves(
                 &read_partition_constraint_def(client, schema, &tgt_bare),
             )
         });
-    let mut all_diffed = allow_diff;
+    let mut diffed_rows = allow_diff.then_some(0u64);
     for src in behind_root.into_iter().chain(diffable) {
         let outcome = execute_partition_swap_for_child(
-            client, view_name, schema, src, base_query, end_query, unlogged, all_diffed,
+            client,
+            view_name,
+            schema,
+            src,
+            base_query,
+            end_query,
+            unlogged,
+            diffed_rows.is_some(),
         )
         .map_err(|e| (src.clone(), e))?;
-        all_diffed &= outcome == SwapOutcome::Diffed;
+        diffed_rows = match (diffed_rows, outcome) {
+            (Some(rows), SwapOutcome::Diffed(staged)) => Some(rows + staged),
+            _ => None,
+        };
     }
-    Ok(all_diffed)
+    Ok(diffed_rows)
 }
 
 /// How one mirror leaf was rebuilt, which decides what its dependents still need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwapOutcome {
     /// Every change to the leaf went through the root as DML its observing
-    /// dependents received (a row diff, or an empty leaf that stayed empty).
-    Diffed,
+    /// dependents received (a row diff, or an empty leaf that stayed empty),
+    /// staging this many rows for a DEFERRED one.
+    Diffed(u64),
     /// The leaf was swapped or filled behind the root's statement triggers:
     /// no dependent learned what changed.
     Swapped,
@@ -3240,7 +3262,7 @@ fn swap_partition_child_ddl(
         } else {
             end_query
         };
-        crate::rebuild_diff::rebuild_target_rows(
+        let staged_rows = crate::rebuild_diff::rebuild_target_rows(
             client,
             view_name,
             rebuild_sql,
@@ -3260,7 +3282,7 @@ fn swap_partition_child_ddl(
             rows_after,
             rebuilt_at.as_deref(),
         );
-        return Ok(SwapOutcome::Diffed);
+        return Ok(SwapOutcome::Diffed(staged_rows));
     }
     if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
@@ -3308,7 +3330,7 @@ fn swap_partition_child_ddl(
             && rows_after == Some(0)
             && !lost_rows_without_dml(client, view_name);
         return Ok(if tgt_propagates && stayed_empty {
-            SwapOutcome::Diffed
+            SwapOutcome::Diffed(0)
         } else {
             SwapOutcome::Swapped
         });

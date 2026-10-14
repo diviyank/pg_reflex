@@ -558,7 +558,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                     unlogged,
                     true,
                 ) {
-                    Ok(all_diffed) => all_diffed,
+                    Ok(diffed_rows) => diffed_rows.is_some(),
                     Err((src_bare, e)) => {
                         warning!(
                             "pg_reflex: per-partition reconcile of '{}' for child '{}' failed: {}",
