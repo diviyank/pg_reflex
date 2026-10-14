@@ -2,6 +2,7 @@ DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has
 BEGIN
     SELECT EXISTS(SELECT 1 FROM "__REFLEX_SLOT_REF_NEW__" LIMIT 1) INTO _has_rows;
     IF NOT _has_rows THEN RETURN NULL; END IF;
+    __REFLEX_SLOT_UNREAD_COLUMN_CHECK__
     FOR _rec IN
       SELECT name, base_query, end_query, aggregations::text AS aggregations,
              COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate, ignored_sources
