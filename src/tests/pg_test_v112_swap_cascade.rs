@@ -131,19 +131,21 @@ impl ScChain {
     }
 
     /// Commits `statements` (which may return rows) as one implicit
-    /// transaction that records its id first; the error text when it raises.
+    /// transaction that records its id first; the error text when it did not
+    /// commit. `dblink(..., false)` turns errors into NOTICEs and keeps the rows
+    /// of the last statement that returned some, so only the id the transaction
+    /// wrote, which survives only if it committed, tells the outcome.
     fn commit(&self, statements: &str) -> Result<(), String> {
         worker_exec("TRUNCATE sc_trace, sc_xact");
-        let committed = Spi::get_one::<i64>(&format!(
+        Spi::run(&format!(
             "SELECT count(*) FROM dblink('reflex_lock_worker', {}, false) AS t(v text)",
             sql_lit(&self.named(&format!(
                 "INSERT INTO sc_xact SELECT pg_current_xact_id()::text; {statements}; \
                  SELECT 'committed'"
             )))
         ))
-        .expect("dblink")
-        .unwrap_or(0);
-        if committed == 1 {
+        .expect("dblink");
+        if worker_scalar_i64("SELECT count(*) FROM sc_xact") == 1 {
             return Ok(());
         }
         let error = Spi::get_one::<String>("SELECT dblink_error_message('reflex_lock_worker')")
@@ -151,7 +153,7 @@ impl ScChain {
             .unwrap_or_default();
         let _ =
             Spi::get_one::<String>("SELECT dblink_exec('reflex_lock_worker', 'ROLLBACK', false)");
-        Err(error)
+        Err(format!("transaction did not commit: {error}"))
     }
 
     fn create(&self, call: &str) {
@@ -2813,6 +2815,8 @@ fn v112_sc_commit_reports_a_failed_transaction_as_failed() {
         "CREATE TABLE sc_parent (id INT PRIMARY KEY)",
         "CREATE TABLE sc_child (parent_id INT REFERENCES sc_parent (id) \
            DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE FUNCTION sc_orphan() RETURNS INT LANGUAGE sql AS \
+           $$ INSERT INTO sc_child VALUES (3) RETURNING 1 $$",
     ] {
         chain.exec(ddl);
     }
@@ -2828,6 +2832,19 @@ fn v112_sc_commit_reports_a_failed_transaction_as_failed() {
             (outcome.is_ok() != *should_commit)
                 .then(|| format!("{label}: commit() returned {outcome:?}"))
         })
+        .collect();
+    let single_statement_helpers = [
+        ("v112_sh_remote", v112_sh_remote("sc_orphan()").is_ok()),
+        ("v112_pl_call", v112_pl_call("sc_orphan()").is_ok()),
+    ];
+    let wrong: Vec<String> = wrong
+        .into_iter()
+        .chain(
+            single_statement_helpers
+                .into_iter()
+                .filter(|(_, reported_ok)| *reported_ok)
+                .map(|(helper, _)| format!("{helper}: a deferred FK violation at COMMIT reported Ok")),
+        )
         .collect();
     probe_db_close(dbname);
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));

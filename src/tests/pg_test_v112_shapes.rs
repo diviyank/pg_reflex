@@ -29,14 +29,10 @@ fn v112_sh_remote(sql: &str) -> Result<String, String> {
         sql_lit(&format!("SELECT ({sql})::text"))
     ))
     .unwrap_or_else(|e| panic!("v112_sh_remote failed for <{sql}>: {e}"));
-    match value {
-        Some(text) => Ok(text),
-        None => Err(Spi::get_one::<String>(
-            "SELECT dblink_error_message('reflex_lock_worker')",
-        )
-        .expect("dblink_error_message")
-        .unwrap_or_default()),
+    if let Some(error) = dblink_last_error("reflex_lock_worker") {
+        return Err(error);
     }
+    value.ok_or_else(String::new)
 }
 
 /// What `create_reflex_ivm` answered, a raised error included.
