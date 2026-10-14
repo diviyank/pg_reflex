@@ -273,7 +273,10 @@ fn gec_poisoned_partition_attach_takes_path_b() {
         worker_exec(ddl);
     }
     assert_eq!(
-        rbc_select(&format!("create_reflex_ivm('gec_ap_v', {})", sql_lit(sql))),
+        rbc_select(&format!(
+            "create_reflex_ivm('gec_ap_v', {}, 'k', NULL, NULL, NULL, ARRAY[]::text[])",
+            sql_lit(sql)
+        )),
         "CREATE REFLEX INCREMENTAL VIEW"
     );
     worker_exec(
