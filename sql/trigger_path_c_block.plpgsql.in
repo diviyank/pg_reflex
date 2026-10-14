@@ -32,7 +32,7 @@ IF _directional_op = 'INSERT_PROMOTED' THEN
                  END;
                END IF;
                SELECT wipe_threshold INTO _pc_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name;
-               _pc_thr := COALESCE(_pc_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5);
+               _pc_thr := COALESCE(_pc_per_imv, public.__reflex_setting('reflex.wipe_threshold', 0.5::NUMERIC));
                IF _pc_imv_rows IS NOT NULL AND _pc_imv_rows > 0 AND _pc_est IS NOT NULL THEN
                  _pc_ratio := _pc_est::NUMERIC / _pc_imv_rows;
                  IF _pc_ratio >= _pc_thr THEN
