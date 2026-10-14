@@ -524,12 +524,13 @@ extension_sql!(
     END;
     $fn$;
 
-    -- 1.12.2: the one reader of pg_reflex's own settings (reflex.wipe_threshold,
-    -- reflex.wipe_floor_rows, ...), typed by `_default`. A custom setting once
-    -- SET LOCAL, or SET then RESET, reads back as '' for the rest of the session:
-    -- that, like an unset setting, gives the default. A value that does not parse
-    -- as the default's type gives the default with a WARNING: a raise here would
-    -- discard a DEFERRED flush's staged delta.
+    -- 1.12.2: reads a pg_reflex setting for SQL this extension installs, typed by
+    -- `_default`. A custom setting once SET LOCAL, or SET then RESET, reads back
+    -- as '' for the rest of the session: that, like an unset setting, gives the
+    -- default. A value that does not parse as the default's type gives the
+    -- default with a WARNING. SQL the library generates at run time must not call
+    -- it (it reads `NULLIF(current_setting(..., true), '')` inline): the library
+    -- can run before ALTER EXTENSION UPDATE has created this function.
     CREATE OR REPLACE FUNCTION public.__reflex_setting(_setting TEXT, _default anyelement)
     RETURNS anyelement LANGUAGE plpgsql STABLE AS $fn$
     DECLARE
