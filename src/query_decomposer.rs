@@ -87,6 +87,15 @@ pub fn transition_old_table_name(source_table: &str) -> String {
     ))
 }
 
+/// Name of the temp view of every row the DEFERRED flush stages for a source's
+/// IMV, old and new side, before netting.
+pub fn staged_rows_view_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_staged_{}",
+        sanitized_source_suffix(source_table)
+    ))
+}
+
 /// Wrap a sanitized local identifier in the schema of `qualified_name`.
 /// Always returns a quoted identifier reference: `"schema"."local"` when
 /// `qualified_name` has a schema, `"local"` otherwise. The local part is run

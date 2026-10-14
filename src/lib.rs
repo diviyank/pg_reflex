@@ -1958,6 +1958,8 @@ mod tests {
     include!("tests/pg_test_v112_full_join_scope.rs");
     include!("tests/pg_test_v1121_heal_own_rebuild.rs");
     include!("tests/pg_test_v1122_push_scoped_reader.rs");
+    include!("tests/pg_test_v1122_minmax_pruned_recompute.rs");
+    include!("tests/pg_test_v1122_minmax_bulk_replace.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -170,7 +170,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
 /// statements. `build_merge_using` returns two statements (a gated
 /// sargable/NULL-safe pair) when the group key is nullable; the dispatch builders
 /// split here so each becomes its own `EXECUTE`.
-fn split_reflex_statements(sql: &str) -> Vec<String> {
+pub(crate) fn split_reflex_statements(sql: &str) -> Vec<String> {
     sql.split("\n--<<REFLEX_SEP>>--\n")
         .map(str::trim)
         .filter(|s| !s.is_empty())
