@@ -244,3 +244,23 @@ fn v1122_psr_failed_key_refresh_falls_back_to_a_full_reconcile() {
 }
 
 
+
+/// Step 0.4 guard: a push whose diff staged fewer rows than half the rows of
+/// the plans a refresh would rescan leaves the aggregates to apply those rows
+/// at COMMIT, as before; both stay correct.
+#[pg_test]
+fn v1122_psr_low_churn_push_leaves_the_aggregates_to_the_commit_flush() {
+    let chain = psr_open("reflex_psr_t8");
+    let one_product_changed = "SELECT plan, d, yr, product, loc, \
+           qty + CASE WHEN product = 1 THEN 3 ELSE 0 END, base FROM sc_ss_p_2_2027_02";
+    let flushes_before = psr_flush_count("psr_sum");
+    let outcome = psr_commit(&chain, &sc_swap(2, 2, one_product_changed));
+    let flushes_after = psr_flush_count("psr_sum");
+    let refreshes = [psr_refreshes_of(&chain, "sc_fdya"), psr_refreshes_of(&chain, "psr_sum")];
+    let wrong = psr_wrong(&chain);
+    probe_db_close("reflex_psr_t8");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(refreshes, [Vec::<String>::new(), Vec::new()], "[sc_fdya, psr_sum] refreshes");
+    assert_eq!(flushes_after, flushes_before + 1, "psr_sum applied the row diff at COMMIT");
+}
