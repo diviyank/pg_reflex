@@ -32,7 +32,8 @@ pub(crate) fn may_replace_large_deltas(plan: &AggregationPlan, netted_delta: boo
 /// on that separator.
 ///
 /// `staged_delta` is the base query over every row staged for the source, old
-/// and new side, before netting: netting the delta costs as much as aggregating
+/// and new side, before netting (the rows the netted delta reads, so after a
+/// rebuild in the transaction only those staged after it): netting the delta costs as much as aggregating
 /// it, and the groups of the un-netted rows are a superset of those the netted
 /// delta touches. Replacing a group the delta leaves unchanged is still exact,
 /// so the superset only costs speed, and so does counting rows that net out.
