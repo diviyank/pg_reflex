@@ -727,12 +727,6 @@ fn literal_group_key_filters_sql(affected_tbl: &str, keys: &[(&str, &str)]) -> S
     )
 }
 
-/// `EXISTS` over the affected-groups table `affected_tbl`, its key columns
-/// projected as `projection` and matched by `conds`.
-fn affected_exists(affected_tbl: &str, projection: &str, conds: &str) -> String {
-    format!("EXISTS (SELECT 1 FROM (SELECT {projection} FROM {affected_tbl}) __ng WHERE {conds})")
-}
-
 /// `text` as a dollar-quoted literal whose tag does not occur in it.
 fn dollar_quoted(text: &str) -> String {
     let tag = (0..)
@@ -834,7 +828,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // identically once the caller has already proven (via `eq`) that no group key
     // involved can be NULL, so scoping this by the same `eq` the join predicates
     // already use is sound, not just fast.
-    let scoped_source = |eq: bool| -> String {
+    let scoped_source = |eq: bool, keys_marker: &str| -> String {
         match affected_tbl {
             Some(at) => {
                 // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
@@ -874,7 +868,10 @@ pub(crate) fn build_min_max_recompute_sql_inner(
                     .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
                     .collect::<Vec<_>>()
                     .join(" AND ");
-                let filter = format!(" AND {}", affected_exists(at, &projection, &conds));
+                let filter = format!(
+                    " AND {}EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
+                    keys_marker, projection, at, conds
+                );
                 match splice_before_group_by(orig_base_query, &filter) {
                     Some(spliced) => spliced,
                     None => orig_base_query.to_string(),
@@ -909,12 +906,12 @@ pub(crate) fn build_min_max_recompute_sql_inner(
             .collect::<Vec<_>>()
             .join(" AND ")
     };
-    let build_update = |eq: bool| -> String {
+    let build_update = |eq: bool, keys_marker: &str| -> String {
         format!(
             "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
             intermediate_tbl,
             set_parts.join(", "),
-            scoped_source(eq),
+            scoped_source(eq, keys_marker),
             update_join(eq),
             null_check.join(" OR ")
         )
@@ -926,7 +923,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         let all_not_null = group_cols
             .iter()
             .all(|gc| plan.not_null_columns.contains(gc.as_str()));
-        return Some(build_update(all_not_null));
+        return Some(build_update(all_not_null, ""));
     };
 
     // Gate the recompute on `EXISTS (intermediate row with NULL slot
@@ -966,32 +963,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         .zip(group_cols.iter())
         .collect();
     let literal_keyed_update = |eq: bool| -> Option<LiteralKeyedUpdate> {
-        let projection = pairs
-            .iter()
-            .enumerate()
-            .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let op = if eq { "=" } else { "IS NOT DISTINCT FROM" };
-        let conds = pairs
-            .iter()
-            .enumerate()
-            .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let filter = format!(
-            " AND {LITERAL_KEYS_MARKER}{}",
-            affected_exists(at, &projection, &conds)
-        );
-        let spliced = splice_before_group_by(orig_base_query, &filter)?;
-        let update = format!(
-            "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
-            intermediate_tbl,
-            set_parts.join(", "),
-            spliced,
-            update_join(eq),
-            null_check.join(" OR ")
-        );
+        let update = build_update(eq, LITERAL_KEYS_MARKER);
         let (prefix, suffix) = update.split_once(LITERAL_KEYS_MARKER)?;
         Some(LiteralKeyedUpdate {
             prefix: prefix.to_string(),
@@ -1003,7 +975,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         .map(|(raw, norm)| (raw.as_str(), norm.as_str()))
         .collect();
     let do_block = |check: &str, eq: bool| -> String {
-        let static_update = build_update(eq);
+        let static_update = build_update(eq, "");
         match literal_keyed_update(eq) {
             Some(keyed) => format!(
                 "DO $_reflex_recompute$ DECLARE __reflex_keys TEXT; BEGIN IF {check} THEN \
