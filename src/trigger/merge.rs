@@ -650,11 +650,12 @@ pub fn build_min_max_recompute_sql_force_topk(
     build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, true)
 }
 
-/// Most groups a MIN/MAX recompute lists as literal keys. Each key is one arm of
-/// an OR the planner expands and checks against every partition bound, so the
-/// planning cost grows with the list; beyond this the correlated EXISTS form is
-/// cheaper to plan, and that many groups rarely sit in few partitions anyway.
-pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 1000;
+/// Most distinct values of one group column a MIN/MAX recompute lists as a
+/// literal array. The planner estimates `col = ANY(array)` once per element on
+/// every partition it keeps, so a long array costs planning time even where it
+/// prunes nothing (measured, cassert, 1,200 leaves: +70 ms at 100 values,
+/// +640 ms at 1,000). A column with more distinct values gets no array.
+pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 100;
 
 /// Key types whose text form reads back as the same value in the same session,
 /// whatever its DateStyle, TimeZone or extra_float_digits. Left out: floats,
@@ -664,63 +665,72 @@ pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 1000;
 const ROUND_TRIP_KEY_TYPES: &str = "'int2', 'int4', 'int8', 'numeric', 'text', 'varchar', \
      'bpchar', 'date', 'timestamp', 'bool', 'uuid'";
 
-/// Stands for the literal key list in a recompute UPDATE until it is split in
-/// two around it. A NUL never occurs in SQL text PostgreSQL stored.
+/// Stands for the literal key filters in a recompute UPDATE until it is split
+/// in two around it. A NUL never occurs in SQL text PostgreSQL stored.
 const LITERAL_KEYS_MARKER: &str = "\u{0}";
 
-/// A recompute UPDATE whose source scan is filtered by `(group keys) IN (...)`,
-/// split where the literal key list goes.
+/// A recompute UPDATE split where its literal key filters go.
 struct LiteralKeyedUpdate {
     prefix: String,
     suffix: String,
 }
 
-/// SQL yielding the affected group keys as an `IN` list of typed literals,
-/// `('2'::integer, '2027'::integer), ...`, or NULL when a literal list would
-/// not select exactly the groups the EXISTS form selects: a NULL key (never
-/// equal to a literal), a key type outside `ROUND_TRIP_KEY_TYPES`, no group,
-/// or more than `MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP` groups.
-fn literal_group_keys_sql(affected_tbl: &str, key_columns: &[&str]) -> String {
+/// SQL yielding `(raw key) = ANY('{...}'::type[]) AND ...`: for each group
+/// column with at most `MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP` distinct affected
+/// values, the array of those values. Every affected group's row satisfies it,
+/// so ANDed to the EXISTS scope it selects the same rows, and lets the planner
+/// prune partitions on those columns. NULL or empty when the arrays could drop
+/// an affected row: a NULL key (never equal to an element), a key type outside
+/// `ROUND_TRIP_KEY_TYPES` (its elements may not read back as the same value), or
+/// no affected group.
+fn literal_group_key_filters_sql(affected_tbl: &str, keys: &[(&str, &str)]) -> String {
     let relation = format!("to_regclass('{}')", affected_tbl.replace('\'', "''"));
-    let column_names = key_columns
+    let column_names = keys
         .iter()
-        .map(|c| format!("'{}'", c.replace('\'', "''")))
+        .map(|(_, column)| format!("'{}'", column.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    let projection = key_columns
+    let projection = keys
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("\"{c}\" AS __g{i}"))
+        .map(|(i, (_, column))| format!("\"{column}\" AS __g{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let none_null = (0..key_columns.len())
+    let none_null = (0..keys.len())
         .map(|i| format!("__g{i} IS NOT NULL"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let typed_literals = key_columns
+    let filters = keys
         .iter()
         .enumerate()
-        .map(|(i, c)| {
+        .map(|(i, (raw, column))| {
             format!(
-                "format('%L::%s', __g{i}, (SELECT format_type(atttypid, atttypmod) \
-                 FROM pg_attribute WHERE attrelid = {relation} AND attname = '{}'))",
-                c.replace('\'', "''")
+                "CASE WHEN count(DISTINCT __g{i}) <= {cap} THEN \
+                 format('(%s) = ANY(%L::%s[])', {raw}, array_agg(DISTINCT __g{i})::text, \
+                   (SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+                    WHERE attrelid = {relation} AND attname = '{column}')) END",
+                cap = MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP,
+                raw = dollar_quoted(raw),
+                column = column.replace('\'', "''"),
             )
         })
         .collect::<Vec<_>>()
-        .join(" || ', ' || ");
+        .join(", ");
     format!(
-        "CASE WHEN count(*) BETWEEN 1 AND {cap} AND bool_and({none_null}) \
+        "SELECT concat_ws(' AND ', {filters}) FROM (SELECT {projection} FROM {affected_tbl}) __keys \
+         HAVING count(*) >= 1 AND bool_and({none_null}) \
            AND (SELECT count(*) FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
                 WHERE a.attrelid = {relation} AND a.attname IN ({column_names}) \
                   AND t.typnamespace = 'pg_catalog'::regnamespace \
-                  AND t.typname IN ({ROUND_TRIP_KEY_TYPES})) = {n} \
-         THEN string_agg('(' || {typed_literals} || ')', ', ') END \
-         FROM (SELECT DISTINCT {projection} FROM {affected_tbl} LIMIT {limit}) __keys",
-        cap = MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP,
-        n = key_columns.len(),
-        limit = MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP + 1,
+                  AND t.typname IN ({ROUND_TRIP_KEY_TYPES})) = {n}",
+        n = keys.len(),
     )
+}
+
+/// `EXISTS` over the affected-groups table `affected_tbl`, its key columns
+/// projected as `projection` and matched by `conds`.
+fn affected_exists(affected_tbl: &str, projection: &str, conds: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM (SELECT {projection} FROM {affected_tbl}) __ng WHERE {conds})")
 }
 
 /// `text` as a dollar-quoted literal whose tag does not occur in it.
@@ -864,10 +874,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
                     .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
                     .collect::<Vec<_>>()
                     .join(" AND ");
-                let filter = format!(
-                    " AND EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
-                    projection, at, conds
-                );
+                let filter = format!(" AND {}", affected_exists(at, &projection, &conds));
                 match splice_before_group_by(orig_base_query, &filter) {
                     Some(spliced) => spliced,
                     None => orig_base_query.to_string(),
@@ -959,12 +966,23 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         .zip(group_cols.iter())
         .collect();
     let literal_keyed_update = |eq: bool| -> Option<LiteralKeyedUpdate> {
-        let lhs = pairs
+        let projection = pairs
             .iter()
-            .map(|(raw, _)| format!("({raw})"))
+            .enumerate()
+            .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
             .collect::<Vec<_>>()
             .join(", ");
-        let filter = format!(" AND ({lhs}) IN ({LITERAL_KEYS_MARKER})");
+        let op = if eq { "=" } else { "IS NOT DISTINCT FROM" };
+        let conds = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let filter = format!(
+            " AND {LITERAL_KEYS_MARKER}{}",
+            affected_exists(at, &projection, &conds)
+        );
         let spliced = splice_before_group_by(orig_base_query, &filter)?;
         let update = format!(
             "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
@@ -980,17 +998,20 @@ pub(crate) fn build_min_max_recompute_sql_inner(
             suffix: suffix.to_string(),
         })
     };
-    let affected_key_columns: Vec<&str> = pairs.iter().map(|(_, norm)| norm.as_str()).collect();
+    let affected_keys: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(raw, norm)| (raw.as_str(), norm.as_str()))
+        .collect();
     let do_block = |check: &str, eq: bool| -> String {
         let static_update = build_update(eq);
         match literal_keyed_update(eq) {
             Some(keyed) => format!(
                 "DO $_reflex_recompute$ DECLARE __reflex_keys TEXT; BEGIN IF {check} THEN \
-                 SELECT {keys} INTO __reflex_keys; \
-                 IF __reflex_keys IS NULL THEN {static_update}; \
-                 ELSE EXECUTE {prefix} || __reflex_keys || {suffix}; END IF; \
+                 {keys} INTO __reflex_keys; \
+                 IF COALESCE(__reflex_keys, '') = '' THEN {static_update}; \
+                 ELSE EXECUTE {prefix} || __reflex_keys || ' AND ' || {suffix}; END IF; \
                  END IF; END $_reflex_recompute$",
-                keys = literal_group_keys_sql(at, &affected_key_columns),
+                keys = literal_group_key_filters_sql(at, &affected_keys),
                 prefix = dollar_quoted(&keyed.prefix),
                 suffix = dollar_quoted(&keyed.suffix),
             ),
