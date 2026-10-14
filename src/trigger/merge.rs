@@ -657,11 +657,12 @@ pub fn build_min_max_recompute_sql_force_topk(
 /// +640 ms at 1,000). A column with more distinct values gets no array.
 pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 100;
 
-/// Key types whose text form reads back as the same value in the same session,
-/// whatever its DateStyle, TimeZone or extra_float_digits. Left out: floats,
-/// which print rounded when extra_float_digits < 1; timestamptz, which under
-/// DateStyle SQL or Postgres prints a zone abbreviation that may read back as
-/// another zone (IST); domains and every other type.
+/// Key types the bound key arrays are allowed for. The arrays reach the
+/// recompute as typed values (`EXECUTE ... USING`), never as text, so no
+/// DateStyle, TimeZone or extra_float_digits setting can change them. The list
+/// is still kept to the types whose `=` is plain value equality and that the
+/// tests cover; floats, timestamptz, domains and every other type keep the
+/// EXISTS form alone.
 const ROUND_TRIP_KEY_TYPES: &str = "'int2', 'int4', 'int8', 'numeric', 'text', 'varchar', \
      'bpchar', 'date', 'timestamp', 'bool', 'uuid'";
 
@@ -675,14 +676,14 @@ struct LiteralKeyedUpdate {
     suffix: String,
 }
 
-/// SQL yielding `(raw key) = ANY('{...}'::type[]) AND ...`: for each group
-/// column with at most `MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP` distinct affected
-/// values, the array of those values. Every affected group's row satisfies it,
-/// so ANDed to the EXISTS scope it selects the same rows, and lets the planner
-/// prune partitions on those columns. NULL or empty when the arrays could drop
-/// an affected row: a NULL key (never equal to an element), a key type outside
-/// `ROUND_TRIP_KEY_TYPES` (its elements may not read back as the same value), or
-/// no affected group.
+/// SQL yielding one row: `filters`, the text `(raw key) = ANY($i) AND ...`, and
+/// `a0`, `a1`, ..., the arrays of distinct affected values of each group column,
+/// to bind as `$1`, `$2`, .... A column with more than
+/// `MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP` distinct values gets no filter. Every
+/// affected group's row satisfies the filters, so ANDed to the EXISTS scope they
+/// select the same rows, and let the planner prune partitions on those columns.
+/// No row when the arrays could drop an affected row: a NULL key (never equal to
+/// an element), a key type outside `ROUND_TRIP_KEY_TYPES`, or no affected group.
 fn literal_group_key_filters_sql(affected_tbl: &str, keys: &[(&str, &str)]) -> String {
     let relation = format!("to_regclass('{}')", affected_tbl.replace('\'', "''"));
     let column_names = keys
@@ -703,21 +704,23 @@ fn literal_group_key_filters_sql(affected_tbl: &str, keys: &[(&str, &str)]) -> S
     let filters = keys
         .iter()
         .enumerate()
-        .map(|(i, (raw, column))| {
+        .map(|(i, (raw, _))| {
             format!(
-                "CASE WHEN count(DISTINCT __g{i}) <= {cap} THEN \
-                 format('(%s) = ANY(%L::%s[])', {raw}, array_agg(DISTINCT __g{i})::text, \
-                   (SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
-                    WHERE attrelid = {relation} AND attname = '{column}')) END",
+                "CASE WHEN count(DISTINCT __g{i}) <= {cap} THEN '(' || {raw} || ') = ANY(${n})' END",
                 cap = MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP,
                 raw = dollar_quoted(raw),
-                column = column.replace('\'', "''"),
+                n = i + 1,
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let arrays = (0..keys.len())
+        .map(|i| format!("array_agg(DISTINCT __g{i}) AS a{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT concat_ws(' AND ', {filters}) FROM (SELECT {projection} FROM {affected_tbl}) __keys \
+        "SELECT concat_ws(' AND ', {filters}) AS filters, {arrays} \
+         FROM (SELECT {projection} FROM {affected_tbl}) __keys \
          HAVING count(*) >= 1 AND bool_and({none_null}) \
            AND (SELECT count(*) FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
                 WHERE a.attrelid = {relation} AND a.attname IN ({column_names}) \
@@ -978,14 +981,19 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         let static_update = build_update(eq, "");
         match literal_keyed_update(eq) {
             Some(keyed) => format!(
-                "DO $_reflex_recompute$ DECLARE __reflex_keys TEXT; BEGIN IF {check} THEN \
+                "DO $_reflex_recompute$ DECLARE __reflex_keys RECORD; BEGIN IF {check} THEN \
                  {keys} INTO __reflex_keys; \
-                 IF COALESCE(__reflex_keys, '') = '' THEN {static_update}; \
-                 ELSE EXECUTE {prefix} || __reflex_keys || ' AND ' || {suffix}; END IF; \
+                 IF NOT FOUND THEN {static_update}; \
+                 ELSIF COALESCE(__reflex_keys.filters, '') = '' THEN {static_update}; \
+                 ELSE EXECUTE {prefix} || __reflex_keys.filters || ' AND ' || {suffix} USING {bound}; END IF; \
                  END IF; END $_reflex_recompute$",
                 keys = literal_group_key_filters_sql(at, &affected_keys),
                 prefix = dollar_quoted(&keyed.prefix),
                 suffix = dollar_quoted(&keyed.suffix),
+                bound = (0..affected_keys.len())
+                    .map(|i| format!("__reflex_keys.a{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
             None => format!(
                 "DO $_reflex_recompute$ BEGIN IF {check} THEN {static_update}; END IF; END $_reflex_recompute$"
