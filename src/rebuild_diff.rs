@@ -473,28 +473,34 @@ fn apply_keyed_diff(
         1,
     )];
     if !others.is_empty() {
-        stmts.push((format!(
-            "UPDATE {root} t SET {} FROM {diff} d WHERE d.op = 'u' AND {by_identity}",
-            others
+        stmts.push((
+            format!(
+                "UPDATE {root} t SET {} FROM {diff} d WHERE d.op = 'u' AND {by_identity}",
+                others
+                    .iter()
+                    .map(|c| format!("{q} = (d.r).{q}", q = quoted(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            2,
+        ));
+    }
+    stmts.push((
+        format!(
+            "INSERT INTO {root} ({cols}) SELECT {rcols} FROM {diff} d WHERE d.op = 'i'",
+            cols = columns
                 .iter()
-                .map(|c| format!("{q} = (d.r).{q}", q = quoted(c)))
+                .map(|c| quoted(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            rcols = columns
+                .iter()
+                .map(|c| format!("(d.r).{}", quoted(c)))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ), 2));
-    }
-    stmts.push((format!(
-        "INSERT INTO {root} ({cols}) SELECT {rcols} FROM {diff} d WHERE d.op = 'i'",
-        cols = columns
-            .iter()
-            .map(|c| quoted(c))
-            .collect::<Vec<_>>()
-            .join(", "),
-        rcols = columns
-            .iter()
-            .map(|c| format!("(d.r).{}", quoted(c)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ), 1));
+        ),
+        1,
+    ));
     let mut staged_delta_rows = 0u64;
     for (stmt, staged_per_row) in &stmts {
         let written = client.update(stmt, None, &[]).unwrap_or_report().len() as u64;
