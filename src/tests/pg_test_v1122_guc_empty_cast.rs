@@ -250,11 +250,12 @@ fn gec_poisoned_path_c_does_not_fail() {
     assert_imv_correct("gec_pc_v", sql);
 }
 
-/// An attach of 6000 rows onto 2000 analysed ones, to an unpartitioned IMV,
-/// after `poison` has set up the worker session: the attach must be applied
-/// by `reflex_apply_partition_delta`'s Path B reconcile, which the default
-/// threshold selects. Returns the WARNINGs kept during the attach.
-fn gec_attach_case(dbname: &str, poison: fn()) -> Vec<String> {
+/// An attach of `attach_rows` rows onto 2000 analysed ones, to an
+/// unpartitioned IMV, after `poison` has set up the worker session. Returns
+/// the WARNINGs kept during the attach and whether
+/// `reflex_apply_partition_delta` applied it by its Path B reconcile (taken
+/// when `attach_rows / 2000` reaches the threshold).
+fn gec_attach_case(dbname: &str, attach_rows: i32, poison: fn()) -> (Vec<String>, bool) {
     let sql = "SELECT k, SUM(v) AS s, COUNT(*) AS n FROM gec_ap GROUP BY k";
     probe_db_open(dbname);
     for ddl in [
@@ -263,7 +264,7 @@ fn gec_attach_case(dbname: &str, poison: fn()) -> Vec<String> {
         "INSERT INTO gec_ap SELECT 1, g FROM generate_series(1, 2000) g",
         "ANALYZE gec_ap",
         "CREATE TABLE gec_ap_2 (LIKE gec_ap)",
-        "INSERT INTO gec_ap_2 SELECT 2, g FROM generate_series(1, 6000) g",
+        &format!("INSERT INTO gec_ap_2 SELECT 2, g FROM generate_series(1, {attach_rows}) g"),
         "CREATE TABLE gec_trace (context TEXT NOT NULL)",
         "CREATE FUNCTION gec_note_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
            DECLARE stack TEXT; \
@@ -288,24 +289,35 @@ fn gec_attach_case(dbname: &str, poison: fn()) -> Vec<String> {
     worker_exec("ALTER TABLE gec_ap ATTACH PARTITION gec_ap_2 FOR VALUES IN (2)");
     let warnings = sc_text_rows("SELECT unnest(tests.gec_kept_warnings())");
     assert_eq!(rbc_mismatch("gec_ap_v", sql), 0, "gec_ap_v matches its recompute");
-    assert!(
-        worker_scalar_i64(
-            "SELECT count(*)::int8 FROM gec_trace \
-              WHERE context LIKE '%reflex_apply_partition_delta%' \
-                AND context LIKE '%reflex_reconcile%'"
-        ) > 0,
-        "the attach is applied by Path B's reconcile: {:?}",
-        sc_text_rows("SELECT left(context, 400) FROM gec_trace")
-    );
+    let path_b = worker_scalar_i64(
+        "SELECT count(*)::int8 FROM gec_trace \
+          WHERE context LIKE '%reflex_apply_partition_delta%' \
+            AND context LIKE '%reflex_reconcile%'",
+    ) > 0;
     gec_assert_no_flush_failure();
     probe_db_close(dbname);
-    warnings
+    (warnings, path_b)
 }
 
 /// T4, `reflex_apply_partition_delta` in a poisoned session.
 #[pg_test]
 fn gec_poisoned_partition_attach_takes_path_b() {
-    gec_attach_case("reflex_gec_t4_attach", gec_poison_worker_with_set_local);
+    let (_, path_b) =
+        gec_attach_case("reflex_gec_t4_attach", 6000, gec_poison_worker_with_set_local);
+    assert!(path_b, "the attach is applied by Path B's reconcile");
+}
+
+/// `reflex_apply_partition_delta` in a poisoned session uses exactly the
+/// default threshold 0.5: an attach of 0.6 x the source takes Path B, one of
+/// 0.4 x does not.
+#[pg_test]
+fn gec_poisoned_partition_delta_uses_the_default_threshold() {
+    let (_, above) =
+        gec_attach_case("reflex_gec_pd_above", 1200, gec_poison_worker_with_set_local);
+    assert!(above, "ratio 0.6 reaches the default 0.5: Path B");
+    let (_, below) =
+        gec_attach_case("reflex_gec_pd_below", 800, gec_poison_worker_with_set_local);
+    assert!(!below, "ratio 0.4 stays under the default 0.5: delta path");
 }
 
 /// The partition-anchor debug switch is read on every partitioned create and
@@ -339,9 +351,10 @@ fn gec_poisoned_debug_anchor_switch_does_not_abort_create() {
 /// naming the setting.
 #[pg_test]
 fn gec_unparsable_threshold_in_partition_delta_warns_and_defaults() {
-    let warnings = gec_attach_case("reflex_gec_t5_attach", || {
+    let (warnings, path_b) = gec_attach_case("reflex_gec_t5_attach", 6000, || {
         worker_exec("SET reflex.wipe_threshold = 'abc'")
     });
+    assert!(path_b, "the default threshold applies: Path B");
     assert!(
         warnings.iter().any(|w| w.contains("reflex.wipe_threshold")),
         "a WARNING names reflex.wipe_threshold: {warnings:?}"
@@ -491,8 +504,208 @@ fn gec_setting_helper_reads_values_and_defaults() {
     assert_eq!(read("FALSE"), "true", "bool");
     Spi::run("SET reflex.gec_probe = 'abc'").expect("set");
     assert_eq!(read("0.5::NUMERIC"), "0.5", "unparsable");
-    Spi::run("SET reflex.gec_probe = '1e30'").expect("set");
-    assert_eq!(read("1000::BIGINT"), "1000", "out of range");
+    Spi::run("SET reflex.gec_probe = '99999999999999999999'").expect("set");
+    assert_eq!(read("1000::BIGINT"), "1000", "out of range (22003)");
     Spi::run("RESET reflex.gec_probe").expect("reset");
     assert_eq!(read("0.5::NUMERIC"), "0.5", "empty");
+}
+
+thread_local! {
+    static GEC_TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const GEC_TRACED_PREFIXES: &[&str] = &[
+    "pg_reflex wipe:",
+    "pg_reflex Path C smart bulk-INSERT:",
+    "REFLEX-DBG resolve_anchor",
+];
+
+unsafe extern "C-unwind" fn gec_keep_reflex_trace(edata: *mut pgrx::pg_sys::ErrorData) {
+    if edata.is_null() {
+        return;
+    }
+    let message = unsafe { (*edata).message };
+    if message.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().to_string();
+    if GEC_TRACED_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
+        GEC_TRACE.with(|kept| kept.borrow_mut().push(text));
+    }
+}
+
+/// Starts keeping the dispatch, Path C and anchor trace messages of the
+/// calling backend; the caller sets `log_min_messages` low enough for them to
+/// reach the server log, which is what calls the hook.
+#[pg_extern]
+fn gec_keep_trace() -> bool {
+    GEC_TRACE.with(|kept| kept.borrow_mut().clear());
+    unsafe {
+        pgrx::pg_sys::emit_log_hook = Some(gec_keep_reflex_trace);
+    }
+    true
+}
+
+/// The trace messages kept since the last call, one per row.
+#[pg_extern]
+fn gec_kept_trace() -> Vec<String> {
+    GEC_TRACE.with(|kept| kept.borrow_mut().drain(..).collect())
+}
+
+fn gec_kept_trace_in_process() -> Vec<String> {
+    Spi::get_one::<Vec<String>>("SELECT tests.gec_kept_trace()")
+        .expect("trace")
+        .unwrap_or_default()
+}
+
+/// The threshold the unpartitioned aggregate dispatch (dispatch.rs:128)
+/// actually uses, read from its `RAISE DEBUG 'pg_reflex wipe: ratio=% thr=%'`,
+/// after `setup` in a fresh worker session.
+fn gec_dispatch_threshold(dbname: &str, setup: &[&str]) -> Vec<String> {
+    let sql = "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM gec_src GROUP BY region";
+    probe_db_open(dbname);
+    for ddl in GEC_REGION_SRC_DDL {
+        worker_exec(ddl);
+    }
+    assert_eq!(
+        rbc_select(&format!(
+            "create_reflex_ivm('gec_v', {}, 'region', NULL, 'DEFERRED', NULL, ARRAY[]::text[])",
+            sql_lit(sql)
+        )),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    for step in setup {
+        worker_exec(step);
+    }
+    worker_exec("SET log_min_messages = debug1");
+    assert_eq!(rbc_select("tests.gec_keep_trace()"), "true");
+    worker_exec("UPDATE gec_src SET amount = amount + 5 WHERE id % 10 = 0 AND region IN ('A', 'C')");
+    let thresholds: Vec<String> = sc_text_rows("SELECT m FROM unnest(tests.gec_kept_trace()) m")
+        .iter()
+        .filter(|m| m.starts_with("pg_reflex wipe:"))
+        .map(|m| m.split("thr=").nth(1).unwrap_or("").split(' ').next().unwrap_or("").to_string())
+        .collect();
+    worker_exec("RESET log_min_messages");
+    assert_eq!(rbc_mismatch("gec_v", sql), 0, "gec_v matches its recompute");
+    gec_assert_no_flush_failure();
+    probe_db_close(dbname);
+    thresholds
+}
+
+/// '' must give exactly the never-set default at the generated dispatch (0.5
+/// for an IMV with no dependents), and a valid value must still be honoured.
+#[pg_test]
+fn gec_poisoned_dispatch_uses_the_never_set_default() {
+    let never_set = gec_dispatch_threshold("reflex_gec_thr_unset", &[]);
+    assert_eq!(never_set, vec!["0.5".to_string()], "never set: compiled default");
+    let set_local = gec_dispatch_threshold("reflex_gec_thr_local", &[GEC_SET_LOCAL_POISON]);
+    assert_eq!(set_local, never_set, "SET LOCAL-poisoned == never set");
+    let set_reset = gec_dispatch_threshold(
+        "reflex_gec_thr_reset",
+        &["SET reflex.wipe_threshold = 0.3", "RESET reflex.wipe_threshold"],
+    );
+    assert_eq!(set_reset, never_set, "SET+RESET-poisoned == never set");
+    let valid = gec_dispatch_threshold("reflex_gec_thr_valid", &["SET reflex.wipe_threshold = 0.3"]);
+    assert_eq!(valid, vec!["0.3".to_string()], "a valid value is honoured");
+}
+
+/// A dimension flip of `flipped` kinds into an IMV already holding `active`
+/// kinds (`facts` fact rows each), statistics fresh, in a session poisoned on
+/// `reflex.wipe_threshold`. Returns whether Path C took the flip.
+fn gec_path_c_taken(prefix: &str, active: i32, flipped: i32, facts: i32) -> bool {
+    let (dim, fact, imv) = (format!("{prefix}_d"), format!("{prefix}_f"), format!("{prefix}_v"));
+    Spi::run(&format!("CREATE TABLE {dim} (kind INT PRIMARY KEY, active BOOL NOT NULL)"))
+        .expect("dim");
+    Spi::run(&format!(
+        "CREATE TABLE {fact} (id SERIAL PRIMARY KEY, kind INT NOT NULL, v INT NOT NULL)"
+    ))
+    .expect("fact");
+    Spi::run(&format!(
+        "INSERT INTO {dim} SELECT k, k <= {active} FROM generate_series(1, {}) k",
+        active + flipped
+    ))
+    .expect("seed dim");
+    Spi::run(&format!(
+        "INSERT INTO {fact} (kind, v) SELECT k, g FROM generate_series(1, {}) k, \
+         generate_series(1, {facts}) g",
+        active + flipped
+    ))
+    .expect("seed fact");
+    let sql = format!(
+        "SELECT f.kind, SUM(f.v) AS s, COUNT(*) AS n FROM {fact} f \
+         JOIN {dim} d ON d.kind = f.kind WHERE d.active GROUP BY f.kind"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(&imv, &sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run(&format!(
+        "DO $a$ BEGIN \
+           EXECUTE 'ANALYZE ' || public.reflex_intermediate_table_name('{imv}'); \
+           EXECUTE 'ANALYZE {imv}'; EXECUTE 'ANALYZE {dim}'; EXECUTE 'ANALYZE {fact}'; END $a$"
+    ))
+    .expect("analyze");
+    gec_poison_in_process("reflex.wipe_threshold");
+    Spi::run("SET LOCAL log_min_messages = debug1").expect("log level");
+    Spi::run("SELECT tests.gec_keep_trace()").expect("keep trace");
+    Spi::run(&format!("UPDATE {dim} SET active = TRUE WHERE kind > {active}")).expect("flip in");
+    let taken = gec_kept_trace_in_process()
+        .iter()
+        .any(|m| m.starts_with("pg_reflex Path C smart bulk-INSERT:"));
+    Spi::run("SET LOCAL log_min_messages = warning").expect("log level");
+    assert_imv_correct(&imv, &sql);
+    taken
+}
+
+/// Path C in a poisoned session uses the default threshold 0.5: a flip far
+/// under it stays on the standard path, one far over it takes Path C.
+#[pg_test]
+fn gec_poisoned_path_c_uses_the_default_threshold() {
+    assert!(
+        !gec_path_c_taken("gec_pcl", 400, 1, 3),
+        "1 new kind against 400: under the default, standard path"
+    );
+    assert!(
+        gec_path_c_taken("gec_pch", 1, 3, 50),
+        "3 new kinds against 1: over the default, Path C"
+    );
+}
+
+/// The anchor debug switch reads FALSE in a poisoned session: no debug output.
+/// Set on, the same create does print it (the observable works).
+#[pg_test]
+fn gec_poisoned_debug_anchor_switch_stays_off() {
+    Spi::run(
+        "CREATE TABLE gec_dz (id INT NOT NULL, region TEXT NOT NULL, amount INT NOT NULL) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE gec_dz_a PARTITION OF gec_dz FOR VALUES IN ('A')").expect("leaf");
+    Spi::run("INSERT INTO gec_dz SELECT g, 'A', g FROM generate_series(1, 20) g").expect("seed");
+    let create = |name: &str| {
+        Spi::get_one::<String>(&format!(
+            "SELECT create_reflex_ivm('{name}', \
+               'SELECT region, SUM(amount) AS total FROM gec_dz GROUP BY region', \
+               NULL, NULL, NULL, NULL, ARRAY['region'])"
+        ))
+        .expect("create")
+        .unwrap_or_default()
+    };
+    gec_poison_in_process("pg_reflex.debug_resolve_anchor");
+    Spi::run("SET LOCAL log_min_messages = debug1").expect("log level");
+    Spi::run("SELECT tests.gec_keep_trace()").expect("keep trace");
+    assert_eq!(create("gec_dz_off"), "CREATE REFLEX INCREMENTAL VIEW");
+    let poisoned = gec_kept_trace_in_process();
+    Spi::run("SET pg_reflex.debug_resolve_anchor = on").expect("on");
+    assert_eq!(create("gec_dz_on"), "CREATE REFLEX INCREMENTAL VIEW");
+    let switched_on = gec_kept_trace_in_process();
+    Spi::run("SET LOCAL log_min_messages = warning").expect("log level");
+    assert!(
+        !poisoned.iter().any(|m| m.starts_with("REFLEX-DBG")),
+        "poisoned switch reads FALSE: {poisoned:?}"
+    );
+    assert!(
+        switched_on.iter().any(|m| m.starts_with("REFLEX-DBG")),
+        "switched on, the anchor resolution prints: {switched_on:?}"
+    );
 }
