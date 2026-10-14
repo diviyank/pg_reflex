@@ -697,9 +697,10 @@ fn v112_sc_cross_plan_dependents_stay_correct_immediate() {
     sc_assert_cross_plan_dependents_stay_correct("reflex_sc_xp_i", "IMMEDIATE");
 }
 
-/// A push refreshes the passthrough only: the sub-IMVs ignoring it are queued
-/// for their heal (1.12.1).
-const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions")];
+/// A push refreshes the passthrough: the sub-IMVs ignoring it are queued for
+/// their heal (1.12.1), and the aggregate reading it is refreshed by plan
+/// instead of applying the row diff at COMMIT (1.12.2).
+const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions"), ("sc_fdya", "groups")];
 
 /// Swaps of populated leaves refresh the passthrough and the two sub-IMVs that
 /// ignore it, once each and within the swapped plans, whatever the number of
@@ -885,7 +886,9 @@ fn v112_sc_unchanged_leaf_still_refreshes_the_ignoring_sub_imvs() {
         "fixture: the ignoring sub-IMV is behind after an ordinary write: {behind_before:?}"
     );
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
-    assert_eq!(refreshes, chain.expected_refreshes(SC_ONE_LEAF_REFRESHES));
+    // The leaf's rows did not change: no row diff reached the aggregate, so
+    // nothing is refreshed for it (1.12.2).
+    assert_eq!(refreshes, chain.expected_refreshes(&[("sc_sfv", "partitions")]));
     assert!(outside.is_empty(), "wrote outside plan 3: {outside:?}");
 }
 

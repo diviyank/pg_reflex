@@ -189,13 +189,15 @@ fn qualified_on(alias: &str, constraint: &str, partition_columns: &[String]) -> 
         })
 }
 
-/// Bring the target (or one leaf of it) to the rows of `rebuild_sql`.
+/// Bring the target (or one leaf of it) to the rows of `rebuild_sql`. Returns
+/// the rows its writes stage for a DEFERRED reader: one per deleted or inserted
+/// row, two per updated row.
 pub(crate) fn rebuild_target_rows(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     rebuild_sql: &str,
     scope: &RebuildScope,
-) {
+) -> u64 {
     let root = quote_identifier(view_name);
     let run = |client: &mut pgrx::spi::SpiClient<'_>, sql: &str| {
         client.update(sql, None, &[]).unwrap_or_report();
@@ -251,7 +253,9 @@ pub(crate) fn rebuild_target_rows(
     } else {
         indexed_keys
     };
-    if !keys.is_empty() && target_cols == staged_cols && !has_second_unique_index(client, view_name)
+    let staged_delta_rows = if !keys.is_empty()
+        && target_cols == staged_cols
+        && !has_second_unique_index(client, view_name)
     {
         reject_duplicate_keys(client, view_name, &staged, &keys);
         apply_keyed_diff(
@@ -262,13 +266,14 @@ pub(crate) fn rebuild_target_rows(
             &target_cols,
             &keys,
             &scope_on_t,
-        );
+        )
     } else {
-        apply_whole_row_diff(client, &root, &old_rows, &staged, &scope_on_t);
-    }
+        apply_whole_row_diff(client, &root, &old_rows, &staged, &scope_on_t)
+    };
 
     run(client, &format!("DROP TABLE pg_temp.{staged}"));
     set_local(client, "extra_float_digits", &caller_float_digits);
+    staged_delta_rows
 }
 
 /// Set a GUC for the rest of the transaction, returning its previous value.
@@ -338,7 +343,7 @@ fn apply_keyed_diff(
     columns: &[String],
     keys: &[KeyColumn],
     scope_on_t: &str,
-) {
+) -> u64 {
     let staged_rel = format!("pg_temp.{staged}");
     let any_null_key = |alias: &str| {
         keys.iter()
@@ -459,37 +464,52 @@ fn apply_keyed_diff(
         set_local(client, "enable_nestloop", &caller_nestloop);
     }
     let by_identity = format!("t.tableoid = d.toid AND t.ctid = d.tid AND {scope_on_t}");
-    let mut stmts = vec![
-        format!("ANALYZE {diff}"),
+    client
+        .update(&format!("ANALYZE {diff}"), None, &[])
+        .unwrap_or_report();
+    // (statement, delta rows staged per row it writes)
+    let mut stmts = vec![(
         format!("DELETE FROM {root} t USING {diff} d WHERE d.op = 'd' AND {by_identity}"),
-    ];
+        1,
+    )];
     if !others.is_empty() {
-        stmts.push(format!(
-            "UPDATE {root} t SET {} FROM {diff} d WHERE d.op = 'u' AND {by_identity}",
-            others
-                .iter()
-                .map(|c| format!("{q} = (d.r).{q}", q = quoted(c)))
-                .collect::<Vec<_>>()
-                .join(", ")
+        stmts.push((
+            format!(
+                "UPDATE {root} t SET {} FROM {diff} d WHERE d.op = 'u' AND {by_identity}",
+                others
+                    .iter()
+                    .map(|c| format!("{q} = (d.r).{q}", q = quoted(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            2,
         ));
     }
-    stmts.push(format!(
-        "INSERT INTO {root} ({cols}) SELECT {rcols} FROM {diff} d WHERE d.op = 'i'",
-        cols = columns
-            .iter()
-            .map(|c| quoted(c))
-            .collect::<Vec<_>>()
-            .join(", "),
-        rcols = columns
-            .iter()
-            .map(|c| format!("(d.r).{}", quoted(c)))
-            .collect::<Vec<_>>()
-            .join(", ")
+    stmts.push((
+        format!(
+            "INSERT INTO {root} ({cols}) SELECT {rcols} FROM {diff} d WHERE d.op = 'i'",
+            cols = columns
+                .iter()
+                .map(|c| quoted(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            rcols = columns
+                .iter()
+                .map(|c| format!("(d.r).{}", quoted(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        1,
     ));
-    stmts.push(format!("DROP TABLE {diff}"));
-    for stmt in &stmts {
-        client.update(stmt, None, &[]).unwrap_or_report();
+    let mut staged_delta_rows = 0u64;
+    for (stmt, staged_per_row) in &stmts {
+        let written = client.update(stmt, None, &[]).unwrap_or_report().len() as u64;
+        staged_delta_rows += written * staged_per_row;
     }
+    client
+        .update(&format!("DROP TABLE {diff}"), None, &[])
+        .unwrap_or_report();
+    staged_delta_rows
 }
 
 fn apply_whole_row_diff(
@@ -498,7 +518,7 @@ fn apply_whole_row_diff(
     old_rows: &str,
     staged: &str,
     scope_on_t: &str,
-) {
+) -> u64 {
     let numbered = |rel: &str, alias: &str| {
         format!(
             "SELECT {alias}.tableoid AS toid, {alias}.ctid AS tid, ROW({alias}.*)::text AS k, \
@@ -521,8 +541,9 @@ fn apply_whole_row_diff(
          WHERE NOT EXISTS (SELECT 1 FROM ({old}) o WHERE o.k = n.k AND o.rn = n.rn)",
         old = numbered(old_rows, "x")
     );
-    client.update(&delete, None, &[]).unwrap_or_report();
-    client.update(&insert, None, &[]).unwrap_or_report();
+    let deleted = client.update(&delete, None, &[]).unwrap_or_report().len();
+    let inserted = client.update(&insert, None, &[]).unwrap_or_report().len();
+    (deleted + inserted) as u64
 }
 
 /// SQL entry point for trigger-side full refreshes: diff when the target has
