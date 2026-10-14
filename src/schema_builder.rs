@@ -927,6 +927,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
 
     // UPDATE — capture both old and new rows, unless the statement leaves every
     // column the IMVs of the source read unchanged as a multiset of values.
+    // Values compare with each type's `=` (json/xml as text), like the COMMIT-time
+    // spurious and filter-skip checks: a representation-only change is no change.
     let unread_column_check = slot_replace(
         include_str!("../sql/deferred_trigger_unread_column_check.plpgsql.in"),
         &[
