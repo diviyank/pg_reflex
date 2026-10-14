@@ -144,7 +144,7 @@ fn test_ucc_permutation_of_read_values_is_skipped_only_when_the_multiset_is_unch
     assert_imv_correct("ucc2_by_amount", by_amount);
     ucc_assert_captured(
         "ucc2_src",
-        "UPDATE ucc2_src SET amount = CASE WHEN id = 1 THEN 2 ELSE amount END",
+        "UPDATE ucc2_src SET amount = CASE WHEN id = 1 THEN 3 ELSE amount END",
     );
     ucc_flush("ucc2_src");
     assert_imv_correct("ucc2_by_amount", by_amount);
