@@ -2,6 +2,152 @@
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-10-14
+
+A performance release for DEFERRED chains, with one correctness fix. A
+partition push refreshes the DEFERRED aggregates that read the rebuilt IMV
+by group, instead of leaving them to an expensive COMMIT delta flush. The
+MIN / MAX recompute of shrunk groups prunes partitions, and a large DEFERRED
+top-K MIN / MAX delta replaces its groups from the base query. An UPDATE of
+a DEFERRED source that leaves every column its IMVs read unchanged costs
+nothing at COMMIT. The fix: an empty `reflex.wipe_threshold`,
+`reflex.wipe_floor_rows` or `pg_reflex.debug_resolve_anchor` setting, which a
+session gets after `SET LOCAL` or `SET` then `RESET`, discarded DEFERRED
+flushes or aborted partitioned creates.
+`ALTER EXTENSION pg_reflex UPDATE TO '1.12.2';`
+
+---
+
+### Changed
+
+- **A push refreshes the DEFERRED aggregates that observe the rebuilt IMV
+  by group.** When every rebuilt leaf of a partition push is row-diffed, a
+  DEFERRED aggregate that reads the rebuilt IMV and is grouped by its
+  partition column is refreshed for the pushed groups in the push, and the
+  watermark makes its COMMIT flush skip the deltas the refresh already
+  reflects. It used to apply the whole staged delta at COMMIT, ending in a
+  MIN / MAX recompute that scanned every partition. The refresh is chosen
+  only when the push's own diff stages at least half as many rows as the
+  rebuilt IMV holds in those groups; a low-churn push keeps the COMMIT
+  flush. Errors while choosing are contained and fall back to the COMMIT
+  flush. On a 370 k-row-per-leaf fixture (three leaves, 70 % churn) the
+  COMMIT drops from 5.8–7.5 s to 1.6 s, and the push takes 1.1–3.4 s longer.
+  Extrapolated, not measured, for the field push whose
+  `forecast_dp_year_agg` flush took 73.8 s: about 55–65 s saved per push.
+- **The MIN / MAX recompute prunes partitions.** The recompute of shrunk
+  or emptied groups now also filters each group column with
+  `= ANY($n)`, binding the affected keys as typed arrays rather than
+  printing them, so the planner prunes the source's partitions. It applies
+  when no affected key is NULL and every key column is `int2`, `int4`,
+  `int8`, `numeric`, `text`, `varchar`, `bpchar`, `date`, `timestamp`,
+  `bool` or `uuid`; a column with more than 100 distinct affected values
+  is left unfiltered. Otherwise the recompute is the one 1.12.1 ran. IMMEDIATE
+  and DEFERRED. A 100-row change that shrinks a group: flush −39 to −44 %;
+  a whole-plan change: −0 to −4 %.
+- **A large DEFERRED top-K MIN / MAX delta replaces its groups.** When the
+  rows staged for the affected groups reach half of the rows those groups
+  hold, the flush deletes the groups' intermediate rows and re-inserts them
+  from the base query, scoped and pruned as above, instead of subtracting
+  and adding both deltas and recomputing the shrunk groups. It applies to
+  every DEFERRED top-K MIN / MAX IMV with a GROUP BY, an unpartitioned
+  target, no DISTINCT aggregate and no `ignored_sources`, with no opt-in.
+  Flush −33 to −52 % at a staged/held ratio of 0.5 to 2; below the ratio
+  the extra decision pass costs about +5 %.
+- **An UPDATE that leaves every read column unchanged costs nothing at
+  COMMIT.** The UPDATE trigger of a source with a DEFERRED IMV now compares
+  OLD and NEW on the columns its IMVs read, and on their `WHERE`
+  predicates, before capturing anything. When they are equal, the row
+  counts match and nothing is staged yet for the source in the
+  transaction, the statement stages nothing, queues nothing and maintains
+  none of the source's IMMEDIATE IMVs. A 2 M-row `UPDATE` of an unread
+  column: COMMIT 13.5 s → 11 ms; a 1-row one: 5.4 → 0.95 ms per
+  transaction. The same holds for the second hop: a mirror's refresh UPDATE
+  that changes only columns its DEFERRED reader does not read stages
+  nothing, so the reader's COMMIT flush went from ~9 s to under 0.2 s.
+  The price: an UPDATE whose first 100 rows leave the read columns unchanged
+  but whose later rows change them pays the full comparison (~+3 %).
+  Sources whose IMVs are all IMMEDIATE are unchanged: their trigger already
+  skips each IMV by value. Trigger bodies are rendered when IMVs are
+  created, so existing sources need `reflex_rebuild_triggers` (see
+  Migration).
+
+### Fixed
+
+- **(SILENT) An empty `reflex.*` setting discarded DEFERRED flushes.** A
+  custom setting reads back as `''` for the rest of the session after
+  `SET LOCAL` or `SET` then `RESET`. The DEFERRED dispatch cast
+  `reflex.wipe_threshold` straight to `numeric`, raised 22P02, and the
+  flush failure policy discarded the IMV's delta; its readers were not
+  flagged. Since 1.4.5. An empty `reflex.wipe_threshold` or
+  `reflex.wipe_floor_rows` now reads as the default everywhere. The same
+  defect skipped Path B in `reflex_apply_partition_delta` and Path C in
+  IMMEDIATE trigger bodies (with a WARNING), and an empty
+  `pg_reflex.debug_resolve_anchor` made every partitioned create, flush and
+  rebuild fail with 22P02. `reflex_apply_partition_delta` reads its setting
+  through the new `__reflex_setting()`, which also turns an unparsable
+  value into the default with a WARNING; SQL the library generates reads
+  the settings inline, so it does not depend on the migration. An
+  unparsable value there (`'abc'`) still fails the flush loudly: the IMV
+  is flagged `known_stale` with the `reflex_reconcile` remedy.
+
+### Behaviour notes
+
+- The unread-column check, like the COMMIT-time spurious-change and
+  filter-skip checks before it, compares with each type's `=` (`json` and
+  `xml` as text). A change that only alters the representation is no
+  change: numeric scale (`5` → `5.00`), float `0` → `-0`, a case-only
+  change under `citext` or a nondeterministic collation, `bpchar` trailing
+  blanks and `jsonb` number scale. The IMVs keep the earlier rendering.
+  This is by design, and now also holds for the IMMEDIATE IMVs of a source
+  that has a DEFERRED IMV, which 1.12.1 maintained on every UPDATE.
+- The top-K bulk replace applies to every installed DEFERRED top-K MIN / MAX
+  IMV that qualifies, without opt-in; below its ratio a flush costs about
+  5 % more.
+
+### Known issues
+
+Filed in `untreated_bugs/`, all present before 1.12.2:
+
+- An ERROR inside a push's rebuild region under a user `SAVEPOINT` aborts
+  the backend on an assertion build; a release build is not yet checked.
+- IMMEDIATE top-K MIN / MAX: a writable CTE that inserts into and updates
+  the same groups of a source leaves a phantom heap entry (silent wrong
+  MIN / MAX after a later DELETE).
+- An IMV joining a source with a DEFERRED IMV over that source counts the
+  joint delta twice (silent).
+- The readers of an IMV whose DEFERRED flush failed are not reported stale.
+- UPDATE trigger bodies return early on an empty NEW transition table and
+  miss rows removed by a row movement that a BEFORE INSERT trigger
+  cancels (silent).
+
+### Tests
+
+- `pg_test_v1122_push_scoped_reader.rs`,
+  `pg_test_v1122_minmax_pruned_recompute.rs`,
+  `pg_test_v1122_minmax_bulk_replace.rs`, `pg_test_v1122_guc_empty_cast.rs`,
+  `pg_test_v1122_unread_column_check.rs`. The swap-cascade tests expect the
+  extra group refresh of the observing aggregate.
+- The dblink test harnesses (`ScChain::commit`, `v112_sh_remote`,
+  `v112_pl_call_on`) reported a transaction that failed at COMMIT as
+  committed; they now check the outcome in the database.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.2';` creates
+  `public.__reflex_setting(text, anyelement)` and replaces
+  `public.reflex_apply_partition_delta()`, both byte-identical to the
+  bootstrap text. No registry column, table, index, trigger, event trigger
+  or function signature changes; no IMV needs to be recreated. Run it
+  promptly; the new library does not depend on it for correctness.
+- To get the unread-column skip on existing sources, and to replace the
+  setting reads of trigger bodies rendered before 1.12.2, run
+  `SELECT reflex_rebuild_triggers('<source>');` for each source with a
+  DEFERRED IMV (for base-db: `alp.sales_simulation`,
+  `alp.sop_forecast_view` and the other DEFERRED sources). It takes a
+  `SHARE ROW EXCLUSIVE` lock on each source; the migration does not do it.
+
+---
+
 ## [1.12.1] - 2026-10-13
 
 A performance release for partition swaps of a source read by a chain of
