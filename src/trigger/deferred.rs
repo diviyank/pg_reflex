@@ -286,18 +286,18 @@ pub(crate) fn guard_scoped_rebuild(
     ))
 }
 
-/// The source on which a scoped rebuild of `view_name` over `slice`, run now,
-/// would be recorded with its watermark ([`guard_scoped_rebuild`] returning
-/// `RecordWithRebuild`); `None` when it would not. It changes nothing.
-pub(crate) fn scoped_rebuild_recorded_on(
+/// Whether a scoped rebuild of `view_name` over `slice`, run now, would be
+/// recorded with its watermark ([`guard_scoped_rebuild`] returning
+/// `RecordWithRebuild`). It changes nothing.
+pub(crate) fn scoped_rebuild_would_be_recorded(
     client: &pgrx::spi::SpiClient<'_>,
     view_name: &str,
     slice: RebuiltSlice<'_>,
-) -> Option<String> {
-    match staged_rows_in_slice(client, view_name, &slice) {
-        StagedRowsInSlice::Placeable { source, .. } => Some(source),
-        _ => None,
-    }
+) -> bool {
+    matches!(
+        staged_rows_in_slice(client, view_name, &slice),
+        StagedRowsInSlice::Placeable { .. }
+    )
 }
 
 /// The deltas this transaction staged for `view_name`, as a scoped rebuild of
