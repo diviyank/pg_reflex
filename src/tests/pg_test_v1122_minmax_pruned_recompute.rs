@@ -145,6 +145,16 @@ fn mmp_not_stale(p: &str) {
 
 const MMP_DATES: &str = "MIN(d) AS lo, MAX(d) AS hi";
 
+/// Moves the 16 earliest days of each year of the matching rows 40 days later,
+/// within the year: at least K = 16 rows leave the top-K heap of every group
+/// they belong to, so only a recompute from the source restores its MIN.
+fn mmp_beyond_the_heap(p: &str, rows: &str) -> String {
+    format!(
+        "UPDATE {p}_src SET d = d + 40 WHERE ({rows}) \
+         AND (d < '2027-11-17' OR d BETWEEN '2028-01-01' AND '2028-01-16')"
+    )
+}
+
 fn mmp_pruned_recompute(p: &str, mode: &str) {
     mmp_source(p, &["1", "2", "3"], "INT", "0", 3);
     mmp_create(p, MMP_DATES, "plan, yr", mode);
@@ -159,10 +169,10 @@ fn mmp_pruned_recompute(p: &str, mode: &str) {
     mmp_not_stale(p);
     mmp_assert_correct(p, &fresh);
 
-    let on_the_min = mmp_apply(
+    let beyond_the_heap = mmp_apply(
         p,
         mode,
-        &format!("UPDATE {p}_src SET d = d + 3 WHERE plan = 3 AND d = '2027-11-01'"),
+        &mmp_beyond_the_heap(p, "plan = 3"),
         &["3"],
     );
     mmp_not_stale(p);
@@ -178,7 +188,7 @@ fn mmp_pruned_recompute(p: &str, mode: &str) {
     mmp_assert_correct(p, &fresh);
 
     assert_eq!(
-        (whole_plan, on_the_min, on_the_max),
+        (whole_plan, beyond_the_heap, on_the_max),
         (0, 0, 0),
         "the recompute of the shrunk groups must not read the leaves of other plans"
     );
@@ -205,10 +215,7 @@ fn v1122_minmax_recompute_null_key_keeps_exists() {
     let scans = mmp_apply(
         p,
         "DEFERRED",
-        &format!(
-            "UPDATE {p}_src SET d = d + 1, k = k + 100 \
-             WHERE plan IS NULL OR (plan = 2 AND d = '2027-11-01')"
-        ),
+        &mmp_beyond_the_heap(p, "plan IS NULL OR plan = 2"),
         &["n", "2"],
     );
     mmp_not_stale(p);
@@ -228,7 +235,7 @@ fn v1122_minmax_recompute_float_key_keeps_exists() {
     let scans = mmp_apply(
         p,
         "DEFERRED",
-        &format!("UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND d = '2027-11-01'"),
+        &mmp_beyond_the_heap(p, "plan = 2"),
         &["2"],
     );
     Spi::run("SET LOCAL extra_float_digits = 1").expect("float output");
@@ -247,7 +254,7 @@ fn v1122_minmax_recompute_unlisted_types_keep_exists() {
     let scans = mmp_apply(
         p,
         "DEFERRED",
-        &format!("UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND d = '2027-11-01'"),
+        &mmp_beyond_the_heap(p, "plan = 2"),
         &["2"],
     );
     mmp_not_stale(p);
@@ -262,11 +269,34 @@ fn v1122_minmax_recompute_unlisted_types_keep_exists() {
     mmp_apply(
         p,
         "DEFERRED",
-        &format!("UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND d = '2027-11-01'"),
+        &mmp_beyond_the_heap(p, "plan = 2"),
         &["2"],
     );
     mmp_not_stale(p);
     mmp_assert_correct(p, &fresh);
+}
+
+/// Under DateStyle SQL a timestamptz prints its zone as an abbreviation, and
+/// the abbreviation reads back through timezone_abbreviations: IST prints for
+/// Asia/Kolkata (+05:30) and reads back as Israel (+02). Its keys are not listed.
+#[pg_test]
+fn v1122_minmax_recompute_timestamptz_key_keeps_exists() {
+    Spi::run("SET LOCAL DateStyle = 'SQL, DMY'").expect("datestyle");
+    Spi::run("SET LOCAL TimeZone = 'Asia/Kolkata'").expect("timezone");
+    let p = "mmp_tz";
+    mmp_source(
+        p,
+        &["1", "2"],
+        "TIMESTAMPTZ",
+        "TIMESTAMPTZ '2027-03-04 05:06:07.123456+02' + make_interval(secs => k)",
+        3,
+    );
+    mmp_create(p, MMP_DATES, "plan, key_column", "DEFERRED");
+    let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
+    let scans = mmp_apply(p, "DEFERRED", &mmp_beyond_the_heap(p, "plan = 2"), &["2"]);
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+    assert!(scans > 0, "a timestamptz key must take the EXISTS form");
 }
 
 /// Up to the cap the keys are listed and the scan is pruned; one more group
@@ -326,7 +356,7 @@ fn v1122_minmax_recompute_text_key_quoting() {
     let scans = mmp_apply(
         p,
         "DEFERRED",
-        &format!("UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND d = '2027-11-01'"),
+        &mmp_beyond_the_heap(p, "plan = 2"),
         &["2"],
     );
     mmp_not_stale(p);
@@ -341,7 +371,10 @@ fn v1122_minmax_recompute_allowlisted_types_round_trip() {
     Spi::run("SET LOCAL TimeZone = 'Asia/Kolkata'").expect("timezone");
     for (p, key_type, key_value) in [
         ("mmp_num", "NUMERIC(12,4)", "k / 3.0"),
-        ("mmp_ts", "TIMESTAMPTZ", "TIMESTAMPTZ '2027-03-04 05:06:07.123456+02' + make_interval(secs => k)"),
+        ("mmp_ts", "TIMESTAMP", "TIMESTAMP '2027-03-04 05:06:07.123456' + make_interval(secs => k)"),
+        ("mmp_vc", "VARCHAR(10)", "'v' || k"),
+        ("mmp_big", "INT8", "k * 10000000000"),
+        ("mmp_bool", "BOOL", "k % 2 = 0"),
         ("mmp_day", "DATE", "DATE '2027-02-03' + k"),
         ("mmp_uid", "UUID", "md5(k::text)::uuid"),
         ("mmp_chr", "CHAR(6)", "'c' || k"),
@@ -353,7 +386,7 @@ fn v1122_minmax_recompute_allowlisted_types_round_trip() {
         let scans = mmp_apply(
             p,
             "DEFERRED",
-            &format!("UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND d = '2027-11-01'"),
+            &mmp_beyond_the_heap(p, "plan = 2"),
             &["2"],
         );
         mmp_not_stale(p);
@@ -390,7 +423,7 @@ fn v1122_minmax_recompute_mixed_aggregates_unpartitioned() {
     );
     for dml in [
         format!("UPDATE {p}_src SET d = d + 1, v = v + 5 WHERE plan = 2"),
-        format!("UPDATE {p}_src SET d = d + 2 WHERE plan = 3 AND d = '2027-11-01'"),
+        mmp_beyond_the_heap(p, "plan = 3"),
         format!("DELETE FROM {p}_src WHERE plan = 1 AND v = (SELECT max(v) FROM {p}_src WHERE plan = 1)"),
         format!("UPDATE {p}_src SET d = '2026-12-31' WHERE plan = 1 AND k = 1 AND d < '2027-11-05'"),
     ] {
