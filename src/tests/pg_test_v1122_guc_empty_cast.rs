@@ -164,15 +164,14 @@ const GEC_REGION_SRC_DDL: &[&str] = &[
 
 /// One DEFERRED IMV over `gec_src` in a poisoned worker session; a committed
 /// UPDATE must land, through the dispatch builder the IMV's shape selects.
-fn gec_deferred_dispatch_case(dbname: &str, sql: &str, keys: &str, partitioned: bool) {
+fn gec_deferred_dispatch_case(dbname: &str, sql: &str, keys: &str, partition_by: &str) {
     probe_db_open(dbname);
     for ddl in GEC_REGION_SRC_DDL {
         worker_exec(ddl);
     }
-    let partition_by = if partitioned { ", NULL, ARRAY['region']" } else { "" };
     assert_eq!(
         rbc_select(&format!(
-            "create_reflex_ivm('gec_v', {}, {}, NULL, 'DEFERRED'{partition_by})",
+            "create_reflex_ivm('gec_v', {}, {}, NULL, 'DEFERRED', NULL, {partition_by})",
             sql_lit(sql),
             sql_lit(keys)
         )),
@@ -185,14 +184,16 @@ fn gec_deferred_dispatch_case(dbname: &str, sql: &str, keys: &str, partitioned: 
     probe_db_close(dbname);
 }
 
-/// T4, `build_high_selectivity_dispatch_sql`: an unpartitioned aggregate.
+/// T4, `build_high_selectivity_dispatch_sql`: an aggregate kept unpartitioned
+/// (its group key is the source's partition key, which would otherwise
+/// partition it and route it to the partition-aware builder).
 #[pg_test]
 fn gec_poisoned_aggregate_dispatch_applies_delta() {
     gec_deferred_dispatch_case(
         "reflex_gec_t4_agg",
         "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM gec_src GROUP BY region",
         "region",
-        false,
+        "ARRAY[]::text[]",
     );
 }
 
@@ -204,7 +205,7 @@ fn gec_poisoned_partition_aware_dispatch_applies_delta() {
         "SELECT region, id % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n \
          FROM gec_src GROUP BY region, id % 7",
         "region, bucket",
-        true,
+        "ARRAY['region']",
     );
 }
 
@@ -215,7 +216,7 @@ fn gec_poisoned_passthrough_partition_dispatch_applies_delta() {
         "reflex_gec_t4_pt",
         "SELECT id, region, amount FROM gec_src",
         "id, region",
-        true,
+        "ARRAY['region']",
     );
 }
 
