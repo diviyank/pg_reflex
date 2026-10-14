@@ -583,3 +583,23 @@ fn test_ucc_mirror_refresh_stages_nothing_for_a_reader_of_unchanged_columns() {
     ucc_flush("ucc16_mirror");
     assert_imv_correct("ucc16_reader", reader_fresh);
 }
+
+/// The staged rows of a transaction form one history of full rows, which the
+/// flush nets column by column: an unread UPDATE skipped between two staged
+/// statements on the same rows would break it (the INSERT's row no longer nets
+/// with the later UPDATE's old row).
+#[pg_test]
+fn test_ucc_unread_update_between_staged_statements_of_a_transaction() {
+    ucc_source("ucc17_src");
+    let pt = "SELECT id, grp, amount FROM ucc17_src";
+    ucc_create("ucc17_pt", pt, Some("id"), "DEFERRED");
+    ucc_create("ucc17_sum", &ucc_sum_sql("ucc17_src"), None, "DEFERRED");
+    Spi::run("INSERT INTO ucc17_src VALUES (5001, 1, 10, 'new', 0)").expect("insert");
+    Spi::run("UPDATE ucc17_src SET note = 'unread'").expect("unread update");
+    Spi::run("UPDATE ucc17_src SET amount = amount + 1 WHERE id IN (1, 5001)").expect("read update");
+    Spi::run("DELETE FROM ucc17_src WHERE id = 2").expect("delete");
+    ucc_flush("ucc17_src");
+    assert_imv_correct("ucc17_pt", pt);
+    assert_imv_correct("ucc17_sum", &ucc_sum_sql("ucc17_src"));
+    ucc_assert_nothing_captured("ucc17_src", "UPDATE ucc17_src SET note = 'unread after flush'");
+}
