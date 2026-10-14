@@ -443,3 +443,154 @@ fn v1122_minmax_recompute_mixed_aggregates_unpartitioned() {
         mmp_assert_correct(p, &fresh);
     }
 }
+
+/// Under a YMD DateStyle a date prints month or day first but reads back year
+/// first: 01/03/0012 reads as 2001-03-12. The keys must reach the recompute as
+/// values, not as text, in either mode, and still prune.
+fn mmp_ymd_key(p: &str, datestyle: &str, key_type: &str, key_value: &str, mode: &str) {
+    Spi::run(&format!("SET LOCAL DateStyle = '{datestyle}'")).expect("datestyle");
+    mmp_source(p, &["1", "2"], key_type, key_value, 3);
+    mmp_create(p, MMP_DATES, "plan, key_column", mode);
+    let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
+    let scans = mmp_apply(p, mode, &mmp_beyond_the_heap(p, "plan = 2"), &["2"]);
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+    assert_eq!(scans, 0, "{key_type} keys under {datestyle} are listed and prune");
+}
+
+#[pg_test]
+fn v1122_minmax_recompute_sql_ymd_date_keys() {
+    for mode in ["DEFERRED", "IMMEDIATE"] {
+        let tag = &mode[..1].to_lowercase();
+        mmp_ymd_key(&format!("mmp_ymd_{tag}"), "SQL, YMD", "DATE", "DATE '2027-02-03' + k", mode);
+        mmp_ymd_key(&format!("mmp_ymd12_{tag}"), "SQL, YMD", "DATE", "DATE '0012-01-02' + k", mode);
+    }
+}
+
+#[pg_test]
+fn v1122_minmax_recompute_german_ymd_date_keys() {
+    for mode in ["DEFERRED", "IMMEDIATE"] {
+        let tag = &mode[..1].to_lowercase();
+        mmp_ymd_key(&format!("mmp_ger12_{tag}"), "German, YMD", "DATE", "DATE '0012-01-02' + k", mode);
+        mmp_ymd_key(
+            &format!("mmp_gerts_{tag}"),
+            "German, YMD",
+            "TIMESTAMP",
+            "TIMESTAMP '0012-01-02 03:04:05' + make_interval(days => k)",
+            mode,
+        );
+    }
+}
+
+#[pg_test]
+fn v1122_minmax_recompute_postgres_ymd_keys() {
+    mmp_ymd_key("mmp_pgymd", "Postgres, YMD", "DATE", "DATE '0012-01-02' + k", "DEFERRED");
+    mmp_ymd_key(
+        "mmp_pgymdts",
+        "Postgres, YMD",
+        "TIMESTAMP",
+        "TIMESTAMP '2027-02-03 04:05:06' + make_interval(days => k)",
+        "DEFERRED",
+    );
+}
+
+/// Case-insensitive keys: 'a' and 'A' are one group. The keys compare under the
+/// column's collation, as the EXISTS does.
+#[pg_test]
+fn v1122_minmax_recompute_nondeterministic_collation_key() {
+    let icu = Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i')")
+        .expect("icu")
+        .unwrap_or(false);
+    if !icu {
+        return;
+    }
+    Spi::run(
+        "CREATE COLLATION IF NOT EXISTS mmp_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+    )
+    .expect("collation");
+    let p = "mmp_ci";
+    mmp_source(p, &["1", "2"], "TEXT COLLATE mmp_ci", "(ARRAY['a','A','b','B'])[k]", 4);
+    mmp_create(p, MMP_DATES, "plan, key_column", "DEFERRED");
+    let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
+    mmp_apply(p, "DEFERRED", &mmp_beyond_the_heap(p, "plan = 2"), &["2"]);
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+    mmp_apply(
+        p,
+        "DEFERRED",
+        &format!("UPDATE {p}_src SET key_column = upper(key_column) WHERE plan = 2 AND k <= 2 AND d < '2027-11-20'"),
+        &["2"],
+    );
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+}
+
+#[pg_test]
+fn v1122_minmax_recompute_expression_keys() {
+    let p = "mmp_expr";
+    mmp_source(p, &["1", "2", "3"], "TEXT", "(ARRAY['Ab','aB','cd'])[k]", 3);
+    Spi::run(&format!(
+        "SELECT create_reflex_ivm('{p}_v', 'SELECT plan, lower(key_column) AS lk, date_trunc(''month'', d::timestamp) AS m, \
+           MIN(d) AS lo, MAX(d) AS hi FROM {p}_src GROUP BY plan, lower(key_column), date_trunc(''month'', d::timestamp)', \
+           NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[])"
+    ))
+    .expect("create IMV");
+    let fresh = format!(
+        "SELECT plan, lower(key_column), date_trunc('month', d::timestamp), MIN(d), MAX(d) FROM {p}_src \
+         GROUP BY plan, lower(key_column), date_trunc('month', d::timestamp)"
+    );
+    let scans = mmp_apply(p, "DEFERRED", &mmp_beyond_the_heap(p, "plan = 2"), &["2"]);
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+    assert_eq!(scans, 0, "expression keys next to a plain plan key still prune on plan");
+    mmp_apply(p, "DEFERRED", &format!("DELETE FROM {p}_src WHERE plan = 3 AND d < '2027-11-10'"), &["3"]);
+    mmp_not_stale(p);
+    mmp_assert_correct(p, &fresh);
+}
+
+/// The group key comes from a joined table; with a LEFT JOIN, plan 3 has no
+/// dimension row and its key is NULL.
+fn mmp_join(p: &str, join: &str, mode: &str) {
+    mmp_source(p, &["1", "2", "3"], "INT", "0", 3);
+    Spi::run(&format!(
+        "CREATE TABLE {p}_dim (plan INT PRIMARY KEY, label TEXT NOT NULL); \
+         INSERT INTO {p}_dim VALUES (1, 'one'), (2, 'two')"
+    ))
+    .expect("dim");
+    Spi::run(&format!(
+        "SELECT create_reflex_ivm('{p}_v', 'SELECT dm.label, s.yr, MIN(s.d) AS lo, MAX(s.d) AS hi \
+           FROM {p}_src s {join} {p}_dim dm ON dm.plan = s.plan GROUP BY dm.label, s.yr', \
+           NULL, NULL, '{mode}', NULL, ARRAY[]::text[])"
+    ))
+    .expect("create IMV");
+    let fresh = format!(
+        "SELECT dm.label, s.yr, MIN(s.d), MAX(s.d) FROM {p}_src s {join} {p}_dim dm ON dm.plan = s.plan \
+         GROUP BY dm.label, s.yr"
+    );
+    let flush_dim = || {
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{p}_dim')")).expect("flush dim");
+        }
+    };
+    mmp_apply(p, mode, &mmp_beyond_the_heap(p, "plan = 2"), &["2"]);
+    mmp_not_stale(p);
+    assert_imv_correct(&format!("{p}_v"), &fresh);
+    mmp_apply(p, mode, &mmp_beyond_the_heap(p, "plan = 3"), &["3"]);
+    mmp_not_stale(p);
+    assert_imv_correct(&format!("{p}_v"), &fresh);
+    Spi::run(&format!("UPDATE {p}_dim SET label = 'one' WHERE plan = 2")).expect("dim update");
+    flush_dim();
+    mmp_not_stale(p);
+    assert_imv_correct(&format!("{p}_v"), &fresh);
+    Spi::run(&format!("DELETE FROM {p}_dim WHERE plan = 1")).expect("dim delete");
+    flush_dim();
+    mmp_not_stale(p);
+    assert_imv_correct(&format!("{p}_v"), &fresh);
+}
+
+#[pg_test]
+fn v1122_minmax_recompute_join_keys() {
+    mmp_join("mmp_jn", "JOIN", "DEFERRED");
+    mmp_join("mmp_lj", "LEFT JOIN", "DEFERRED");
+    mmp_join("mmp_ji", "JOIN", "IMMEDIATE");
+}
