@@ -196,6 +196,25 @@ into them, so on a large IMV the `COMMIT` can take minutes.
   rebuilds an IMV with dependents (also via `reflex_reconcile`) cannot be
   prepared with `PREPARE TRANSACTION`.
 
+## Upgrading to 1.12.2
+
+```sql
+ALTER EXTENSION pg_reflex UPDATE TO '1.12.2';
+```
+
+The migration creates `__reflex_setting()` and replaces `reflex_apply_partition_delta()`. No IMV needs to be recreated. Run it promptly after installing the library; the library does not depend on it for correctness.
+
+**Re-render the triggers of DEFERRED sources.** The skip of an UPDATE that leaves every read column unchanged lives in the source's trigger body, which is rendered when an IMV is created. Existing sources keep their 1.12.1 bodies, which stay correct but capture such UPDATEs as before. The same re-render replaces the setting reads of bodies rendered before 1.12.2 (an empty `reflex.wipe_threshold` there skips Path C with a WARNING, and in bodies from 1.11.4 or earlier also Path B; the data stays correct):
+
+```sql
+SET lock_timeout = '10s';
+SELECT reflex_rebuild_triggers('<schema>.<source>');  -- per source with a DEFERRED IMV
+```
+
+Each call takes a `SHARE ROW EXCLUSIVE` lock on the source, so run it in a quiet window. For base-db: `alp.sales_simulation`, `alp.sop_forecast_view` and the other DEFERRED sources.
+
+**Behaviour change: representation-only UPDATEs.** An UPDATE is compared with each type's `=` on the read columns, as the COMMIT-time checks already did. A change of numeric scale, float `-0`, `citext` case, `bpchar` trailing blanks or `jsonb` number scale is no change, and the IMVs keep the earlier rendering. On 1.12.1 the IMMEDIATE IMVs of a source that also has a DEFERRED IMV were maintained on every UPDATE and showed the new rendering.
+
 ## Upgrading to 1.12.1
 
 ```sql

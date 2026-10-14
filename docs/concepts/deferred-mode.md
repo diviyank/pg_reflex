@@ -39,6 +39,10 @@ sequenceDiagram
 
 Each per-IMV flush is wrapped in its own `SAVEPOINT` (since 1.2.0) — a single bad IMV records its `last_error` and lets the cascade continue.
 
+### UPDATEs that change nothing an IMV reads
+
+Since 1.12.2 the UPDATE trigger of a source with a DEFERRED IMV first compares OLD and NEW on the columns its IMVs read and on their `WHERE` predicates. When they are equal, the row counts match and nothing is staged yet for the source in the transaction, the statement stages nothing, queues nothing and maintains none of the source's IMMEDIATE IMVs, so it costs nothing at COMMIT. The comparison uses each type's `=` (`json` and `xml` as text): a representation-only change, such as numeric scale or a `citext` case change, counts as unchanged. Sources created before 1.12.2 get the check after `reflex_rebuild_triggers('<source>')`.
+
 ## Manual flush
 
 Call `reflex_flush_deferred(source_table)` to drain a source's pending queue without waiting for COMMIT:

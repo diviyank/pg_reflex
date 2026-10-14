@@ -101,3 +101,33 @@ field-shaped benchmark with 100 k-row leaves the COMMIT slope drops from 12.1 to
 COMMIT + heal stays at about the 1.12.0 COMMIT cost. Residual: the total work (now split between the
 COMMIT and the heal) still grows with the rows changed per leaf; re-measure the field push after the
 upgrade (base-db 6.7.7 `refresh-views` runs the heal) before closing this report.
+
+## 1.12.2
+
+Field profile of the 2026-10-13 21:00 alp push on 1.12.1 (19 leaves, ~370 k rows each, release
+build): the sync block took 141.7 s (7.46 s/leaf), and the COMMIT flush of the reader
+`forecast_dp_year_agg` added 73.8 s on top: two aggregations over the 11.46 M staged delta rows
+(24 s each) plus an unpruned MIN/MAX recompute (24.6 s). Ledger
+`.superpowers/sdd/2026-10-14-1.12.2-bulk-leaf-rebuild/` (`e1/report.md`, the E2/E3 summary in
+`progress.md`).
+
+What 1.12.2 changes for the per-push cost:
+
+- A push whose rebuilt leaves are all row-diffed now refreshes `forecast_dp_year_agg` for the
+  pushed plan in the push, and its COMMIT flush skips the deltas that refresh reflects. Field
+  estimate (from e1/e2, not measured in the field): the 73.8 s flush becomes ~5–8 s.
+- The MIN/MAX recompute prunes to the affected plans' partitions, and a large top-K MIN/MAX delta
+  replaces its groups from the base query; both cut the reader flush when the push path is not taken.
+
+Residual, still open:
+
+- The per-leaf cost inside the sync block is unchanged: ~7.4 s/leaf against 4.2 s/leaf on 1.11.4.
+  The largest part is the mirror leaf's row-diff write through the IMV root, ~63 s of the 141.7 s
+  for this push, dominated by maintaining the leaf's 7 indexes; then the leaf-diff temp table
+  (1.39 s/leaf) and the old-row delta capture.
+- The bulk leaf rebuild (DELETE + INSERT of the whole leaf instead of the row diff, with the readers
+  scoped) was evaluated and not built: E2 measured it saving ~1.2 s/leaf more on a 370 k-row leaf (9.15 →
+  6.72 s with the 1.12.2 reader change, → 5.5 s with the bulk path), i.e. ~22–36 s per field push.
+  Feasible-with-conditions per E3 (no TRUNCATE, trigger whitelist, readers from depends_on and
+  graph_child, never mixing diff and bulk in one flush); 150–200 LOC plus tests. Re-measure the field
+  push on 1.12.2 before deciding.
