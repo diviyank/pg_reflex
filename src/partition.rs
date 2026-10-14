@@ -2627,16 +2627,35 @@ fn rebuild_partitions_and_queue_dependents(
             }],
         );
 
+        let rebuilt_rows = crate::cascade::RebuiltRows {
+            view_name,
+            partition_columns: &part_cols,
+            schema: &schema,
+            partitions: &to_process,
+            keys: keys_of_changed_rows.listed(),
+        };
         // Observing dependents already received every leaf's change as DML when
-        // all leaves were diffed; only the ignoring ones still need a refresh.
+        // all leaves were diffed; only the ignoring ones still need a refresh,
+        // and the aggregates a refresh of their groups serves better.
         let children: Vec<String> = if all_diffed && origin_triggers_fire(client) {
-            crate::reconcile::ignoring_dependents(view_name)
+            let mut unreached = crate::reconcile::ignoring_dependents(view_name);
+            unreached.extend(crate::cascade::aggregates_refreshed_by_group(
+                client,
+                &rebuilt_rows,
+                &children,
+            ));
+            unreached
         } else {
             children
         };
-        let keys = keys_of_changed_rows.listed();
         let children: Vec<String> = if push {
-            crate::heal::queue_heals(client, view_name, Some(part_col), &ignoring_readers, &keys);
+            crate::heal::queue_heals(
+                client,
+                view_name,
+                Some(part_col),
+                &ignoring_readers,
+                &rebuilt_rows.keys,
+            );
             children
                 .into_iter()
                 .filter(|child| !ignoring_readers.contains(child))
@@ -2645,17 +2664,7 @@ fn rebuild_partitions_and_queue_dependents(
             children
         };
 
-        crate::cascade::queue_dependents(
-            client,
-            &crate::cascade::RebuiltRows {
-                view_name,
-                partition_columns: &part_cols,
-                schema: &schema,
-                partitions: &to_process,
-                keys,
-            },
-            &children,
-        );
+        crate::cascade::queue_dependents(client, &rebuilt_rows, &children);
 
         Ok(format!(
             "RECONCILED partitions: {}",

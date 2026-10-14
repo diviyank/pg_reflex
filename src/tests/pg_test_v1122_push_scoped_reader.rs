@@ -222,7 +222,7 @@ fn v1122_psr_failed_key_refresh_falls_back_to_a_full_reconcile() {
     for ddl in [
         "CREATE FUNCTION psr_refuse_key_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
            DECLARE stack TEXT; BEGIN GET DIAGNOSTICS stack = PG_CONTEXT; \
-             IF stack LIKE '%reflex_scoped_cascade%' AND stack NOT LIKE '%reflex_reconcile(%' THEN \
+             IF stack LIKE '%reflex_scoped_cascade%' AND stack NOT LIKE '%SELECT public.reflex_reconcile(%' THEN \
                RAISE EXCEPTION 'psr: key refresh refused'; END IF; RETURN NULL; END $$",
         "CREATE TRIGGER psr_refuse_key_refresh AFTER INSERT OR DELETE ON psr_sum \
            FOR EACH STATEMENT EXECUTE FUNCTION psr_refuse_key_refresh()",
