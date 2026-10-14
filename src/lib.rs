@@ -1988,6 +1988,7 @@ mod tests {
     include!("tests/pg_test_v1122_minmax_pruned_recompute.rs");
     include!("tests/pg_test_v1122_minmax_bulk_replace.rs");
     include!("tests/pg_test_v1122_guc_empty_cast.rs");
+    include!("tests/pg_test_v1122_unread_column_check.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

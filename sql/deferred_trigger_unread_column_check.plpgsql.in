@@ -1,0 +1,56 @@
+DECLARE _read TEXT; _unchanged BOOLEAN := FALSE;
+    BEGIN
+     BEGIN
+      WITH consumer AS (
+        SELECT aggregations, where_predicate,
+               CASE WHEN jsonb_typeof(aggregations->'imv_relevant_columns'->'__REFLEX_SLOT_SOURCE_TABLE__') = 'array'
+                    THEN aggregations->'imv_relevant_columns'->'__REFLEX_SLOT_SOURCE_TABLE__'
+                    ELSE '[]'::jsonb END AS read_columns
+        FROM public.__reflex_ivm_reference
+        WHERE '__REFLEX_SLOT_SOURCE_TABLE__' = ANY(depends_on) AND enabled = TRUE
+          AND NOT COALESCE('__REFLEX_SLOT_SOURCE_TABLE__' = ANY(ignored_sources) OR '__REFLEX_SLOT_BARE_SOURCE__' = ANY(ignored_sources), FALSE)
+      ),
+      read_column AS (
+        SELECT DISTINCT c.name FROM consumer CROSS JOIN LATERAL jsonb_array_elements_text(consumer.read_columns) AS c(name)
+      ),
+      read_value AS (
+        SELECT CASE WHEN t.typname IN ('json', 'xml') THEN format('%I::text', c.name) ELSE format('%I', c.name) END AS expr,
+               a.attnum IS NULL AS unresolved
+        FROM read_column c
+        LEFT JOIN pg_attribute a ON a.attrelid = '__REFLEX_SLOT_SOURCE_TABLE__'::regclass
+                                AND a.attname = c.name AND a.attnum > 0 AND NOT a.attisdropped
+        LEFT JOIN pg_type t ON t.oid = a.atttypid
+        UNION
+        SELECT format('((%s) IS TRUE)', p.predicate), FALSE
+        FROM consumer
+        CROSS JOIN LATERAL (VALUES (consumer.aggregations->'imv_relevant_where'->>'__REFLEX_SLOT_SOURCE_TABLE__'),
+                                   (consumer.where_predicate)) AS p(predicate)
+        WHERE p.predicate <> ''
+      )
+      SELECT CASE
+               WHEN NOT EXISTS (SELECT 1 FROM consumer) THEN NULL
+               WHEN EXISTS (SELECT 1 FROM consumer WHERE jsonb_array_length(read_columns) = 0) THEN NULL
+               WHEN EXISTS (SELECT 1 FROM read_value WHERE unresolved) THEN NULL
+               ELSE (SELECT string_agg(expr, ', ' ORDER BY expr) FROM read_value)
+             END
+      INTO _read;
+      IF _read IS NOT NULL THEN
+        EXECUTE format(
+          'SELECT (SELECT array_agg(ROW(%1$s) ORDER BY ROW(%1$s)) FROM (SELECT * FROM %2$I LIMIT 100) o) '
+          || 'IS NOT DISTINCT FROM (SELECT array_agg(ROW(%1$s) ORDER BY ROW(%1$s)) FROM (SELECT * FROM %3$I LIMIT 100) n)',
+          _read, '__REFLEX_SLOT_REF_OLD__', '__REFLEX_SLOT_REF_NEW__') INTO _unchanged;
+        IF _unchanged THEN
+          EXECUTE format(
+            'SELECT (SELECT count(*) FROM %2$I) = (SELECT count(*) FROM %3$I) '
+            || 'AND NOT EXISTS (SELECT %1$s FROM %3$I EXCEPT ALL SELECT %1$s FROM %2$I)',
+            _read, '__REFLEX_SLOT_REF_OLD__', '__REFLEX_SLOT_REF_NEW__') INTO _unchanged;
+        END IF;
+        IF _unchanged AND EXISTS (SELECT 1 FROM __REFLEX_SLOT_DELTA_TBL__) THEN
+          _unchanged := FALSE;
+        END IF;
+      END IF;
+     EXCEPTION WHEN OTHERS THEN
+      _unchanged := FALSE;
+     END;
+     IF _unchanged THEN RETURN NULL; END IF;
+    END;
