@@ -481,56 +481,99 @@ fn scope_of(
 }
 
 /// The DEFERRED aggregates among `readers` that a refresh of their groups
-/// brings up to date in place of the row diff `rebuilt` sent them: each reads
-/// `rebuilt.view_name`, is refreshed by group of its partition column, and the
-/// deltas that diff staged for it are placed by group, so the refresh records
-/// its watermark and their COMMIT flush skips them instead of aggregating them.
+/// brings up to date in place of the row diff `rebuilt` sent them: each is
+/// refreshed by group of `rebuilt`'s partition column, and the deltas staged
+/// for it are placed by group, so the refresh records its watermark and their
+/// COMMIT flush skips them instead of aggregating them. None when the staged
+/// rows are too few to outweigh the rows of the groups a refresh rescans.
 pub(crate) fn aggregates_refreshed_by_group(
     client: &pgrx::spi::SpiClient<'_>,
     rebuilt: &RebuiltRows<'_>,
     readers: &[String],
 ) -> Vec<String> {
-    readers
-        .iter()
-        .filter(|name| {
-            let Some(reader) = read_dependent(client, name) else {
-                return false;
-            };
-            let RefreshScope::Groups { column, keys } = scope_of(client, &reader, rebuilt) else {
-                return false;
-            };
-            let literals = keys
-                .iter()
-                .map(|key| crate::partition::sql_literal_text(key))
-                .collect::<Vec<_>>()
-                .join(", ");
-            reads_relation(client, name, rebuilt.view_name)
-                && !crate::trigger::deferred::scoped_rebuild_waits_for_commit(name)
-                && crate::trigger::deferred::scoped_rebuild_would_be_recorded(
-                    client,
-                    name,
-                    crate::trigger::deferred::RebuiltSlice::Keys {
-                        column: &column,
-                        literals: &literals,
-                    },
-                )
-        })
-        .cloned()
-        .collect()
+    let mut refreshed = Vec::new();
+    let mut staged_on = BTreeSet::new();
+    let mut groups = None;
+    for name in readers {
+        let Some(reader) = read_dependent(client, name) else {
+            continue;
+        };
+        let RefreshScope::Groups { column, keys } = scope_of(client, &reader, rebuilt) else {
+            continue;
+        };
+        let literals = keys
+            .iter()
+            .map(|key| crate::partition::sql_literal_text(key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if crate::trigger::deferred::scoped_rebuild_waits_for_commit(name) {
+            continue;
+        }
+        let Some(source) = crate::trigger::deferred::scoped_rebuild_recorded_on(
+            client,
+            name,
+            crate::trigger::deferred::RebuiltSlice::Keys {
+                column: &column,
+                literals: &literals,
+            },
+        ) else {
+            continue;
+        };
+        staged_on.insert(source);
+        groups = Some((column, literals));
+        refreshed.push(name.clone());
+    }
+    match groups {
+        Some((column, literals))
+            if staged_rows_outweigh_the_groups(client, rebuilt, &staged_on, &column, &literals) =>
+        {
+            refreshed
+        }
+        _ => Vec::new(),
+    }
 }
 
-fn reads_relation(client: &pgrx::spi::SpiClient<'_>, imv: &str, relation: &str) -> bool {
-    client
-        .select(
-            "SELECT public.__reflex_reads_relation(depends_on, $2) AS reads \
-             FROM public.__reflex_ivm_reference WHERE name = $1",
-            Some(1),
-            &[text_arg(imv), text_arg(relation)],
-        )
-        .ok()
-        .and_then(|mut rows| rows.next())
-        .and_then(|row| row.get_by_name::<bool, _>("reads").ok().flatten())
-        .unwrap_or(false)
+/// Rows of the refreshed groups a refresh may rescan per staged row before it
+/// costs more than applying the staged rows at COMMIT.
+const GROUP_ROWS_PER_STAGED_ROW: i64 = 2;
+
+/// Whether the rows this transaction staged on `sources` are many enough that
+/// rescanning the rows of `rebuilt.view_name` whose `column` is one of
+/// `literals` costs less than applying them. Counts at most what decides it.
+fn staged_rows_outweigh_the_groups(
+    client: &pgrx::spi::SpiClient<'_>,
+    rebuilt: &RebuiltRows<'_>,
+    sources: &BTreeSet<String>,
+    column: &str,
+    literals: &str,
+) -> bool {
+    let count = |sql: &str| {
+        client
+            .select(sql, Some(1), &[])
+            .ok()
+            .and_then(|mut rows| rows.next())
+            .and_then(|row| row.get_by_name::<i64, _>("n").ok().flatten())
+    };
+    let staged: Option<i64> = sources
+        .iter()
+        .map(|source| {
+            count(&format!(
+                "SELECT count(*) AS n FROM {} WHERE public.__reflex_xid_is_current(xmin)",
+                crate::query_decomposer::staging_delta_table_name(source)
+            ))
+        })
+        .sum();
+    let Some(staged) = staged else {
+        return false;
+    };
+    let rescanned_at_most = staged.saturating_mul(GROUP_ROWS_PER_STAGED_ROW);
+    count(&format!(
+        "SELECT count(*) AS n FROM (SELECT 1 FROM {} WHERE \"{}\" IN ({literals}) LIMIT {}) g",
+        crate::query_decomposer::quote_identifier(rebuilt.view_name),
+        column.replace('"', "\"\""),
+        rescanned_at_most.saturating_add(1)
+    ))
+    .is_some_and(|in_groups| in_groups <= rescanned_at_most)
 }
 
 /// Queues the refresh of each enabled IMV of `dependents` after `rebuilt`.
