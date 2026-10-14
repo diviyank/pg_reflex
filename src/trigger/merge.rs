@@ -657,11 +657,12 @@ pub fn build_min_max_recompute_sql_force_topk(
 pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 1000;
 
 /// Key types whose text form reads back as the same value in the same session,
-/// whatever its DateStyle, TimeZone or extra_float_digits. Floats are left out:
-/// they print rounded when extra_float_digits < 1. Domains are left out too.
-const ROUND_TRIP_KEY_TYPES: &str =
-    "'int2', 'int4', 'int8', 'numeric', 'text', 'varchar', 'bpchar', 'date', \
-     'timestamp', 'timestamptz', 'bool', 'uuid'";
+/// whatever its DateStyle, TimeZone or extra_float_digits. Left out: floats,
+/// which print rounded when extra_float_digits < 1; timestamptz, which under
+/// DateStyle SQL or Postgres prints a zone abbreviation that may read back as
+/// another zone (IST); domains and every other type.
+const ROUND_TRIP_KEY_TYPES: &str = "'int2', 'int4', 'int8', 'numeric', 'text', 'varchar', \
+     'bpchar', 'date', 'timestamp', 'bool', 'uuid'";
 
 /// Stands for the literal key list in a recompute UPDATE until it is split in
 /// two around it. A NUL never occurs in SQL text PostgreSQL stored.
