@@ -250,14 +250,13 @@ fn gec_poisoned_path_c_does_not_fail() {
     assert_imv_correct("gec_pc_v", sql);
 }
 
-/// T4, `reflex_apply_partition_delta`: an attached partition three times the
-/// size of the source is applied by Path B's reconcile at the default
-/// threshold, which a poisoned session must still read.
-#[pg_test]
-fn gec_poisoned_partition_attach_takes_path_b() {
-    const DBNAME: &str = "reflex_gec_t4_attach";
+/// An attach of 6000 rows onto 2000 analysed ones, to an unpartitioned IMV,
+/// after `poison` has set up the worker session: the attach must be applied
+/// by `reflex_apply_partition_delta`'s Path B reconcile, which the default
+/// threshold selects. Returns the WARNINGs kept during the attach.
+fn gec_attach_case(dbname: &str, poison: fn()) -> Vec<String> {
     let sql = "SELECT k, SUM(v) AS s, COUNT(*) AS n FROM gec_ap GROUP BY k";
-    probe_db_open(DBNAME);
+    probe_db_open(dbname);
     for ddl in [
         "CREATE TABLE gec_ap (k INT NOT NULL, v INT NOT NULL) PARTITION BY LIST (k)",
         "CREATE TABLE gec_ap_1 PARTITION OF gec_ap FOR VALUES IN (1)",
@@ -284,8 +283,10 @@ fn gec_poisoned_partition_attach_takes_path_b() {
         "CREATE TRIGGER gec_note_refresh AFTER UPDATE OF last_update_date \
            ON public.__reflex_ivm_reference FOR EACH ROW EXECUTE FUNCTION gec_note_refresh()",
     );
-    gec_poison_worker_with_set_local();
+    poison();
+    assert_eq!(rbc_select("tests.gec_keep_warnings()"), "true");
     worker_exec("ALTER TABLE gec_ap ATTACH PARTITION gec_ap_2 FOR VALUES IN (2)");
+    let warnings = sc_text_rows("SELECT unnest(tests.gec_kept_warnings())");
     assert_eq!(rbc_mismatch("gec_ap_v", sql), 0, "gec_ap_v matches its recompute");
     assert!(
         worker_scalar_i64(
@@ -297,7 +298,14 @@ fn gec_poisoned_partition_attach_takes_path_b() {
         sc_text_rows("SELECT left(context, 400) FROM gec_trace")
     );
     gec_assert_no_flush_failure();
-    probe_db_close(DBNAME);
+    probe_db_close(dbname);
+    warnings
+}
+
+/// T4, `reflex_apply_partition_delta` in a poisoned session.
+#[pg_test]
+fn gec_poisoned_partition_attach_takes_path_b() {
+    gec_attach_case("reflex_gec_t4_attach", gec_poison_worker_with_set_local);
 }
 
 /// The partition-anchor debug switch is read on every partitioned create and
@@ -326,11 +334,28 @@ fn gec_poisoned_debug_anchor_switch_does_not_abort_create() {
     assert_imv_correct("gec_da_v", sql);
 }
 
-/// T5: an unparsable value of either wipe setting falls back to the default
-/// with a WARNING naming the setting; the delta is applied, nothing is stale.
+/// T5, SQL the extension installs (`reflex_apply_partition_delta`): an
+/// unparsable `reflex.wipe_threshold` falls back to the default with a WARNING
+/// naming the setting.
 #[pg_test]
-fn gec_unparsable_wipe_settings_warn_and_apply_delta() {
-    const DBNAME: &str = "reflex_gec_t5";
+fn gec_unparsable_threshold_in_partition_delta_warns_and_defaults() {
+    let warnings = gec_attach_case("reflex_gec_t5_attach", || {
+        worker_exec("SET reflex.wipe_threshold = 'abc'")
+    });
+    assert!(
+        warnings.iter().any(|w| w.contains("reflex.wipe_threshold")),
+        "a WARNING names reflex.wipe_threshold: {warnings:?}"
+    );
+}
+
+/// T5, SQL the library generates at run time (the dispatch blocks), which
+/// must not depend on a function the extension update creates: an unparsable
+/// wipe setting is an operator error that fails the flush loudly — the IMV is
+/// flagged stale with the cast error and an event row — never silently, and
+/// the printed remedy repairs it once the setting is fixed.
+#[pg_test]
+fn gec_unparsable_wipe_settings_in_generated_dispatch_fail_loudly() {
+    const DBNAME: &str = "reflex_gec_t5_dispatch";
     let sql = "SELECT region, id % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n \
                FROM gec_src GROUP BY region, id % 7";
     probe_db_open(DBNAME);
@@ -345,19 +370,104 @@ fn gec_unparsable_wipe_settings_warn_and_apply_delta() {
         )),
         "CREATE REFLEX INCREMENTAL VIEW"
     );
-    worker_exec("SET reflex.wipe_threshold = 'abc'");
-    worker_exec("SET reflex.wipe_floor_rows = 'many'");
-    assert_eq!(rbc_select("tests.gec_keep_warnings()"), "true");
-    worker_exec("UPDATE gec_src SET amount = amount + 5 WHERE id % 10 = 0 AND region IN ('A', 'C')");
-    let warnings = sc_text_rows("SELECT unnest(tests.gec_kept_warnings())");
-    assert_eq!(rbc_mismatch("gec_v", sql), 0, "gec_v matches its recompute");
-    gec_assert_no_flush_failure();
     for setting in ["reflex.wipe_threshold", "reflex.wipe_floor_rows"] {
+        worker_exec(&format!("SET {setting} = 'abc'"));
+        worker_exec(
+            "UPDATE gec_src SET amount = amount + 5 WHERE id % 10 = 0 AND region IN ('A', 'C')",
+        );
+        assert_eq!(
+            sc_text_rows(
+                "SELECT stale_reason FROM public.__reflex_ivm_reference \
+                  WHERE name = 'gec_v' AND known_stale \
+                    AND stale_reason LIKE '%invalid input syntax%reflex_reconcile%'"
+            )
+            .len(),
+            1,
+            "{setting}: the failed flush is flagged stale with its cause and remedy"
+        );
         assert!(
-            warnings.iter().any(|w| w.contains(setting)),
-            "a WARNING names {setting}: {warnings:?}"
+            worker_scalar_i64(
+                "SELECT count(*)::int8 FROM public.__reflex_event_log \
+                  WHERE imv_name = 'gec_v' AND event = 'error' AND sqlstate = '22P02'"
+            ) > 0,
+            "{setting}: the failed flush is logged"
+        );
+        worker_exec(&format!("RESET {setting}"));
+        let reconciled = rbc_select("reflex_reconcile('gec_v')");
+        assert!(!reconciled.starts_with("ERROR"), "{setting}: {reconciled}");
+        assert_eq!(rbc_mismatch("gec_v", sql), 0, "{setting}: the remedy repairs gec_v");
+        worker_exec("DELETE FROM public.__reflex_event_log");
+        gec_assert_no_flush_failure();
+    }
+    probe_db_close(DBNAME);
+}
+
+/// The upgrade window: the new library runs against an install whose
+/// extension SQL predates `__reflex_setting`. Creating IMVs and flushing every
+/// generated dispatch and the Path C block in a poisoned session must not need
+/// it.
+#[pg_test]
+fn gec_library_does_not_need_the_setting_helper() {
+    const DBNAME: &str = "reflex_gec_no_helper";
+    probe_db_open(DBNAME);
+    worker_exec("ALTER EXTENSION pg_reflex DROP FUNCTION public.__reflex_setting(text, anyelement)");
+    worker_exec("DROP FUNCTION public.__reflex_setting(text, anyelement)");
+    for ddl in GEC_REGION_SRC_DDL {
+        worker_exec(ddl);
+    }
+    let deferred = [
+        (
+            "gec_agg",
+            "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM gec_src GROUP BY region",
+            "region",
+            "ARRAY[]::text[]",
+        ),
+        (
+            "gec_part",
+            "SELECT region, id % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n \
+             FROM gec_src GROUP BY region, id % 7",
+            "region, bucket",
+            "ARRAY['region']",
+        ),
+        ("gec_pt", "SELECT id, region, amount FROM gec_src", "id, region", "ARRAY['region']"),
+    ];
+    for (name, sql, keys, partition_by) in deferred {
+        assert_eq!(
+            rbc_select(&format!(
+                "create_reflex_ivm('{name}', {}, {}, NULL, 'DEFERRED', NULL, {partition_by})",
+                sql_lit(sql),
+                sql_lit(keys)
+            )),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{name}"
         );
     }
+    for ddl in [
+        "CREATE TABLE gec_pc_d (kind TEXT PRIMARY KEY, active BOOL NOT NULL)",
+        "CREATE TABLE gec_pc_f (id SERIAL PRIMARY KEY, kind TEXT NOT NULL, v INT NOT NULL)",
+        "INSERT INTO gec_pc_d VALUES ('a', TRUE), ('b', FALSE), ('c', FALSE), ('d', FALSE)",
+        "INSERT INTO gec_pc_f (kind, v) SELECT k, g FROM generate_series(1, 50) g, \
+           unnest(ARRAY['a', 'b', 'c', 'd']) k",
+    ] {
+        worker_exec(ddl);
+    }
+    let path_c_sql = "SELECT f.kind, SUM(f.v) AS s, COUNT(*) AS n FROM gec_pc_f f \
+                      JOIN gec_pc_d d ON d.kind = f.kind WHERE d.active GROUP BY f.kind";
+    assert_eq!(
+        rbc_select(&format!("create_reflex_ivm('gec_pc_v', {})", sql_lit(path_c_sql))),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    gec_poison_worker_with_set_local();
+    assert_eq!(rbc_select("tests.gec_keep_warnings()"), "true");
+    worker_exec("UPDATE gec_src SET amount = amount + 5 WHERE id % 10 = 0 AND region IN ('A', 'C')");
+    worker_exec("UPDATE gec_pc_d SET active = TRUE WHERE kind IN ('b', 'c', 'd')");
+    let warnings = sc_text_rows("SELECT unnest(tests.gec_kept_warnings())");
+    assert_eq!(warnings, Vec::<String>::new(), "no flush or Path C failure");
+    for (name, sql, _, _) in deferred {
+        assert_eq!(rbc_mismatch(name, sql), 0, "{name} matches its recompute");
+    }
+    assert_eq!(rbc_mismatch("gec_pc_v", path_c_sql), 0, "gec_pc_v matches its recompute");
+    gec_assert_no_flush_failure();
     probe_db_close(DBNAME);
 }
 
