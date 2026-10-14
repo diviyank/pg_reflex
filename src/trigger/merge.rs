@@ -666,15 +666,10 @@ pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 100;
 const ROUND_TRIP_KEY_TYPES: &str = "'int2', 'int4', 'int8', 'numeric', 'text', 'varchar', \
      'bpchar', 'date', 'timestamp', 'bool', 'uuid'";
 
-/// Stands for the literal key filters in a recompute UPDATE until it is split
-/// in two around it. A NUL never occurs in SQL text PostgreSQL stored.
-const LITERAL_KEYS_MARKER: &str = "\u{0}";
-
-/// A recompute UPDATE split where its literal key filters go.
-struct LiteralKeyedUpdate {
-    prefix: String,
-    suffix: String,
-}
+/// Stands for the literal key filters in a statement scoped to the affected
+/// groups until it is split in two around it. A NUL never occurs in SQL text
+/// PostgreSQL stored.
+pub(crate) const LITERAL_KEYS_MARKER: &str = "\u{0}";
 
 /// SQL yielding one row: `filters`, the text `(raw key) = ANY($i) AND ...`, and
 /// `a0`, `a1`, ..., the arrays of distinct affected values of each group column,
@@ -731,12 +726,107 @@ fn literal_group_key_filters_sql(affected_tbl: &str, keys: &[(&str, &str)]) -> S
 }
 
 /// `text` as a dollar-quoted literal whose tag does not occur in it.
-fn dollar_quoted(text: &str) -> String {
+pub(crate) fn dollar_quoted(text: &str) -> String {
     let tag = (0..)
         .map(|n| format!("$_reflex_keyed{n}$"))
         .find(|tag| !text.contains(tag.as_str()))
         .expect("an unused tag");
     format!("{tag}{text}{tag}")
+}
+
+/// `orig_base_query` reading only the source rows of the groups listed in
+/// `affected_tbl`, or `None` when it has no GROUP BY to scope before.
+///
+/// A correlated EXISTS pairs each raw GROUP BY expression (LHS, evaluated in the
+/// source scope) with its normalized column in the affected table, by `=` when
+/// `eq`, else by `IS NOT DISTINCT FROM`. `(cols) IN (SELECT ...)` would never
+/// match a NULL group key. `=` is only exact once the caller has proven that no
+/// affected key is NULL, but it keeps the semi-join hashable.
+///
+/// The affected columns are aliased through a derived table (`__g0`, `__g1`, ...)
+/// so the correlated subquery exposes no column named like a raw source column:
+/// a bare raw key (e.g. `grp`) then resolves outward to the source row instead
+/// of binding to the affected column and turning the predicate trivially TRUE.
+/// reflex reserves the `__` namespace, so no source column is named `__gN`.
+///
+/// `keys_marker` is written in front of the EXISTS, where
+/// [`literal_keyed_plpgsql`] puts the key filters.
+pub(crate) fn affected_scoped_base_query(
+    plan: &AggregationPlan,
+    orig_base_query: &str,
+    affected_tbl: &str,
+    eq: bool,
+    keys_marker: &str,
+) -> Option<String> {
+    let group_cols = scoped_group_columns(plan);
+    let pairs: Vec<(&String, &String)> = plan
+        .group_by_columns
+        .iter()
+        .zip(group_cols.iter())
+        .collect();
+    let projection = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let op = if eq { "=" } else { "IS NOT DISTINCT FROM" };
+    let conds = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let filter = format!(
+        " AND {}EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
+        keys_marker, projection, affected_tbl, conds
+    );
+    splice_before_group_by(orig_base_query, &filter)
+}
+
+fn scoped_group_columns(plan: &AggregationPlan) -> Vec<String> {
+    plan.group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| normalized_column_name(c))
+        .collect()
+}
+
+/// PL/pgSQL running `statement`, scoped to the groups of `affected_tbl`. When
+/// it holds [`LITERAL_KEYS_MARKER`] (see [`affected_scoped_base_query`]), the
+/// key filters of those groups go there, with their arrays bound as values, so
+/// the planner can prune the source's partitions; without filters (see
+/// `literal_group_key_filters_sql`) the statement runs as is. The enclosing
+/// block declares `__reflex_keys RECORD`.
+pub(crate) fn literal_keyed_plpgsql(
+    statement: &str,
+    affected_tbl: &str,
+    plan: &AggregationPlan,
+) -> String {
+    let static_statement = statement.replace(LITERAL_KEYS_MARKER, "");
+    let Some((prefix, suffix)) = statement.split_once(LITERAL_KEYS_MARKER) else {
+        return format!("{static_statement};");
+    };
+    let group_cols = scoped_group_columns(plan);
+    let affected_keys: Vec<(&str, &str)> = plan
+        .group_by_columns
+        .iter()
+        .zip(group_cols.iter())
+        .map(|(raw, norm)| (raw.as_str(), norm.as_str()))
+        .collect();
+    let bound = (0..affected_keys.len())
+        .map(|i| format!("__reflex_keys.a{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{keys} INTO __reflex_keys; \
+         IF NOT FOUND THEN {static_statement}; \
+         ELSIF COALESCE(__reflex_keys.filters, '') = '' THEN {static_statement}; \
+         ELSE EXECUTE {prefix} || __reflex_keys.filters || ' AND ' || {suffix} USING {bound}; END IF;",
+        keys = literal_group_key_filters_sql(affected_tbl, &affected_keys),
+        prefix = dollar_quoted(prefix),
+        suffix = dollar_quoted(suffix),
+    )
 }
 
 pub(crate) fn build_min_max_recompute_sql_inner(
@@ -832,56 +922,9 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // involved can be NULL, so scoping this by the same `eq` the join predicates
     // already use is sound, not just fast.
     let scoped_source = |eq: bool, keys_marker: &str| -> String {
-        match affected_tbl {
-            Some(at) => {
-                // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
-                // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
-                // NULL group would be dropped from the scoped source and a MIN/MAX left
-                // NULL by a retraction would never be re-derived (silent wrong result).
-                // Use a correlated EXISTS with per-column `IS NOT DISTINCT FROM` (or `=`
-                // when `eq` proves no NULL key can be involved), pairing each raw GROUP
-                // BY expression (LHS, evaluated in the outer source scope) to its
-                // normalized column in the affected table (RHS).
-                //
-                // The affected columns are aliased through a derived table (`__g0`,
-                // `__g1`, …) so the correlated subquery exposes NO column named like a
-                // raw source column: an unqualified raw key (e.g. bare `grp`) then
-                // resolves outward to the source row, not inward to the affected table.
-                // Without the alias, a bare raw key equal to an affected column name
-                // would bind to the affected column, the predicate would be trivially
-                // TRUE, and the scoping would silently collapse to a full source scan.
-                // (The `__gN` labels prevent bare-column shadowing; they are not
-                // collision-proof against a source column literally named `__gN`, but
-                // reflex reserves the `__` identifier namespace, so that cannot occur.)
-                let pairs: Vec<(&String, &String)> = plan
-                    .group_by_columns
-                    .iter()
-                    .zip(group_cols.iter())
-                    .collect();
-                let projection = pairs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let op = if eq { "=" } else { "IS NOT DISTINCT FROM" };
-                let conds = pairs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
-                let filter = format!(
-                    " AND {}EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
-                    keys_marker, projection, at, conds
-                );
-                match splice_before_group_by(orig_base_query, &filter) {
-                    Some(spliced) => spliced,
-                    None => orig_base_query.to_string(),
-                }
-            }
-            None => orig_base_query.to_string(),
-        }
+        affected_tbl
+            .and_then(|at| affected_scoped_base_query(plan, orig_base_query, at, eq, keys_marker))
+            .unwrap_or_else(|| orig_base_query.to_string())
     };
 
     // Both the recompute UPDATE's join to `__src` and (below) the EXISTS
@@ -960,45 +1003,12 @@ pub(crate) fn build_min_max_recompute_sql_inner(
             nullc = null_check.join(" OR "),
         )
     };
-    let pairs: Vec<(&String, &String)> = plan
-        .group_by_columns
-        .iter()
-        .zip(group_cols.iter())
-        .collect();
-    let literal_keyed_update = |eq: bool| -> Option<LiteralKeyedUpdate> {
-        let update = build_update(eq, LITERAL_KEYS_MARKER);
-        let (prefix, suffix) = update.split_once(LITERAL_KEYS_MARKER)?;
-        Some(LiteralKeyedUpdate {
-            prefix: prefix.to_string(),
-            suffix: suffix.to_string(),
-        })
-    };
-    let affected_keys: Vec<(&str, &str)> = pairs
-        .iter()
-        .map(|(raw, norm)| (raw.as_str(), norm.as_str()))
-        .collect();
     let do_block = |check: &str, eq: bool| -> String {
-        let static_update = build_update(eq, "");
-        match literal_keyed_update(eq) {
-            Some(keyed) => format!(
-                "DO $_reflex_recompute$ DECLARE __reflex_keys RECORD; BEGIN IF {check} THEN \
-                 {keys} INTO __reflex_keys; \
-                 IF NOT FOUND THEN {static_update}; \
-                 ELSIF COALESCE(__reflex_keys.filters, '') = '' THEN {static_update}; \
-                 ELSE EXECUTE {prefix} || __reflex_keys.filters || ' AND ' || {suffix} USING {bound}; END IF; \
-                 END IF; END $_reflex_recompute$",
-                keys = literal_group_key_filters_sql(at, &affected_keys),
-                prefix = dollar_quoted(&keyed.prefix),
-                suffix = dollar_quoted(&keyed.suffix),
-                bound = (0..affected_keys.len())
-                    .map(|i| format!("__reflex_keys.a{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            None => format!(
-                "DO $_reflex_recompute$ BEGIN IF {check} THEN {static_update}; END IF; END $_reflex_recompute$"
-            ),
-        }
+        format!(
+            "DO $_reflex_recompute$ DECLARE __reflex_keys RECORD; BEGIN IF {check} THEN {} END IF; \
+             END $_reflex_recompute$",
+            literal_keyed_plpgsql(&build_update(eq, LITERAL_KEYS_MARKER), at, plan)
+        )
     };
 
     let quoted_group_cols: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
