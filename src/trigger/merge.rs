@@ -650,6 +650,8 @@ pub fn build_min_max_recompute_sql_force_topk(
     build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, true)
 }
 
+pub(crate) const MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP: usize = 1000;
+
 pub(crate) fn build_min_max_recompute_sql_inner(
     intermediate_tbl: &str,
     plan: &AggregationPlan,
