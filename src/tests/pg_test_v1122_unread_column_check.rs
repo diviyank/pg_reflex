@@ -604,3 +604,118 @@ fn test_ucc_unread_update_between_staged_statements_of_a_transaction() {
     assert_imv_correct("ucc17_sum", &ucc_sum_sql("ucc17_src"));
     ucc_assert_nothing_captured("ucc17_src", "UPDATE ucc17_src SET note = 'unread after flush'");
 }
+
+/// The contract (user ruling, 1.12.2): the check compares read columns with each
+/// type's `=`, exactly like the COMMIT-time checks of 1.12.1. A change that only
+/// alters the representation (numeric scale, float -0, citext case, bpchar trailing
+/// blanks, jsonb number scale) is therefore UNCHANGED: the statement is skipped,
+/// also for the IMMEDIATE IMVs of a mixed source, which keep showing the earlier
+/// representation. A failure here means the contract changed: make it a decision.
+#[pg_test]
+fn test_ucc_representation_only_changes_are_skipped_by_design() {
+    lock_shared_fixtures();
+    Spi::run("CREATE EXTENSION IF NOT EXISTS citext").expect("citext");
+    Spi::run(
+        "CREATE TABLE ucc21_src (id INT PRIMARY KEY, amount NUMERIC, x FLOAT8, \
+         name CITEXT, code BPCHAR, doc JSONB, note TEXT)",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO ucc21_src SELECT g, g, 0, 'name' || g, 'a', jsonb_build_object('v', 1.0), 'n' \
+         FROM generate_series(1, 200) g",
+    )
+    .expect("seed");
+    let shown = "SELECT id, amount::text AS a, x::text AS x, name::text AS n, \
+                 octet_length(code) AS c, doc::text AS d FROM ucc21_src";
+    let by_note = "SELECT note, COUNT(*) AS n FROM ucc21_src GROUP BY note";
+    ucc_create("ucc21_shown", shown, Some("id"), "IMMEDIATE");
+    ucc_create("ucc21_by_note", by_note, None, "DEFERRED");
+    Spi::run("SET LOCAL track_functions = 'all'").expect("track functions");
+    let delta_builds = || {
+        Spi::get_one::<i64>(
+            "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_xact_user_functions \
+             WHERE funcname = 'reflex_build_delta_sql'",
+        )
+        .expect("function stats")
+        .expect("not null")
+    };
+    let shown_row = |id: i32| {
+        Spi::get_one::<String>(&format!(
+            "SELECT format('%s|%s|%s|%s|%s', a, x, n, c, d) FROM ucc21_shown WHERE id = {id}"
+        ))
+        .expect("read")
+        .expect("not null")
+    };
+    let before_row = shown_row(7);
+    for statement in [
+        "UPDATE ucc21_src SET amount = round(amount, 2)",
+        "UPDATE ucc21_src SET x = -x",
+        "UPDATE ucc21_src SET name = upper(name)",
+        "UPDATE ucc21_src SET code = 'a  '::bpchar",
+        "UPDATE ucc21_src SET doc = '{\"v\": 1.00}'::jsonb",
+    ] {
+        let before = delta_builds();
+        ucc_assert_nothing_captured("ucc21_src", statement);
+        assert_eq!(
+            delta_builds(),
+            before,
+            "by design, `{statement}` changes only a representation and is skipped"
+        );
+    }
+    assert_eq!(
+        shown_row(7),
+        before_row,
+        "by design, the IMMEDIATE IMV keeps the earlier representation"
+    );
+    Spi::run("UPDATE ucc21_src SET amount = amount + 1 WHERE id = 7").expect("real change");
+    assert_eq!(
+        Spi::get_one::<String>("SELECT a FROM ucc21_shown WHERE id = 7")
+            .expect("read")
+            .expect("not null"),
+        "8.00",
+        "a real change is maintained, with the representation the row holds now"
+    );
+}
+
+// Adopted from the D' review: the staged-rows guard across subtransactions.
+
+fn ucr_seed_numeric(table: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {table} (id INT PRIMARY KEY, grp INT, amount NUMERIC, note TEXT, extra INT)"
+    ))
+    .expect("create source");
+    Spi::run(&format!(
+        "INSERT INTO {table} SELECT g, g % 5, g, 'n' || g, 0 FROM generate_series(1, 200) g"
+    ))
+    .expect("seed source");
+}
+
+/// A staged INSERT rolled back by a subtransaction leaves the delta empty: the next
+/// unread UPDATE may skip, and the read UPDATE after it must still flush correctly.
+/// A staged INSERT kept by a committed subtransaction must keep refusing the skip.
+#[pg_test]
+fn test_ucc_rv_subtransactions_around_the_staged_rows_guard() {
+    ucr_seed_numeric("ucr7_src");
+    let pt = "SELECT id, grp, amount FROM ucr7_src";
+    ucc_create("ucr7_pt", pt, Some("id"), "DEFERRED");
+    ucc_create("ucr7_sum", &ucc_sum_sql("ucr7_src"), None, "DEFERRED");
+    Spi::run(
+        "DO $$ BEGIN \
+           INSERT INTO ucr7_src VALUES (5001, 1, 10, 'new', 0); \
+           RAISE EXCEPTION 'roll back'; \
+         EXCEPTION WHEN OTHERS THEN NULL; END $$",
+    )
+    .expect("rolled-back subtransaction");
+    ucc_assert_nothing_captured("ucr7_src", "UPDATE ucr7_src SET note = 'after rollback'");
+    Spi::run(
+        "DO $$ BEGIN \
+           BEGIN INSERT INTO ucr7_src VALUES (5002, 1, 10, 'kept', 0); END; \
+           UPDATE ucr7_src SET note = 'inside'; \
+         END $$",
+    )
+    .expect("kept subtransaction");
+    Spi::run("UPDATE ucr7_src SET amount = amount + 1 WHERE id IN (1, 5002)").expect("read");
+    ucc_flush("ucr7_src");
+    assert_imv_correct("ucr7_pt", pt);
+    assert_imv_correct("ucr7_sum", &ucc_sum_sql("ucr7_src"));
+}
