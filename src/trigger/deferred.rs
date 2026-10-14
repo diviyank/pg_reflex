@@ -1591,6 +1591,16 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     )
                     .unwrap_or_report();
             }
+            client
+                .update(
+                    &format!(
+                        "CREATE OR REPLACE TEMP VIEW \"{}\" AS SELECT {projection} FROM {rel}",
+                        staged_rows_view_name(source_table)
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
         };
         create_netted_views(client, &delta_tbl);
         let mut views_over = delta_tbl.clone();

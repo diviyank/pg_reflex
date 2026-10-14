@@ -203,6 +203,8 @@ pub(crate) fn aggregate_delete_stmts(
 /// inline.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_update_stmts(
+    view_name: &str,
+    netted_delta: bool,
     plan: &AggregationPlan,
     source_table: &str,
     base_query: &str,
@@ -239,8 +241,9 @@ pub(crate) fn aggregate_update_stmts(
         //   (post-UPDATE) source for every affected top-K column.
         if let Some(ref cols) = grp_cols {
             let select_expr = affected_groups_select(cols);
+            let mut algebraic: Vec<String> = Vec::new();
             push_materialized_merge_and_affected(
-                stmts,
+                &mut algebraic,
                 scratch_tbl,
                 &delta_old,
                 intermediate_tbl,
@@ -257,7 +260,7 @@ pub(crate) fn aggregate_update_stmts(
             // contiguous with the Sub for clarity).
             let recompute_scope = if has_topk
                 && push_topk_shrunk_groups_capture(
-                    stmts,
+                    &mut algebraic,
                     intermediate_tbl,
                     plan,
                     affected_tbl,
@@ -270,7 +273,7 @@ pub(crate) fn aggregate_update_stmts(
             if let Some(refresh) =
                 build_topk_scalar_refresh_sql(intermediate_tbl, plan, Some(affected_tbl))
             {
-                stmts.push(refresh);
+                algebraic.push(refresh);
             }
             if !has_topk {
                 // Non-top-K: recompute BEFORE Add to avoid LEAST(NULL, d).
@@ -280,11 +283,11 @@ pub(crate) fn aggregate_update_stmts(
                     orig_base_query,
                     Some(affected_tbl),
                 ) {
-                    stmts.push(recompute);
+                    algebraic.push(recompute);
                 }
             }
             push_materialized_merge_and_affected(
-                stmts,
+                &mut algebraic,
                 scratch_tbl,
                 &delta_new,
                 intermediate_tbl,
@@ -308,8 +311,30 @@ pub(crate) fn aggregate_update_stmts(
                     orig_base_query,
                     Some(recompute_scope),
                 ) {
-                    stmts.push(recompute);
+                    algebraic.push(recompute);
                 }
+            }
+            let bulk_replace = if may_replace_large_deltas(plan, netted_delta) {
+                build_min_max_bulk_replace_sql(
+                    view_name,
+                    plan,
+                    orig_base_query,
+                    &scoped_delta_query(
+                        base_query,
+                        source_table,
+                        &staged_rows_view_name(source_table),
+                    ),
+                    intermediate_tbl,
+                    affected_tbl,
+                    cols,
+                    &algebraic,
+                )
+            } else {
+                None
+            };
+            match bulk_replace {
+                Some(sql) => stmts.push(sql),
+                None => stmts.extend(algebraic),
             }
         } else {
             push_materialized_merge(
