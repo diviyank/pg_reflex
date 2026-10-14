@@ -370,6 +370,8 @@ pub fn reflex_build_delta_sql(
             }
             "UPDATE" => {
                 if let Some(merge_sql) = aggregate_update_stmts(
+                    view_name,
+                    netted_delta,
                     &plan,
                     source_table,
                     base_query,
@@ -728,6 +730,7 @@ pub(crate) mod deferred;
 mod dispatch;
 mod expression_subquery;
 mod merge;
+mod minmax_bulk_replace;
 mod ops;
 mod outer_join;
 mod scope;
@@ -737,6 +740,7 @@ mod union_delta;
 pub(crate) use deferred::build_netted_view_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
+pub(crate) use minmax_bulk_replace::*;
 pub(crate) use ops::*;
 pub(crate) use scope::*;
 
