@@ -523,6 +523,33 @@ extension_sql!(
         RETURN 'failed:' || left(SQLERRM, 400);
     END;
     $fn$;
+
+    -- 1.12.2: reads a pg_reflex setting for SQL this extension installs, typed by
+    -- `_default`. A custom setting once SET LOCAL, or SET then RESET, reads back
+    -- as '' for the rest of the session: that, like an unset setting, gives the
+    -- default. A value that does not parse as the default's type gives the
+    -- default with a WARNING. SQL the library generates at run time must not call
+    -- it (it reads `NULLIF(current_setting(..., true), '')` inline): the library
+    -- can run before ALTER EXTENSION UPDATE has created this function.
+    CREATE OR REPLACE FUNCTION public.__reflex_setting(_setting TEXT, _default anyelement)
+    RETURNS anyelement LANGUAGE plpgsql STABLE AS $fn$
+    DECLARE
+        _raw TEXT := NULLIF(btrim(current_setting(_setting, true)), '');
+        _value _default%TYPE;
+    BEGIN
+        IF _raw IS NULL THEN
+            RETURN _default;
+        END IF;
+        BEGIN
+            _value := _raw;
+        EXCEPTION WHEN data_exception THEN
+            RAISE WARNING 'pg_reflex: setting % = % is not a valid %; using the default %',
+                _setting, quote_literal(_raw), pg_typeof(_default), _default;
+            RETURN _default;
+        END;
+        RETURN _value;
+    END;
+    $fn$;
     "#,
     name = "pg_reflex_init",
 );
@@ -1598,7 +1625,7 @@ extension_sql!(
             IF _src_total IS NOT NULL AND _src_total >= 1000 THEN
                 EXECUTE format('SELECT count(*) FROM %I', _trans) INTO _trans_count;
                 _thr := COALESCE(_rec.wipe_threshold,
-                                 current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5);
+                                 public.__reflex_setting('reflex.wipe_threshold', 0.5::NUMERIC));
                 IF _trans_count::NUMERIC / _src_total >= _thr THEN
                     EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', _trans);
                     PERFORM public.reflex_reconcile(_imv);
@@ -1960,6 +1987,7 @@ mod tests {
     include!("tests/pg_test_v1122_push_scoped_reader.rs");
     include!("tests/pg_test_v1122_minmax_pruned_recompute.rs");
     include!("tests/pg_test_v1122_minmax_bulk_replace.rs");
+    include!("tests/pg_test_v1122_guc_empty_cast.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

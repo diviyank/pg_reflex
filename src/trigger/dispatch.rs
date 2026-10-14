@@ -125,7 +125,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
              -- instance serves IMVs with shape-divergent crossovers.\n\
              SELECT wipe_threshold INTO _per_imv\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
+             _thr := COALESCE(_per_imv, NULLIF(current_setting('reflex.wipe_threshold', true), '')::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _ratio := _aff::NUMERIC / _imm;\n\
              IF _ratio >= _thr THEN\n\
                  -- High-selectivity path — delegate to reflex_reconcile,\n\
@@ -273,7 +273,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
+             _thr   := COALESCE(_per_imv, NULLIF(current_setting('reflex.wipe_threshold', true), '')::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
              -- Per-partition dirty counts from the already-populated\n\
              -- affected table (GROUP BY partition_col).\n\
@@ -534,7 +534,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
+             _thr   := COALESCE(_per_imv, NULLIF(current_setting('reflex.wipe_threshold', true), '')::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
              SELECT count(*) INTO _partition_total\n\
                  FROM pg_inherits WHERE inhparent = '{parent}'::regclass;\n\
