@@ -700,9 +700,10 @@ fn v112_sc_cross_plan_dependents_stay_correct_immediate() {
 }
 
 /// A push refreshes the passthrough: the sub-IMVs ignoring it are queued for
-/// their heal (1.12.1), and the aggregate reading it is refreshed by plan
-/// instead of applying the row diff at COMMIT (1.12.2).
-const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions"), ("sc_fdya", "groups")];
+/// their heal (1.12.1). The aggregate reading it is not refreshed: these swaps
+/// change no column it reads, so the unread-column check stages nothing for it
+/// (1.12.2).
+const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions")];
 
 /// Swaps of populated leaves refresh the passthrough and the two sub-IMVs that
 /// ignore it, once each and within the swapped plans, whatever the number of
