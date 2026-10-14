@@ -535,3 +535,68 @@ fn v1122_minmax_bulk_block_survives_statement_split() {
         );
     }
 }
+
+/// After a rebuild in the transaction, the flush applies only the rows staged
+/// after it. The replacement decides on, and replaces, those rows' groups only:
+/// one row of plan 1 does not replace plan 2's groups again.
+#[pg_test]
+fn v1122_minmax_bulk_after_rebuild_reads_only_later_rows() {
+    let p = "mmb_wm";
+    mmb_dates_imv(p, 3, 3);
+    let fresh = mmb_dates_fresh(p);
+    Spi::run(&format!("UPDATE {p}_src SET d = d + 1, k = k + 100 WHERE plan = 2")).expect("whole plan");
+    Spi::run(&format!("SELECT public.reflex_reconcile('{p}_v')")).expect("reconcile");
+    let replaced = mmb_apply(
+        p,
+        &format!("UPDATE {p}_src SET v = v + 1, d = d + 1 WHERE plan = 1 AND d = '2027-12-15' AND k = 1"),
+    );
+    mmb_check(p, &fresh);
+    let plan_2_groups_maintained = Spi::get_one::<i64>(&format!(
+        "SELECT count(*) FROM __reflex_affected_{p}_v WHERE plan = 2"
+    ))
+    .expect("affected")
+    .expect("affected NULL");
+    assert_eq!(
+        (replaced, plan_2_groups_maintained),
+        (false, 0),
+        "only the row staged after the rebuild may be maintained"
+    );
+}
+
+/// The replacement reads the source of the replaced groups only: with the
+/// source partitioned by plan, the leaves of other plans are not scanned.
+#[pg_test]
+fn v1122_minmax_bulk_reinsert_prunes() {
+    let p = "mmb_prune";
+    mmb_dates_imv(p, 3, 3);
+    mmb_plant_scratch_marker(p);
+    let scans = mmp_apply(
+        p,
+        "DEFERRED",
+        &format!("UPDATE {p}_src SET d = d + 1, k = k + 100 WHERE plan = 2"),
+        &["2"],
+    );
+    mmb_check(p, &mmb_dates_fresh(p));
+    assert!(mmb_replaced(p), "the whole-plan UPDATE replaces the plan's groups");
+    assert_eq!(scans, 0, "the replacement must not read the leaves of other plans");
+}
+
+/// The decision counts every staged row, before netting: a plan moved and moved
+/// back stages rows that net out, and they still count. Both paths are exact;
+/// this pins which one a delta with net-zero rows takes.
+#[pg_test]
+fn v1122_minmax_bulk_decides_on_unnetted_rows() {
+    let p = "mmb_net";
+    mmb_dates_imv(p, 3, 3);
+    let replaced = mmb_apply_all(
+        p,
+        &[
+            format!("UPDATE {p}_src SET d = d + 1, k = k + 100 WHERE plan = 2"),
+            format!("UPDATE {p}_src SET d = d - 1, k = k - 100 WHERE plan = 2"),
+            format!("UPDATE {p}_src SET d = d + 40, k = k + 100 WHERE plan = 1 AND d = '2027-11-01' AND k = 1"),
+        ],
+        &[&format!("{p}_src")],
+    );
+    mmb_check(p, &mmb_dates_fresh(p));
+    assert!(replaced, "rows that net out still count toward the ratio");
+}
