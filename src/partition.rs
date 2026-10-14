@@ -1176,7 +1176,7 @@ pub(crate) fn resolve_anchor_source(
     let col = partition_col.to_lowercase();
     let debug_resolve = client
         .select(
-            "SELECT public.__reflex_setting('pg_reflex.debug_resolve_anchor', FALSE) AS v",
+            "SELECT COALESCE(NULLIF(current_setting('pg_reflex.debug_resolve_anchor', true), '')::bool, FALSE) AS v",
             Some(1),
             &[],
         )
