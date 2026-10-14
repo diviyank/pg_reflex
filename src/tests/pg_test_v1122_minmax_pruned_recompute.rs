@@ -300,42 +300,51 @@ fn v1122_minmax_recompute_timestamptz_key_keeps_exists() {
     assert!(scans > 0, "a timestamptz key must take the EXISTS form");
 }
 
-/// Up to the cap the keys are listed and the scan is pruned; one more group
-/// takes the EXISTS form.
+/// Up to the cap the distinct values of a group column are listed and prune the
+/// scan; with one more that column gets no list. Plans 3.. live in the DEFAULT
+/// partition, so only the list of plans keeps the scan off plans 1 and 2.
 #[pg_test]
 fn v1122_minmax_recompute_key_cap() {
     let cap = crate::trigger::MIN_MAX_RECOMPUTE_LITERAL_KEY_CAP as i32;
-    for (p, groups, pruned) in [("mmp_cap", cap, true), ("mmp_over", cap + 1, false)] {
-        mmp_source(p, &["1", "2"], "INT", "k", 1);
+    for (p, plans, pruned) in [("mmp_cap", cap, true), ("mmp_over", cap + 1, false)] {
         Spi::run(&format!(
-            "INSERT INTO {p}_src (plan, d, yr, k, key_column, v) \
-             SELECT plan, DATE '2027-11-01', 2027, 0, g, 0 \
-             FROM generate_series(1, 2) plan, generate_series(10, {groups} + 9) g"
+            "CREATE TABLE {p}_src (plan INT NOT NULL, d DATE NOT NULL) PARTITION BY LIST (plan); \
+             CREATE TABLE {p}_src_1 PARTITION OF {p}_src FOR VALUES IN (1); \
+             CREATE TABLE {p}_src_2 PARTITION OF {p}_src FOR VALUES IN (2); \
+             CREATE TABLE {p}_src_rest PARTITION OF {p}_src DEFAULT; \
+             INSERT INTO {p}_src SELECT plan, DATE '2027-11-01' + day \
+               FROM generate_series(1, {plans} + 2) plan, generate_series(0, 19) day; \
+             ANALYZE {p}_src"
         ))
-        .expect("one row per extra group");
-        Spi::run(&format!("ANALYZE {p}_src")).expect("analyze");
-        mmp_create(p, MMP_DATES, "plan, key_column", "DEFERRED");
-        let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
-        let affected_groups = Spi::get_one::<i64>(&format!(
-            "SELECT count(DISTINCT key_column)::int8 FROM {p}_src WHERE plan = 2"
+        .expect("source");
+        Spi::run(&format!(
+            "SELECT create_reflex_ivm('{p}_v', 'SELECT plan, MIN(d) AS lo, MAX(d) AS hi FROM {p}_src GROUP BY plan', \
+               NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[])"
         ))
-        .expect("groups")
-        .expect("groups NULL");
-        assert_eq!(affected_groups, groups as i64 + 1, "fixture: groups of plan 2");
-        let scans = mmp_apply(
-            p,
-            "DEFERRED",
-            &format!(
-                "UPDATE {p}_src SET d = d + 1 WHERE plan = 2 AND key_column <> 1"
-            ),
-            &["2"],
-        );
+        .expect("create IMV");
+        let fresh = format!("SELECT plan, MIN(d), MAX(d) FROM {p}_src GROUP BY plan");
+        Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").expect("serial plans");
+        let leaf_scans = || {
+            Spi::get_one::<i64>(&format!(
+                "SELECT (pg_stat_get_xact_numscans('{p}_src_1'::regclass) \
+                       + pg_stat_get_xact_numscans('{p}_src_2'::regclass))::int8"
+            ))
+            .expect("scans")
+            .expect("scans NULL")
+        };
+        let before = leaf_scans();
+        Spi::run(&format!(
+            "UPDATE {p}_src SET d = d + 30 WHERE plan > 2 AND d < '2027-11-17'"
+        ))
+        .expect("dml");
+        Spi::run(&format!("SELECT reflex_flush_deferred('{p}_src')")).expect("flush");
+        let scans = leaf_scans() - before;
         mmp_not_stale(p);
         mmp_assert_correct(p, &fresh);
         assert_eq!(
             scans == 0,
             pruned,
-            "{groups} shrunk groups (cap {cap}): pruned expected {pruned}, scans {scans}"
+            "{plans} affected plans (cap {cap}): pruned expected {pruned}, scans {scans}"
         );
     }
 }
