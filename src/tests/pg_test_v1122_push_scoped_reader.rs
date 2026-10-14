@@ -6,7 +6,7 @@
 const PSR_SUM_SQL: &str =
     "SELECT plan, yr, SUM(quantity) AS q, COUNT(*) AS n FROM {sfv} AS sf GROUP BY plan, yr";
 const PSR_JOINED_SQL: &str = "SELECT sf.plan, SUM(sf.quantity * w.w) AS q, COUNT(*) AS n \
-     FROM {sfv} AS sf JOIN sc_w AS w ON w.loc = sf.loc GROUP BY sf.plan";
+     FROM {sfv} AS sf JOIN sc_w AS w ON w.loc = sf.loc GROUP BY plan";
 const PSR_IMMEDIATE_SQL: &str =
     "SELECT plan, yr, SUM(quantity) AS q, COUNT(*) AS n FROM {sfv} AS sf GROUP BY plan, yr";
 const PSR_BY_YEAR_SQL: &str =
@@ -263,4 +263,59 @@ fn v1122_psr_low_churn_push_leaves_the_aggregates_to_the_commit_flush() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert_eq!(refreshes, [Vec::<String>::new(), Vec::new()], "[sc_fdya, psr_sum] refreshes");
     assert_eq!(flushes_after, flushes_before + 1, "psr_sum applied the row diff at COMMIT");
+}
+
+/// A partition rebuild run inside a trigger, while the statement may still
+/// stage deltas, leaves a DEFERRED aggregate of the rebuilt IMV to its COMMIT
+/// flush: a refresh of its groups there would only list it for a full rebuild.
+#[pg_test]
+fn v1122_psr_rebuild_inside_a_trigger_leaves_the_aggregate_to_its_flush() {
+    probe_db_open("reflex_psr_t9");
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE hs (id INT NOT NULL, region TEXT NOT NULL, amount INT NOT NULL) \
+           PARTITION BY LIST (region)",
+        "CREATE TABLE hs_a PARTITION OF hs FOR VALUES IN ('A')",
+        "CREATE TABLE hs_b PARTITION OF hs FOR VALUES IN ('B')",
+        "INSERT INTO hs SELECT g, r, g FROM unnest(ARRAY['A', 'B']) r, generate_series(1, 20) g",
+        "CREATE TABLE kick (n INT)",
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+    ] {
+        worker_exec(ddl);
+    }
+    for call in [
+        "create_reflex_ivm('hv', 'SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs \
+           GROUP BY region', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['region'])",
+        "create_reflex_ivm('hg', 'SELECT region, SUM(total) AS t, COUNT(*) AS n FROM hv \
+           GROUP BY region', NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[])",
+        "reflex_set_wipe_threshold('hg', 1000000000)",
+    ] {
+        assert!(!rbc_select(call).starts_with("ERROR"), "{call}");
+    }
+    for ddl in [
+        "CREATE FUNCTION kick_reconcile() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           BEGIN PERFORM public.reflex_reconcile_partition('hv', 'A'); RETURN NULL; END $$",
+        "CREATE TRIGGER kick_reconcile AFTER INSERT ON kick \
+           FOR EACH STATEMENT EXECUTE FUNCTION kick_reconcile()",
+        "CREATE FUNCTION sc_note_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           DECLARE stack TEXT; BEGIN GET DIAGNOSTICS stack = PG_CONTEXT; \
+             INSERT INTO sc_trace (name, context) VALUES (NEW.name, stack); RETURN NULL; END $$",
+        "CREATE TRIGGER sc_note_refresh AFTER UPDATE OF last_update_date \
+           ON public.__reflex_ivm_reference FOR EACH ROW EXECUTE FUNCTION sc_note_refresh()",
+    ] {
+        worker_exec(ddl);
+    }
+    let outcome = chain
+        .commit("UPDATE hs SET amount = amount + 7 WHERE region = 'A'; INSERT INTO kick VALUES (1)");
+    let refreshes = psr_refreshes_of(&chain, "hg");
+    let mismatches = rbc_mismatch(
+        "hg",
+        "SELECT region, SUM(total) AS t, COUNT(*) AS n FROM \
+           (SELECT region, SUM(amount) AS total FROM hs GROUP BY region) AS v GROUP BY region",
+    );
+    probe_db_close("reflex_psr_t9");
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(mismatches, 0, "hg");
+    assert!(refreshes.is_empty(), "hg is left to its COMMIT flush: {refreshes:?}");
 }
