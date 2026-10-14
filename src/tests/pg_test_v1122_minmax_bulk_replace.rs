@@ -458,3 +458,80 @@ fn v1122_minmax_bulk_join_sources() {
     );
     mmb_check(p, &fresh);
 }
+
+/// A nullable group key holding NULL: the groups are matched NULL-safely when
+/// deleted and reinserted, and the algebraic path keeps its gated statement pairs.
+#[pg_test]
+fn v1122_minmax_bulk_null_group_key() {
+    let p = "mmb_null";
+    mmp_source(p, &["1", "2", "NULL"], "INT", "0", 3);
+    mmp_create(p, MMP_DATES, "plan, yr", "DEFERRED");
+    let fresh = mmb_dates_fresh(p);
+    let replaced = mmb_apply(p, &format!("UPDATE {p}_src SET d = d + 1, k = k + 100 WHERE plan IS NULL"));
+    mmb_check(p, &fresh);
+    assert!(replaced, "a whole-plan UPDATE of the NULL plan replaces its groups");
+    let replaced = mmb_apply(p, &format!("DELETE FROM {p}_src WHERE plan IS NULL AND yr = 2028"));
+    mmb_check(p, &fresh);
+    assert!(replaced, "deleting a NULL-keyed group replaces it");
+    let small = mmb_apply(
+        p,
+        &format!("UPDATE {p}_src SET d = d + 40, k = k + 100 WHERE plan IS NULL AND d = '2027-11-02' AND k = 101"),
+    );
+    mmb_check(p, &fresh);
+    assert!(!small, "a small delta on the NULL plan keeps the algebraic path");
+}
+
+/// The field shape: the MIN/MAX reader reads a DEFERRED passthrough IMV, whose
+/// own flush stages the reader's delta.
+#[pg_test]
+fn v1122_minmax_bulk_over_deferred_imv() {
+    let p = "mmb_chain";
+    mmp_source(p, &["1", "2", "3"], "INT", "0", 3);
+    mmb_create(&format!(
+        "'{p}_mirror', 'SELECT plan, d, yr, k FROM {p}_src', NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[]"
+    ));
+    mmb_create(&format!(
+        "'{p}_v', 'SELECT plan, yr, MIN(d) AS lo, MAX(d) AS hi FROM {p}_mirror GROUP BY plan, yr', \
+         NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[]"
+    ));
+    let replaced = mmb_apply_all(
+        p,
+        &[format!("UPDATE {p}_src SET d = d + 1, k = k + 100 WHERE plan = 2")],
+        &[&format!("{p}_src"), &format!("{p}_mirror")],
+    );
+    mmb_check(p, &format!("SELECT plan, yr, MIN(d), MAX(d) FROM {p}_mirror GROUP BY plan, yr"));
+    assert_imv_correct(&format!("{p}_v"), &mmb_dates_fresh(p));
+    assert!(replaced, "the reader's flush replaces the plan's groups");
+}
+
+/// Every caller (the DEFERRED flush and the IMMEDIATE trigger body) splits the
+/// generated SQL on the statement separator and runs each part on its own. The
+/// replacement DO block wraps algebraic statements that are themselves gated
+/// pairs (a nullable key): no separator may fall inside it.
+#[pg_test]
+fn v1122_minmax_bulk_block_survives_statement_split() {
+    let p = "mmb_split";
+    mmp_source(p, &["1", "NULL"], "INT", "0", 1);
+    mmp_create(p, MMP_DATES, "plan, yr", "DEFERRED");
+    let sql = Spi::get_one::<String>(&format!(
+        "SELECT reflex_build_delta_sql(name, '{p}_src', 'UPDATE_NETTED', base_query, end_query, \
+           aggregations::text, base_query) FROM public.__reflex_ivm_reference WHERE name = '{p}_v'"
+    ))
+    .expect("delta sql")
+    .expect("delta sql NULL");
+    let blocks: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .map(str::trim)
+        .filter(|stmt| stmt.starts_with("DO $"))
+        .collect();
+    assert!(!blocks.is_empty(), "the flush SQL holds DO blocks");
+    for block in blocks {
+        let tag_end = block[4..].find('$').expect("closing $ of the opening tag") + 5;
+        let tag = &block[3..tag_end];
+        assert!(
+            block.ends_with(tag),
+            "a DO block was cut by the statement separator: {}",
+            &block[..block.len().min(300)]
+        );
+    }
+}
