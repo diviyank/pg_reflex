@@ -2801,3 +2801,34 @@ fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_immediate() {
 fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_deferred() {
     sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan("reflex_sc_rir_d", "DEFERRED");
 }
+
+#[pg_test]
+fn v112_sc_commit_reports_a_failed_transaction_as_failed() {
+    let dbname = "reflex_sc_commit_outcome";
+    probe_db_open(dbname);
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+        "CREATE TABLE sc_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE sc_child (parent_id INT REFERENCES sc_parent (id) \
+           DEFERRABLE INITIALLY DEFERRED)",
+    ] {
+        chain.exec(ddl);
+    }
+    let outcomes = [
+        ("a committing transaction", "INSERT INTO sc_parent VALUES (1)", true),
+        ("a deferred FK violation at COMMIT", "INSERT INTO sc_child VALUES (2)", false),
+        ("an error between two row-returning statements", "SELECT 1; SELECT 1/0; SELECT 2", false),
+    ];
+    let wrong: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(label, statements, should_commit)| {
+            let outcome = chain.commit(statements);
+            (outcome.is_ok() != *should_commit)
+                .then(|| format!("{label}: commit() returned {outcome:?}"))
+        })
+        .collect();
+    probe_db_close(dbname);
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
