@@ -26,7 +26,10 @@ pub(crate) fn may_replace_large_deltas(plan: &AggregationPlan, netted_delta: boo
 
 /// A DO block that, for the groups the netted delta touches, either replaces
 /// their intermediate rows from the base query or runs `algebraic_stmts` (the
-/// Sub / shrunk capture / Add / forced recompute sequence) unchanged.
+/// Sub / shrunk capture / Add / forced recompute sequence) unchanged. An entry
+/// of `algebraic_stmts` may be a gated pair joined by the statement separator:
+/// each part gets its own EXECUTE, since every caller splits the returned SQL
+/// on that separator.
 ///
 /// Both fill `affected_tbl` with those groups, so the epilogue that follows
 /// brings their target rows in line either way. The replacement deletes the
@@ -92,7 +95,8 @@ pub(crate) fn build_min_max_bulk_replace_sql(
         .join("\n");
     let algebraic = algebraic_stmts
         .iter()
-        .map(|stmt| format!("EXECUTE {};", dollar_quoted(stmt)))
+        .flat_map(|stmts| split_reflex_statements(stmts))
+        .map(|stmt| format!("EXECUTE {};", dollar_quoted(&stmt)))
         .collect::<Vec<_>>()
         .join("\n");
     let cols = group_cols.join(", ");
