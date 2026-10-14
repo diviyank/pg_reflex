@@ -266,7 +266,7 @@ fn v1122_minmax_recompute_unlisted_types_keep_exists() {
     mmp_source(p, &["1", "2"], "mmp_dom_code", "'c' || k", 3);
     mmp_create(p, MMP_DATES, "plan, key_column", "DEFERRED");
     let fresh = format!("SELECT plan, key_column, MIN(d), MAX(d) FROM {p}_src GROUP BY plan, key_column");
-    mmp_apply(
+    let scans = mmp_apply(
         p,
         "DEFERRED",
         &mmp_beyond_the_heap(p, "plan = 2"),
@@ -274,6 +274,7 @@ fn v1122_minmax_recompute_unlisted_types_keep_exists() {
     );
     mmp_not_stale(p);
     mmp_assert_correct(p, &fresh);
+    assert!(scans > 0, "a domain key must take the EXISTS form");
 }
 
 /// Under DateStyle SQL a timestamptz prints its zone as an abbreviation, and
