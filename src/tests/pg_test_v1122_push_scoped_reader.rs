@@ -306,8 +306,13 @@ fn v1122_psr_rebuild_inside_a_trigger_leaves_the_aggregate_to_its_flush() {
     ] {
         worker_exec(ddl);
     }
-    let outcome = chain
-        .commit("UPDATE hs SET amount = amount + 7 WHERE region = 'A'; INSERT INTO kick VALUES (1)");
+    // hv drifts behind hs (its triggers off), so the reconcile in the trigger
+    // diffs rows through hv and stages them for hg.
+    let outcome = chain.commit(
+        "ALTER TABLE hs DISABLE TRIGGER USER; \
+         UPDATE hs SET amount = amount + 7 WHERE region = 'A'; \
+         ALTER TABLE hs ENABLE TRIGGER USER; INSERT INTO kick VALUES (1)",
+    );
     let refreshes = psr_refreshes_of(&chain, "hg");
     let mismatches = rbc_mismatch(
         "hg",
