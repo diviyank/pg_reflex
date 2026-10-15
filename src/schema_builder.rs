@@ -925,12 +925,26 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
          FOR EACH STATEMENT EXECUTE FUNCTION public.{del_fn}()"
     );
 
-    // UPDATE — capture both old and new rows
+    // UPDATE — capture both old and new rows, unless the statement leaves every
+    // column the IMVs of the source read unchanged as a multiset of values.
+    // Values compare with each type's `=` (json/xml as text), like the COMMIT-time
+    // spurious and filter-skip checks: a representation-only change is no change.
+    let unread_column_check = slot_replace(
+        include_str!("../sql/deferred_trigger_unread_column_check.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
+            ("__REFLEX_SLOT_REF_NEW__", &ref_new),
+            ("__REFLEX_SLOT_REF_OLD__", &ref_old),
+            ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+        ],
+    );
     let upd_fn = source_trigger_function_name(source_table, "upd");
     let upd_trig = source_trigger_name(source_table, "upd");
     let upd_body = slot_replace(
         include_str!("../sql/deferred_trigger_update_body.plpgsql.in"),
         &[
+            ("__REFLEX_SLOT_UNREAD_COLUMN_CHECK__", &unread_column_check),
             ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
             ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
             ("__REFLEX_SLOT_REF_NEW__", &ref_new),

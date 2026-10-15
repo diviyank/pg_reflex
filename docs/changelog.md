@@ -4,6 +4,34 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.12.2] — 2026-10-14
+
+A performance release for DEFERRED chains, with one correctness fix. A partition push refreshes the DEFERRED aggregates that read the rebuilt IMV by group instead of leaving them to an expensive COMMIT delta flush; the MIN / MAX recompute of shrunk groups prunes partitions; a large DEFERRED top-K MIN / MAX delta replaces its groups from the base query; and an UPDATE of a DEFERRED source that leaves every column its IMVs read unchanged costs nothing at COMMIT. The fix: an empty `reflex.wipe_threshold`, `reflex.wipe_floor_rows` or `pg_reflex.debug_resolve_anchor` (after `SET LOCAL`, or `SET` then `RESET`) discarded DEFERRED flushes or aborted partitioned creates. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.2';`
+
+**Changed**
+
+- A push whose rebuilt leaves are all row-diffed refreshes, by group, the DEFERRED aggregates grouped by the rebuilt IMV's partition column, and their COMMIT flush skips what the refresh reflects; only when the push's diff stages at least half the rows of those groups. Fixture COMMIT 5.8–7.5 s → 1.6 s (push +1.1–3.4 s); field estimate −55–65 s per push.
+- The MIN / MAX recompute binds the affected keys as typed arrays (`= ANY($n)`), so the source's partitions prune; for NULL-free keys of `int2`/`int4`/`int8`/`numeric`/`text`/`varchar`/`bpchar`/`date`/`timestamp`/`bool`/`uuid`, up to 100 distinct values per column. Small shrinking changes: flush −39 to −44 %.
+- A DEFERRED top-K MIN / MAX delta whose staged rows reach half the rows of its groups replaces those groups from the base query (GROUP BY, unpartitioned target, no DISTINCT aggregate, no `ignored_sources`; no opt-in). Flush −33 to −52 % at ratio 0.5–2, about +5 % below it.
+- An UPDATE of a source with a DEFERRED IMV that leaves every read column and `WHERE` predicate unchanged, while nothing is staged for the source, stages and maintains nothing: 2 M rows COMMIT 13.5 s → 11 ms, 1 row 5.4 → 0.95 ms, and a mirror refresh's DEFERRED reader ~9 s → <0.2 s. Needs `reflex_rebuild_triggers` on existing sources.
+
+**Fixed**
+
+- (SILENT) An empty `reflex.wipe_threshold` / `reflex.wipe_floor_rows` raised 22P02 in the DEFERRED dispatch and the delta was discarded (since 1.4.5); it also skipped Path B / Path C, and an empty `pg_reflex.debug_resolve_anchor` failed every partitioned create and flush. Empty now reads as the default; the new `__reflex_setting()` also defaults an unparsable value with a WARNING.
+
+**Behaviour notes**
+
+- The unread-column check compares with each type's `=`, like the existing COMMIT-time checks: a representation-only change (numeric scale, float `-0`, `citext` case, `bpchar` blanks, `jsonb` number scale) is unchanged, by design, now also for the IMMEDIATE IMVs of a source with a DEFERRED IMV.
+- The top-K bulk replace applies to every qualifying installed DEFERRED top-K MIN / MAX IMV, with no opt-in.
+
+**Known issues**
+
+- Filed, pre-existing: an ERROR in a push's rebuild region under a user `SAVEPOINT` aborts an assertion-build backend; an IMMEDIATE top-K writable CTE INSERT + UPDATE leaves a phantom heap entry; an IMV joining a source with a DEFERRED IMV over it double-counts the joint delta; readers of a flush-failed IMV are not reported stale; UPDATE bodies return early on an empty NEW and miss rows a cancelled row movement removed.
+
+**Migration**
+
+- [`sql/pg_reflex--1.12.1--1.12.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.12.1--1.12.2.sql) — creates `__reflex_setting()` and replaces `reflex_apply_partition_delta()`; no registry, table or signature change. Run it promptly; the library does not depend on it. Then `SELECT reflex_rebuild_triggers('<source>')` per DEFERRED source (base-db: `alp.sales_simulation`, `alp.sop_forecast_view`, …). See [Upgrading to 1.12.2](getting-started/upgrading.md#upgrading-to-1122).
+
 ## [1.12.1] — 2026-10-13
 
 A performance release for partition swaps of a source read by a chain of IMVs. A push that swaps leaves of a partitioned source no longer refreshes, at COMMIT, the IMVs that list the rebuilt partition-mirroring IMV in their `ignored_sources`: their affected partitions are queued as stale and rebuilt by `reflex_heal_ignored_sources`, `reflex_scheduled_reconcile` or `reflex_doctor(fix => TRUE)`. A FULL JOIN passthrough refreshes only the changed join keys, and an aggregate IMV without a unique index is diffed by its groups. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.1';`

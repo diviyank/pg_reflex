@@ -2,6 +2,8 @@
 
 pg_reflex reads a handful of runtime settings via `current_setting`. None require a restart — set them per-session with `SET`, per-transaction with `SET LOCAL`, or per-database/role with `ALTER DATABASE/ROLE ... SET`. All are optional; the compiled defaults apply when unset.
 
+An empty value reads as unset (1.12.2+). After `SET LOCAL` or `SET` then `RESET`, a custom setting reads back as `''` for the rest of the session; before 1.12.2 that made the DEFERRED flush of `reflex.wipe_threshold` fail and discard its delta, and made every partitioned create fail on `pg_reflex.debug_resolve_anchor`. A value that does not parse (`'abc'`) is an operator error and fails what reads it (a DEFERRED flush flags the IMV `known_stale` with the `reflex_reconcile` remedy), except in `reflex_apply_partition_delta`, which uses the default with a WARNING.
+
 | Setting | Type | Default | Effect |
 |---|---|---|---|
 | [`reflex.wipe_threshold`](#reflexwipe_threshold) | float `0`–`1` | `0.5` | Dirty-row fraction at or above which a batch wipes-and-rebuilds instead of applying a delta. |
