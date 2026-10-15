@@ -18,6 +18,16 @@ fn v112_pl_holder_exec(sql: &str) {
     .unwrap_or_else(|e| panic!("holder failed for <{sql}>: {e}"));
 }
 
+/// The error the last call over `session` raised, if any. `dblink(..., false)`
+/// turns errors, a failed COMMIT included, into NOTICEs and may still return the
+/// rows of an earlier statement, so the rows alone never prove the call succeeded.
+fn dblink_last_error(session: &str) -> Option<String> {
+    let message = Spi::get_one::<String>(&format!("SELECT dblink_error_message('{session}')"))
+        .expect("dblink_error_message")
+        .unwrap_or_default();
+    (!message.is_empty() && message != "OK").then_some(message)
+}
+
 /// Evaluates `expr` on the worker; the error text when it raises or when it
 /// reports a failure as an `ERROR…` value.
 fn v112_pl_call(expr: &str) -> Result<String, String> {
@@ -33,12 +43,11 @@ fn v112_pl_call_on(session: &str, expr: &str) -> Result<String, String> {
     ))
     .expect("call over dblink")
     .unwrap_or_default();
+    if let Some(error) = dblink_last_error(session) {
+        return Err(error);
+    }
     if value == RAISED {
-        return Err(
-            Spi::get_one::<String>(&format!("SELECT dblink_error_message('{session}')"))
-                .expect("dblink_error_message")
-                .unwrap_or_default(),
-        );
+        return Err(String::new());
     }
     let reports_a_failure = value.starts_with("ERROR")
         || value.contains("lock timeout")

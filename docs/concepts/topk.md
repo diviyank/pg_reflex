@@ -64,6 +64,10 @@ __min_x      = (public.__reflex_array_subtract_multiset(t.__min_x_topk, d.__min_
 
 **On heap underflow** (`cardinality(__min_x_topk) = 0` after subtract): the existing `build_min_max_recompute_sql` UPDATE runs against the source for those groups, repopulating both `__min_x` and `__min_x_topk` from a fresh scan.
 
+Since 1.12.2 that recompute also filters each group column with `= ANY($n)`, the affected keys bound as typed arrays, so a partitioned source is pruned to the partitions holding those groups. It applies when no affected key is NULL and every key column is `int2`, `int4`, `int8`, `numeric`, `text`, `varchar`, `bpchar`, `date`, `timestamp`, `bool` or `uuid`; a column with more than 100 distinct affected values is left unfiltered.
+
+**On a large DEFERRED delta** (1.12.2+): when the rows staged for the affected groups reach half the rows those groups hold, the COMMIT flush deletes the groups' intermediate rows and re-inserts them from the base query instead of subtracting, adding and recomputing. It applies to DEFERRED IMVs with a GROUP BY, an unpartitioned target, no DISTINCT aggregate and no `ignored_sources`. IMMEDIATE IMVs always take the algebraic path above.
+
 ## Choosing K
 
 | Workload | Recommended K |

@@ -131,19 +131,21 @@ impl ScChain {
     }
 
     /// Commits `statements` (which may return rows) as one implicit
-    /// transaction that records its id first; the error text when it raises.
+    /// transaction that records its id first; the error text when it did not
+    /// commit. `dblink(..., false)` turns errors into NOTICEs and keeps the rows
+    /// of the last statement that returned some, so only the id the transaction
+    /// wrote, which survives only if it committed, tells the outcome.
     fn commit(&self, statements: &str) -> Result<(), String> {
         worker_exec("TRUNCATE sc_trace, sc_xact");
-        let committed = Spi::get_one::<i64>(&format!(
+        Spi::run(&format!(
             "SELECT count(*) FROM dblink('reflex_lock_worker', {}, false) AS t(v text)",
             sql_lit(&self.named(&format!(
                 "INSERT INTO sc_xact SELECT pg_current_xact_id()::text; {statements}; \
                  SELECT 'committed'"
             )))
         ))
-        .expect("dblink")
-        .unwrap_or(0);
-        if committed == 1 {
+        .expect("dblink");
+        if worker_scalar_i64("SELECT count(*) FROM sc_xact") == 1 {
             return Ok(());
         }
         let error = Spi::get_one::<String>("SELECT dblink_error_message('reflex_lock_worker')")
@@ -151,7 +153,7 @@ impl ScChain {
             .unwrap_or_default();
         let _ =
             Spi::get_one::<String>("SELECT dblink_exec('reflex_lock_worker', 'ROLLBACK', false)");
-        Err(error)
+        Err(format!("transaction did not commit: {error}"))
     }
 
     fn create(&self, call: &str) {
@@ -697,8 +699,10 @@ fn v112_sc_cross_plan_dependents_stay_correct_immediate() {
     sc_assert_cross_plan_dependents_stay_correct("reflex_sc_xp_i", "IMMEDIATE");
 }
 
-/// A push refreshes the passthrough only: the sub-IMVs ignoring it are queued
-/// for their heal (1.12.1).
+/// A push refreshes the passthrough: the sub-IMVs ignoring it are queued for
+/// their heal (1.12.1). The aggregate reading it is not refreshed: these swaps
+/// change no column it reads, so the unread-column check stages nothing for it
+/// (1.12.2).
 const SC_ONE_LEAF_REFRESHES: &[(&str, &str)] = &[("sc_sfv", "partitions")];
 
 /// Swaps of populated leaves refresh the passthrough and the two sub-IMVs that
@@ -885,7 +889,9 @@ fn v112_sc_unchanged_leaf_still_refreshes_the_ignoring_sub_imvs() {
         "fixture: the ignoring sub-IMV is behind after an ordinary write: {behind_before:?}"
     );
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
-    assert_eq!(refreshes, chain.expected_refreshes(SC_ONE_LEAF_REFRESHES));
+    // The leaf's rows did not change: no row diff reached the aggregate, so
+    // nothing is refreshed for it (1.12.2).
+    assert_eq!(refreshes, chain.expected_refreshes(&[("sc_sfv", "partitions")]));
     assert!(outside.is_empty(), "wrote outside plan 3: {outside:?}");
 }
 
@@ -2797,4 +2803,50 @@ fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_immediate() {
 #[pg_test]
 fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_deferred() {
     sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan("reflex_sc_rir_d", "DEFERRED");
+}
+
+#[pg_test]
+fn v112_sc_commit_reports_a_failed_transaction_as_failed() {
+    let dbname = "reflex_sc_commit_outcome";
+    probe_db_open(dbname);
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+        "CREATE TABLE sc_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE sc_child (parent_id INT REFERENCES sc_parent (id) \
+           DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE FUNCTION sc_orphan() RETURNS INT LANGUAGE sql AS \
+           $$ INSERT INTO sc_child VALUES (3) RETURNING 1 $$",
+    ] {
+        chain.exec(ddl);
+    }
+    let outcomes = [
+        ("a committing transaction", "INSERT INTO sc_parent VALUES (1)", true),
+        ("a deferred FK violation at COMMIT", "INSERT INTO sc_child VALUES (2)", false),
+        ("an error between two row-returning statements", "SELECT 1; SELECT 1/0; SELECT 2", false),
+    ];
+    let wrong: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(label, statements, should_commit)| {
+            let outcome = chain.commit(statements);
+            (outcome.is_ok() != *should_commit)
+                .then(|| format!("{label}: commit() returned {outcome:?}"))
+        })
+        .collect();
+    let single_statement_helpers = [
+        ("v112_sh_remote", v112_sh_remote("sc_orphan()").is_ok()),
+        ("v112_pl_call", v112_pl_call("sc_orphan()").is_ok()),
+    ];
+    let wrong: Vec<String> = wrong
+        .into_iter()
+        .chain(
+            single_statement_helpers
+                .into_iter()
+                .filter(|(_, reported_ok)| *reported_ok)
+                .map(|(helper, _)| format!("{helper}: a deferred FK violation at COMMIT reported Ok")),
+        )
+        .collect();
+    probe_db_close(dbname);
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }

@@ -262,6 +262,60 @@ pub(crate) fn guard_scoped_rebuild(
     view_name: &str,
     slice: RebuiltSlice<'_>,
 ) -> ScopedRebuildGuard {
+    let (source, predicate) = match staged_rows_in_slice(client, view_name, &slice) {
+        StagedRowsInSlice::None => return ScopedRebuildGuard::Unguarded,
+        StagedRowsInSlice::Unplaceable => return ScopedRebuildGuard::ReconcileAtCommit,
+        StagedRowsInSlice::Placeable { source, predicate } => (source, predicate),
+    };
+    ensure_temp_table(
+        client,
+        "__reflex_deferred_scoped_rebuilds",
+        SCOPED_REBUILDS_TABLE_DDL,
+    );
+    let watermark = Watermark::now();
+    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    ScopedRebuildGuard::RecordWithRebuild(format!(
+        "INSERT INTO pg_temp.__reflex_deferred_scoped_rebuilds \
+           (name, source, rebuilt, watermark, watermark_xid) \
+         VALUES ({}, {}, {}, {}, '{}'::xid)",
+        literal(view_name),
+        literal(&source),
+        literal(&predicate),
+        watermark.command,
+        watermark.next_xid
+    ))
+}
+
+/// Whether a scoped rebuild of `view_name` over `slice`, run now, would be
+/// recorded with its watermark ([`guard_scoped_rebuild`] returning
+/// `RecordWithRebuild`). It changes nothing.
+pub(crate) fn scoped_rebuild_would_be_recorded(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    slice: RebuiltSlice<'_>,
+) -> bool {
+    matches!(
+        staged_rows_in_slice(client, view_name, &slice),
+        StagedRowsInSlice::Placeable { .. }
+    )
+}
+
+/// The deltas this transaction staged for `view_name`, as a scoped rebuild of
+/// `slice` sees them ([`guard_scoped_rebuild`]).
+enum StagedRowsInSlice {
+    /// None, or `view_name` is not a DEFERRED IMV flushed outside its own flush.
+    None,
+    /// Some, and whether one lies in the slice cannot be told from its row.
+    Unplaceable,
+    /// Some, staged on `source`; those in the slice satisfy `predicate`.
+    Placeable { source: String, predicate: String },
+}
+
+fn staged_rows_in_slice(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    slice: &RebuiltSlice<'_>,
+) -> StagedRowsInSlice {
     let registry = client
         .select(
             "SELECT COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
@@ -291,41 +345,25 @@ pub(crate) fn guard_scoped_rebuild(
             )
         });
     let Some((true, depends_on)) = registry else {
-        return ScopedRebuildGuard::Unguarded;
+        return StagedRowsInSlice::None;
     };
     let observed = observed_sources(client, view_name);
     if !observed
         .iter()
         .any(|source| staged_by_this_xact(client, &staging_delta_table_name(source)))
     {
-        return ScopedRebuildGuard::Unguarded;
+        return StagedRowsInSlice::None;
     }
     let rebuilt = match (depends_on.as_slice(), observed.as_slice()) {
         ([source], [observed_source]) if source == observed_source => {
-            slice_predicate(client, source, &slice).map(|predicate| (source.clone(), predicate))
+            slice_predicate(client, source, slice).map(|predicate| (source.clone(), predicate))
         }
         _ => None,
     };
-    let Some((source, predicate)) = rebuilt else {
-        return ScopedRebuildGuard::ReconcileAtCommit;
-    };
-    ensure_temp_table(
-        client,
-        "__reflex_deferred_scoped_rebuilds",
-        SCOPED_REBUILDS_TABLE_DDL,
-    );
-    let watermark = Watermark::now();
-    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
-    ScopedRebuildGuard::RecordWithRebuild(format!(
-        "INSERT INTO pg_temp.__reflex_deferred_scoped_rebuilds \
-           (name, source, rebuilt, watermark, watermark_xid) \
-         VALUES ({}, {}, {}, {}, '{}'::xid)",
-        literal(view_name),
-        literal(&source),
-        literal(&predicate),
-        watermark.command,
-        watermark.next_xid
-    ))
+    match rebuilt {
+        Some((source, predicate)) => StagedRowsInSlice::Placeable { source, predicate },
+        None => StagedRowsInSlice::Unplaceable,
+    }
 }
 
 /// The slice as a predicate over a row of `source`'s staging table, or `None`
@@ -1553,6 +1591,16 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     )
                     .unwrap_or_report();
             }
+            client
+                .update(
+                    &format!(
+                        "CREATE OR REPLACE TEMP VIEW \"{}\" AS SELECT {projection} FROM {rel}",
+                        staged_rows_view_name(source_table)
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
         };
         create_netted_views(client, &delta_tbl);
         let mut views_over = delta_tbl.clone();

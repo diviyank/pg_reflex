@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
-    quote_identifier, shrunk_groups_table_name, transition_new_table_name,
+    quote_identifier, shrunk_groups_table_name, staged_rows_view_name, transition_new_table_name,
     transition_old_table_name,
 };
 use crate::sql_writer::identifier::{
@@ -370,6 +370,8 @@ pub fn reflex_build_delta_sql(
             }
             "UPDATE" => {
                 if let Some(merge_sql) = aggregate_update_stmts(
+                    view_name,
+                    netted_delta,
                     &plan,
                     source_table,
                     base_query,
@@ -728,6 +730,7 @@ pub(crate) mod deferred;
 mod dispatch;
 mod expression_subquery;
 mod merge;
+mod minmax_bulk_replace;
 mod ops;
 mod outer_join;
 mod scope;
@@ -737,6 +740,7 @@ mod union_delta;
 pub(crate) use deferred::build_netted_view_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
+pub(crate) use minmax_bulk_replace::*;
 pub(crate) use ops::*;
 pub(crate) use scope::*;
 
