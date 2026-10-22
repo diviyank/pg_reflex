@@ -3079,6 +3079,9 @@ fn fill_fresh_mirror_nodes(
             .iter()
             .map(|src| intermediate_child_name(view_name, src))
             .collect();
+        if source_node_child_count(client, srcs[0]) != Some(srcs.len()) {
+            continue;
+        }
         let Some(tgt_node) = mirror_node_of_exactly(client, schema, &tgt_leaves) else {
             continue;
         };
@@ -3110,6 +3113,31 @@ fn fill_fresh_mirror_nodes(
         filled.extend(srcs.into_iter().cloned().zip(outcomes));
     }
     Ok(filled)
+}
+
+/// How many partitions the source node holding `src_leaf_bare` has. A source
+/// child without a mirror leaf would make the node INSERT raise for its rows.
+fn source_node_child_count(
+    client: &pgrx::spi::SpiClient<'_>,
+    src_leaf_bare: &str,
+) -> Option<usize> {
+    client
+        .select(
+            "SELECT count(*) AS n FROM pg_inherits \
+             WHERE inhparent = (SELECT inhparent FROM pg_inherits \
+                                WHERE inhrelid = to_regclass(quote_ident($1)))",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(
+                    src_leaf_bare.to_string(),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<i64, _>("n").ok().flatten())
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 /// A mirror node, quoted, with its partition constraint.

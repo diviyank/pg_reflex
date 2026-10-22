@@ -321,3 +321,24 @@ fn pg_node_fill_default_leaf_matches_oracle() {
     assert!(in_default > 0, "Feb and Mar rows route into the DEFAULT leaf");
     nf_assert_both_correct();
 }
+
+#[pg_test]
+fn pg_node_fill_unmirrored_source_child_falls_back_per_leaf() {
+    nf_fixture();
+    nf_attach_new_dp(&[1, 2, 3]);
+    Spi::run("CREATE TABLE nf_apr (LIKE nf_ss)").expect("april table");
+    Spi::run("INSERT INTO nf_apr SELECT 2, '2025-04-03', 1, 1, 7").expect("april row");
+    Spi::run(
+        "ALTER TABLE nf_ss_2 ATTACH PARTITION nf_apr \
+         FOR VALUES FROM ('2025-04-01') TO ('2025-05-01')",
+    )
+    .expect("attach april");
+    nf_probe("node", "nf_v_nf_ss_2");
+
+    let result = Spi::get_one::<String>("SELECT reflex_reconcile_partition('nf_v', '2', '', true)")
+        .expect("reconcile")
+        .expect("reconcile result");
+
+    assert!(result.starts_with("RECONCILED"), "reconcile nf_v: {result}");
+    assert_eq!(nf_hits("node"), 0, "a source child without a mirror leaf blocks the node fill");
+}
