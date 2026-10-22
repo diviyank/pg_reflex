@@ -342,3 +342,45 @@ fn pg_node_fill_unmirrored_source_child_falls_back_per_leaf() {
     assert!(result.starts_with("RECONCILED"), "reconcile nf_v: {result}");
     assert_eq!(nf_hits("node"), 0, "a source child without a mirror leaf blocks the node fill");
 }
+
+#[pg_test]
+fn pg_node_fill_source_in_other_schema_off_search_path() {
+    let nf_vs_sql = "SELECT dem_plan_id, order_date, product_id, location_id, qty FROM nf_src_schema.nf_ss";
+    Spi::run("CREATE SCHEMA nf_src_schema").expect("source schema");
+    Spi::run(
+        "CREATE TABLE nf_src_schema.nf_ss (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, \
+         product_id BIGINT, location_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("source root");
+    Spi::run(
+        "CREATE TABLE nf_src_schema.nf_ss_1 PARTITION OF nf_src_schema.nf_ss \
+         FOR VALUES IN (1) PARTITION BY RANGE (order_date)",
+    )
+    .expect("dp 1 node");
+    nf_create_month_leaves("nf_src_schema.nf_ss_1", &[1, 2, 3]);
+    nf_load_dp_months("nf_src_schema.nf_ss", 1, &[1, 2, 3]);
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('nf_vs', '{}', 'dem_plan_id,product_id,location_id,order_date', \
+         NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+        nf_vs_sql.replace('\'', "''")
+    ))
+    .expect("create nf_vs")
+    .expect("create nf_vs result");
+    assert!(!created.starts_with("ERROR"), "create nf_vs: {created}");
+    Spi::run("CREATE TABLE nf_src_schema.nf_ss_2 (LIKE nf_src_schema.nf_ss) PARTITION BY RANGE (order_date)")
+        .expect("dp 2 node");
+    nf_create_month_leaves("nf_src_schema.nf_ss_2", &[1, 2, 3]);
+    nf_load_dp_months("nf_src_schema.nf_ss_2", 2, &[1, 2]);
+    Spi::run(
+        "ALTER TABLE nf_src_schema.nf_ss ATTACH PARTITION nf_src_schema.nf_ss_2 FOR VALUES IN (2)",
+    )
+    .expect("attach dp 2");
+    Spi::run("SELECT reflex_refresh_partition_snapshot_if_diverged('nf_src_schema.nf_ss')").expect("snapshot");
+    nf_probe("node", "nf_vs_nf_ss_2");
+    Spi::run("SET LOCAL search_path = public").expect("narrow search_path");
+
+    nf_reconcile("nf_vs", "2");
+
+    assert_eq!(nf_hits("node"), 1, "the new DP node is filled by one routed INSERT");
+    assert_imv_correct("nf_vs", nf_vs_sql);
+}

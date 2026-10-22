@@ -3069,6 +3069,9 @@ fn fill_fresh_mirror_nodes(
             groups.entry(node).or_default().push(src);
         }
     }
+    let Some(source_schema) = anchor_source_schema(client, view_name) else {
+        return Ok(Vec::new());
+    };
     let mut filled = Vec::new();
     for srcs in groups.into_values() {
         let tgt_leaves: Vec<String> = srcs
@@ -3079,7 +3082,7 @@ fn fill_fresh_mirror_nodes(
             .iter()
             .map(|src| intermediate_child_name(view_name, src))
             .collect();
-        if source_node_child_count(client, srcs[0]) != Some(srcs.len()) {
+        if source_node_child_count(client, source_schema.as_deref(), srcs[0]) != Some(srcs.len()) {
             continue;
         }
         let Some(tgt_node) = mirror_node_of_exactly(client, schema, &tgt_leaves) else {
@@ -3115,24 +3118,60 @@ fn fill_fresh_mirror_nodes(
     Ok(filled)
 }
 
+/// The schema of the anchor source of `view_name`: `Some(None)` when the
+/// anchor is unqualified, `None` when it cannot be resolved.
+fn anchor_source_schema(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+) -> Option<Option<String>> {
+    let registry = client
+        .select(
+            "SELECT depends_on, partition_columns[1] AS part_col \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .ok()?
+        .next()?;
+    let part_col = registry.get_by_name::<String, _>("part_col").ok()??;
+    let depends_on = registry
+        .get_by_name::<Vec<String>, _>("depends_on")
+        .ok()??;
+    let anchor = resolve_anchor_source(client, &part_col, &depends_on).ok()?;
+    let (schema, _) = crate::query_decomposer::split_qualified_name(&anchor);
+    Some(schema.map(str::to_string))
+}
+
 /// How many partitions the source node holding `src_leaf_bare` has. A source
 /// child without a mirror leaf would make the node INSERT raise for its rows.
 fn source_node_child_count(
     client: &pgrx::spi::SpiClient<'_>,
+    source_schema: Option<&str>,
     src_leaf_bare: &str,
 ) -> Option<usize> {
     client
         .select(
             "SELECT count(*) AS n FROM pg_inherits \
              WHERE inhparent = (SELECT inhparent FROM pg_inherits \
-                                WHERE inhrelid = to_regclass(quote_ident($1)))",
+                                WHERE inhrelid = to_regclass(CASE WHEN $2 IS NULL \
+                                    THEN quote_ident($1) ELSE format('%I.%I', $2, $1) END))",
             Some(1),
-            &[unsafe {
-                DatumWithOid::new(
-                    src_leaf_bare.to_string(),
-                    PgBuiltInOids::TEXTOID.oid().value(),
-                )
-            }],
+            &[
+                unsafe {
+                    DatumWithOid::new(
+                        src_leaf_bare.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        source_schema.map(str::to_string),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ],
         )
         .ok()
         .and_then(|mut it| it.next())
