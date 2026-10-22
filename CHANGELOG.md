@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+## [1.12.3] - 2026-10-22
+
+A performance release for partition fills. Filling a new key of a
+two-level partitioned IMV (`reflex_reconcile_partition` on a new DP, or a
+full reconcile of emptied leaves) inserts the whole node in one statement
+that PostgreSQL routes to the leaves, instead of running the base query once
+per leaf, and the partition tree is looked up by oid instead of scanning the
+catalogs. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';`
+
+---
+
+### Changed
+
+- **A fresh mirror node is filled with one routed INSERT.** When the leaves
+  being rebuilt are exactly all children of a non-root mirror node, none is
+  partitioned, each would be filled in place (fresh or empty, no rows to
+  diff), and the source node has no unmirrored child, the node is filled
+  with `INSERT INTO <node> SELECT * FROM (<base_query>) WHERE <node
+  constraint>`. Leaves that already hold rows are truncated first. An
+  aggregate IMV fills its intermediate node, then its target node. Each
+  leaf keeps its ANALYZE, row count and outcome, so the dependent cascade
+  is unchanged. Any other shape keeps the per-leaf fill, including an
+  ATTACH flush where a month of the new key has no source rows. On
+  `alp.sop_forecast_view`, a 2.37 M-row DP over 48 monthly leaves: the fill
+  takes 20.3 s instead of 40.6 s on db_dev. The whole call took 23.9 s
+  instead of 30.7 s on a local 2 M-row fixture.
+- **The partition tree is looked up by oid.** The recursive `pg_inherits`
+  query behind every reconcile, sync and rebuild hashed all of `pg_class`
+  and `pg_inherits` on each call; it now follows each node by oid. On
+  db_dev: 32 ms → 0.1 ms on a leaf, 95 ms → 0.8 ms on a DP node, 110 ms →
+  24 ms on the root, with identical rows.
+
+### Known issues
+
+- Filed, pre-existing: an IMV whose `partition_by` reaches a HASH source
+  sub-level fails at create with `"<imv>_<src>_1" is not partitioned`; a
+  `reflex_reconcile_partition(..., skip_sync => true)` after a month is
+  attached to a non-root source node in the same transaction runs against
+  the stale mirror until the COMMIT flush.
+
+### Tests
+
+- `pg_test_node_fill.rs`: one routed INSERT per new node, through the
+  ATTACH flush, over leaves already holding rows, for an aggregate's
+  intermediate and target nodes, with a DEFAULT leaf, the per-leaf fallback
+  for a mixed node, an empty month, an unmirrored source child and a source
+  schema off `search_path`, and the root never filled. A row-exact test of
+  the partition tree query in `pg_test_subpartition.rs`.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';` changes no SQL object.
+  No IMV needs to be recreated and no trigger re-rendered.
+
+---
+
 ## [1.12.2] - 2026-10-14
 
 A performance release for DEFERRED chains, with one correctness fix. A

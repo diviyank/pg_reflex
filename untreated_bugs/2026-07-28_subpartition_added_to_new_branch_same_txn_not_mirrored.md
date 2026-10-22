@@ -103,3 +103,16 @@ partition flush extends the mirror before the staged rows are applied. Whether t
 one described above (the sync marks the parent done for the transaction) or a second one (no sync
 at all before the statement trigger of the INSERT runs) is not established.
 
+
+## Second symptom: a `skip_sync` reconcile silently runs against the stale mirror (2026-10-22)
+
+Same root cause, found by the final review of `perf/fresh-node-fill`. A source
+node is attached to the root (mirrored), then a month is attached to that node in
+the same transaction (not mirrored), then
+`reflex_reconcile_partition(view, '<key>', '', true)` runs. On `main` @ `83d43c9`
+it returns `RECONCILED` and the new month's rows are missing from the IMV (1
+`EXCEPT ALL` mismatch) until the COMMIT flush syncs and rebuilds. Reproduction:
+`pg_rv_unmirrored_source_leaf_skip_sync` in the review scratch tests (rows
+`id 999999, dp 2, 2025-04-03` in a leaf `rvu_apr` attached to `rvu_ss_2`). The
+`perf/fresh-node-fill` branch falls back to the per-leaf path in this shape, so
+it keeps `main`'s behaviour. The fix direction above also closes this.

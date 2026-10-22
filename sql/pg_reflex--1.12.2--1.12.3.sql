@@ -1,0 +1,8 @@
+-- Migration: pg_reflex 1.12.2 → 1.12.3
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';
+--
+-- A performance release for partition fills. A fresh mirror node is filled
+-- with one routed INSERT, and the partition tree is looked up by oid. Both
+-- changes are Rust-side. No registry column, table, index, trigger, event
+-- trigger or function changes; no IMV needs to be recreated.
