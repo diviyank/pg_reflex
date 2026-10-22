@@ -196,6 +196,14 @@ into them, so on a large IMV the `COMMIT` can take minutes.
   rebuilds an IMV with dependents (also via `reflex_reconcile`) cannot be
   prepared with `PREPARE TRANSACTION`.
 
+## Upgrading to 1.12.3
+
+```sql
+ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';
+```
+
+The migration changes no SQL object. No IMV needs to be recreated and no trigger re-rendered.
+
 ## Upgrading to 1.12.2
 
 ```sql

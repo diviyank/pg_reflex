@@ -373,6 +373,8 @@ pub(crate) fn list_partition_tree(
     client: &pgrx::spi::SpiClient<'_>,
     root: &str,
 ) -> Vec<PartitionNode> {
+    // Lateral by-oid lookups (OFFSET 0 fences them): plain joins make the planner
+    // hash all of pg_class/pg_inherits on every call.
     let sql = "\
         WITH RECURSIVE tree AS ( \
             SELECT i.inhrelid AS child_oid, i.inhparent AS parent_oid, 1 AS depth \
@@ -380,13 +382,15 @@ pub(crate) fn list_partition_tree(
             WHERE i.inhparent = to_regclass($1) \
           UNION ALL \
             SELECT i.inhrelid, i.inhparent, t.depth + 1 \
-            FROM pg_inherits i JOIN tree t ON i.inhparent = t.child_oid \
+            FROM tree t CROSS JOIN LATERAL ( \
+                SELECT i.inhrelid, i.inhparent FROM pg_inherits i \
+                WHERE i.inhparent = t.child_oid OFFSET 0) i \
         ) \
         SELECT \
             c.relname::text AS bare_name, \
             c.oid::int8 AS node_oid, \
             t.depth AS node_depth, \
-            pc.relname::text AS parent_bare, \
+            (SELECT pc.relname::text FROM pg_class pc WHERE pc.oid = t.parent_oid) AS parent_bare, \
             pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
             CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
                               WHEN 'h' THEN 'HASH' ELSE NULL END AS sub_strategy, \
@@ -398,9 +402,9 @@ pub(crate) fn list_partition_tree(
                                    AND a.attnum = k.attnum::smallint \
             ), ARRAY[]::text[]) AS sub_columns \
         FROM tree t \
-        JOIN pg_class c  ON c.oid = t.child_oid \
-        JOIN pg_class pc ON pc.oid = t.parent_oid \
-        LEFT JOIN pg_partitioned_table pt ON pt.partrelid = c.oid \
+        CROSS JOIN LATERAL (SELECT * FROM pg_class c WHERE c.oid = t.child_oid OFFSET 0) c \
+        LEFT JOIN LATERAL ( \
+            SELECT * FROM pg_partitioned_table pt WHERE pt.partrelid = c.oid OFFSET 0) pt ON true \
         ORDER BY t.depth, c.relname";
     match client.select(
         sql,
@@ -3004,8 +3008,27 @@ pub(crate) fn rebuild_mirror_leaves(
                 &read_partition_constraint_def(client, schema, &tgt_bare),
             )
         });
-    let mut diffed_rows = allow_diff.then_some(0u64);
-    for src in behind_root.into_iter().chain(diffable) {
+    let fold = |diffed_rows: Option<u64>, outcome| match (diffed_rows, outcome) {
+        (Some(rows), SwapOutcome::Diffed(staged)) => Some(rows + staged),
+        _ => None,
+    };
+    let node_filled = fill_fresh_mirror_nodes(
+        client,
+        view_name,
+        schema,
+        &behind_root,
+        base_query,
+        end_query,
+    )?;
+    let mut diffed_rows = node_filled
+        .iter()
+        .fold(allow_diff.then_some(0u64), |rows, (_, outcome)| {
+            fold(rows, *outcome)
+        });
+    let per_leaf = behind_root
+        .into_iter()
+        .filter(|src| !node_filled.iter().any(|(filled, _)| filled == *src));
+    for src in per_leaf.chain(diffable) {
         let outcome = execute_partition_swap_for_child(
             client,
             view_name,
@@ -3017,12 +3040,271 @@ pub(crate) fn rebuild_mirror_leaves(
             diffed_rows.is_some(),
         )
         .map_err(|e| (src.clone(), e))?;
-        diffed_rows = match (diffed_rows, outcome) {
-            (Some(rows), SwapOutcome::Diffed(staged)) => Some(rows + staged),
-            _ => None,
-        };
+        diffed_rows = fold(diffed_rows, outcome);
     }
     Ok(diffed_rows)
+}
+
+/// Fill each brand-new mirror node of `src_children` with one INSERT routed
+/// through the node, instead of one scan of the base query per leaf. A node
+/// qualifies when its children are exactly the mirror leaves of some of
+/// `src_children`, each of which [`leaf_fills_in_place`]; on an IMV with an
+/// intermediate table its intermediate node must qualify too. Returns the
+/// source leaves it filled with each one's outcome, as the in-place branch of
+/// `swap_partition_child_ddl` would have reported it; the rest are left to the
+/// per-leaf path.
+fn fill_fresh_mirror_nodes(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_children: &[&String],
+    base_query: &str,
+    end_query: &str,
+) -> Result<Vec<(String, SwapOutcome)>, (String, String)> {
+    let mut groups: std::collections::BTreeMap<String, Vec<&String>> =
+        std::collections::BTreeMap::new();
+    for &src in src_children {
+        let tgt_bare = target_child_name(view_name, src);
+        if let Some(node) = read_immediate_parent_qual(client, schema, &tgt_bare) {
+            groups.entry(node).or_default().push(src);
+        }
+    }
+    let Some(source_schema) = anchor_source_schema(client, view_name) else {
+        return Ok(Vec::new());
+    };
+    let mut filled = Vec::new();
+    for srcs in groups.into_values() {
+        let tgt_leaves: Vec<String> = srcs
+            .iter()
+            .map(|src| target_child_name(view_name, src))
+            .collect();
+        let int_leaves: Vec<String> = srcs
+            .iter()
+            .map(|src| intermediate_child_name(view_name, src))
+            .collect();
+        if source_node_child_count(client, source_schema.as_deref(), srcs[0]) != Some(srcs.len()) {
+            continue;
+        }
+        let Some(tgt_node) = mirror_node_of_exactly(client, schema, &tgt_leaves) else {
+            continue;
+        };
+        let int_node = if end_query.is_empty() {
+            None
+        } else {
+            match mirror_node_of_exactly(client, schema, &int_leaves) {
+                Some(node) => Some(node),
+                None => continue,
+            }
+        };
+        if !srcs
+            .iter()
+            .all(|src| leaf_fills_in_place(client, view_name, schema, src, end_query))
+        {
+            continue;
+        }
+        let outcomes = fill_mirror_node(
+            client,
+            view_name,
+            &tgt_node,
+            int_node.as_ref(),
+            &tgt_leaves,
+            &int_leaves,
+            base_query,
+            end_query,
+        )
+        .map_err(|e| (srcs[0].clone(), e))?;
+        filled.extend(srcs.into_iter().cloned().zip(outcomes));
+    }
+    Ok(filled)
+}
+
+/// The schema of the anchor source of `view_name`: `Some(None)` when the
+/// anchor is unqualified, `None` when it cannot be resolved.
+fn anchor_source_schema(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+) -> Option<Option<String>> {
+    let registry = client
+        .select(
+            "SELECT depends_on, partition_columns[1] AS part_col \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .ok()?
+        .next()?;
+    let part_col = registry.get_by_name::<String, _>("part_col").ok()??;
+    let depends_on = registry
+        .get_by_name::<Vec<String>, _>("depends_on")
+        .ok()??;
+    let anchor = resolve_anchor_source(client, &part_col, &depends_on).ok()?;
+    let (schema, _) = crate::query_decomposer::split_qualified_name(&anchor);
+    Some(schema.map(str::to_string))
+}
+
+/// How many partitions the source node holding `src_leaf_bare` has. A source
+/// child without a mirror leaf would make the node INSERT raise for its rows.
+fn source_node_child_count(
+    client: &pgrx::spi::SpiClient<'_>,
+    source_schema: Option<&str>,
+    src_leaf_bare: &str,
+) -> Option<usize> {
+    client
+        .select(
+            "SELECT count(*) AS n FROM pg_inherits \
+             WHERE inhparent = (SELECT inhparent FROM pg_inherits \
+                                WHERE inhrelid = to_regclass(CASE WHEN $2 IS NULL \
+                                    THEN quote_ident($1) ELSE format('%I.%I', $2, $1) END))",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(
+                        src_leaf_bare.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        source_schema.map(str::to_string),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<i64, _>("n").ok().flatten())
+        .and_then(|n| usize::try_from(n).ok())
+}
+
+/// A mirror node, quoted, with its partition constraint.
+struct MirrorNode {
+    qual: String,
+    constraint: String,
+}
+
+/// The node `leaf_bares` hang under, when they are exactly its children, none
+/// of them partitioned, and it has a partition constraint: the IMV root has
+/// none, and an INSERT into it fires its maintenance statement triggers.
+fn mirror_node_of_exactly(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    leaf_bares: &[String],
+) -> Option<MirrorNode> {
+    let qual = read_immediate_parent_qual(client, schema, leaf_bares.first()?)?;
+    let mut children: Vec<String> = list_partition_children(client, &qual)
+        .into_iter()
+        .map(|child| child.bare_name)
+        .collect();
+    children.sort();
+    let mut leaves = leaf_bares.to_vec();
+    leaves.sort();
+    if children != leaves
+        || leaf_bares
+            .iter()
+            .any(|leaf| is_partitioned_relation(client, schema, leaf))
+    {
+        return None;
+    }
+    let constraint = partition_constraint_def_of(client, &qual);
+    (!constraint.is_empty()).then_some(MirrorNode { qual, constraint })
+}
+
+/// TRUNCATE the populated leaves of a qualifying node and refill it with one
+/// routed INSERT per side, intermediate first, then record each target leaf as
+/// the in-place branch of `swap_partition_child_ddl` does. Outcomes follow
+/// `tgt_leaves`.
+#[allow(clippy::too_many_arguments)]
+fn fill_mirror_node(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    tgt_node: &MirrorNode,
+    int_node: Option<&MirrorNode>,
+    tgt_leaves: &[String],
+    int_leaves: &[String],
+    base_query: &str,
+    end_query: &str,
+) -> Result<Vec<SwapOutcome>, String> {
+    let tgt_quals: Vec<String> = tgt_leaves
+        .iter()
+        .map(|leaf| schema_prefix(view_name, leaf))
+        .collect();
+    let tgt_populated: Vec<bool> = tgt_quals
+        .iter()
+        .map(|qual| relation_has_rows(client, qual))
+        .collect();
+    let rows_before: Vec<Option<i64>> = tgt_quals
+        .iter()
+        .zip(&tgt_populated)
+        .map(|(qual, &populated)| {
+            if populated {
+                count_rows(client, qual)
+            } else {
+                Some(0)
+            }
+        })
+        .collect();
+    let tgt_propagates = crate::rebuild_diff::target_propagates(client, view_name);
+    let (fill_int, fill_tgt) = build_inplace_partition_fill(
+        int_node.map_or("", |node| node.qual.as_str()),
+        &tgt_node.qual,
+        int_node.map_or("", |node| node.constraint.as_str()),
+        &tgt_node.constraint,
+        base_query,
+        end_query,
+    );
+    if let Some(ref fill) = fill_int {
+        let int_quals: Vec<String> = int_leaves
+            .iter()
+            .map(|leaf| schema_prefix(view_name, leaf))
+            .collect();
+        for qual in &int_quals {
+            if relation_has_rows(client, qual) {
+                client
+                    .update(&format!("TRUNCATE {}", qual), None, &[])
+                    .map_err(|e| format!("truncate fresh int child: {}", e))?;
+            }
+        }
+        client
+            .update(fill, None, &[])
+            .map_err(|e| format!("fill fresh int node in place: {}", e))?;
+        for qual in &int_quals {
+            let _ = client.update(&format!("ANALYZE {}", qual), None, &[]);
+        }
+    }
+    for (qual, _) in tgt_quals.iter().zip(&tgt_populated).filter(|(_, &p)| p) {
+        client
+            .update(&format!("TRUNCATE {}", qual), None, &[])
+            .map_err(|e| format!("truncate fresh tgt child: {}", e))?;
+    }
+    client
+        .update(&fill_tgt, None, &[])
+        .map_err(|e| format!("fill fresh tgt node in place: {}", e))?;
+    let mut outcomes = Vec::with_capacity(tgt_quals.len());
+    for (qual, rows_before) in tgt_quals.iter().zip(rows_before) {
+        let rebuilt_at = clock_timestamp(client);
+        let _ = client.update(&format!("ANALYZE {}", qual), None, &[]);
+        let rows_after = count_rows(client, qual);
+        log_slice_rebuild_if_changed(
+            client,
+            view_name,
+            qual,
+            rows_before,
+            rows_after,
+            rebuilt_at.as_deref(),
+        );
+        let stayed_empty = rows_before == Some(0)
+            && rows_after == Some(0)
+            && !lost_rows_without_dml(client, view_name);
+        outcomes.push(if tgt_propagates && stayed_empty {
+            SwapOutcome::Diffed(0)
+        } else {
+            SwapOutcome::Swapped
+        });
+    }
+    Ok(outcomes)
 }
 
 /// How one mirror leaf was rebuilt, which decides what its dependents still need.
@@ -3118,6 +3400,51 @@ fn set_internal_swap_root(client: &mut pgrx::spi::SpiClient<'_>, root: Option<&s
     let _ = client.update(&sql, None, &[]);
 }
 
+/// Whether the mirror leaf of `src_child_bare` may be TRUNCATEd and refilled in
+/// place rather than swapped.
+///
+/// A mirror child with nothing worth preserving does not need the
+/// DETACH/ATTACH swap, and the swap costs an `AccessExclusiveLock` on the
+/// child's immediate parent — the IMV ROOT at mirror depth 1 — held to
+/// commit, which freezes every reader of the IMV including readers pruning
+/// to an unrelated partition. Two disjoint proofs qualify a child:
+///
+///   * it is EMPTY, so the in-place fill trivially reproduces what the swap
+///     would have built; or
+///   * it is FRESH — created by this transaction's sync (`is_fresh_partition`)
+///     — in which case whatever it holds arrived after transaction start and
+///     the swap would discard it anyway, so TRUNCATE + fill is equivalent.
+///     The load's own IMV maintenance delta lands in a brand-new child before
+///     the COMMIT-time reconcile reaches it, so the emptiness proof alone
+///     misses the commonest field shape (create/attach a partition and load it
+///     in one transaction).
+///
+/// TRUNCATE takes `AccessExclusive` on the CHILD only — never on the parent —
+/// and fires no statement-level TRUNCATE trigger of the root, so it inherits
+/// the swap's isolation without the swap's lock. Both probes fail toward
+/// "not qualified", so any doubt still takes the swap.
+fn leaf_fills_in_place(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_child_bare: &str,
+    end_query: &str,
+) -> bool {
+    let int_child_bare = intermediate_child_name(view_name, src_child_bare);
+    let tgt_child_bare = target_child_name(view_name, src_child_bare);
+    let int_def = read_partition_constraint_def(client, schema, &int_child_bare);
+    let tgt_def = read_partition_constraint_def(client, schema, &tgt_child_bare);
+    let int_child_qual = schema_prefix(view_name, &int_child_bare);
+    let tgt_child_qual = schema_prefix(view_name, &tgt_child_bare);
+    let int_is_empty = end_query.is_empty()
+        || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual));
+    let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual);
+    let int_is_fresh = end_query.is_empty()
+        || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual));
+    let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual);
+    (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn swap_partition_child_ddl(
     client: &mut pgrx::spi::SpiClient<'_>,
@@ -3182,34 +3509,11 @@ fn swap_partition_child_ddl(
         ));
     }
 
-    // A mirror child with nothing worth preserving does not need the
-    // DETACH/ATTACH swap, and the swap costs an `AccessExclusiveLock` on the
-    // child's immediate parent — the IMV ROOT at mirror depth 1 — held to
-    // commit, which freezes every reader of the IMV including readers pruning
-    // to an unrelated partition. Two disjoint proofs qualify a child:
-    //
-    //   * it is EMPTY, so the in-place fill trivially reproduces what the swap
-    //     would have built; or
-    //   * it is FRESH — created by this transaction's sync (`is_fresh_partition`)
-    //     — in which case whatever it holds arrived after transaction start and
-    //     the swap would discard it anyway, so TRUNCATE + fill is equivalent.
-    //     The load's own IMV maintenance delta lands in a brand-new child before
-    //     the COMMIT-time reconcile reaches it, so the emptiness proof alone
-    //     misses the commonest field shape (create/attach a partition and load it
-    //     in one transaction).
-    //
-    // TRUNCATE takes `AccessExclusive` on the CHILD only — never on the parent —
-    // and fires no statement-level TRUNCATE trigger of the root, so it inherits
-    // the swap's isolation without the swap's lock. Both probes fail toward
-    // "not qualified", so any doubt still takes the swap.
     let int_child_qual_probe = schema_prefix(view_name, &int_child_bare);
     let tgt_child_qual_probe = schema_prefix(view_name, &tgt_child_bare);
     let int_is_empty = end_query.is_empty()
         || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual_probe));
     let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual_probe);
-    let int_is_fresh = end_query.is_empty()
-        || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
-    let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
     // `tgt_is_empty` already proved the count is 0 two lines up — skip the
     // redundant `count(*)` round-trip in that (common) case.
     let rows_before_tgt: Option<i64> = if tgt_is_empty {
@@ -3284,7 +3588,7 @@ fn swap_partition_child_ddl(
         );
         return Ok(SwapOutcome::Diffed(staged_rows));
     }
-    if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
+    if leaf_fills_in_place(client, view_name, schema, src_child_bare, end_query) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
             &tgt_child_qual_probe,
@@ -3733,7 +4037,11 @@ fn read_partition_constraint_def(
     schema: &str,
     bare: &str,
 ) -> String {
-    let qname = format!("{}.{}", schema, bare);
+    partition_constraint_def_of(client, &format!("{}.{}", schema, bare))
+}
+
+fn partition_constraint_def_of(client: &pgrx::spi::SpiClient<'_>, qname: &str) -> String {
+    let qname = qname.to_string();
     client
         .select(
             "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def",

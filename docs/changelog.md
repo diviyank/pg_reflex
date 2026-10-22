@@ -4,6 +4,19 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.12.3] — 2026-10-22
+
+A performance release for partition fills: a new key of a two-level partitioned IMV is filled with one routed INSERT per node instead of one base-query run per leaf, and the partition tree is looked up by oid. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';`
+
+**Changed**
+
+- A rebuild whose leaves are exactly the children of a non-root mirror node, all filled in place, inserts into the node once and lets PostgreSQL route the rows; populated leaves are truncated first, an aggregate fills its intermediate then its target node, and per-leaf bookkeeping and the cascade are unchanged. 2.37 M-row DP of `alp.sop_forecast_view`: fill 40.6 s → 20.3 s (db_dev).
+- The recursive partition-tree query follows nodes by oid: root 110 ms → 24 ms, leaf 32 ms → 0.1 ms (db_dev), rows identical.
+
+**Known issues**
+
+- Filed, pre-existing: a HASH source sub-level cannot be mirrored two levels deep; a `skip_sync` reconcile after a same-transaction ATTACH to a non-root source node misses that partition until COMMIT.
+
 ## [1.12.2] — 2026-10-14
 
 A performance release for DEFERRED chains, with one correctness fix. A partition push refreshes the DEFERRED aggregates that read the rebuilt IMV by group instead of leaving them to an expensive COMMIT delta flush; the MIN / MAX recompute of shrunk groups prunes partitions; a large DEFERRED top-K MIN / MAX delta replaces its groups from the base query; and an UPDATE of a DEFERRED source that leaves every column its IMVs read unchanged costs nothing at COMMIT. The fix: an empty `reflex.wipe_threshold`, `reflex.wipe_floor_rows` or `pg_reflex.debug_resolve_anchor` (after `SET LOCAL`, or `SET` then `RESET`) discarded DEFERRED flushes or aborted partitioned creates. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.2';`
