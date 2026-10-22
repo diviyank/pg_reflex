@@ -373,6 +373,8 @@ pub(crate) fn list_partition_tree(
     client: &pgrx::spi::SpiClient<'_>,
     root: &str,
 ) -> Vec<PartitionNode> {
+    // Lateral by-oid lookups (OFFSET 0 fences them): plain joins make the planner
+    // hash all of pg_class/pg_inherits on every call.
     let sql = "\
         WITH RECURSIVE tree AS ( \
             SELECT i.inhrelid AS child_oid, i.inhparent AS parent_oid, 1 AS depth \
@@ -380,13 +382,15 @@ pub(crate) fn list_partition_tree(
             WHERE i.inhparent = to_regclass($1) \
           UNION ALL \
             SELECT i.inhrelid, i.inhparent, t.depth + 1 \
-            FROM pg_inherits i JOIN tree t ON i.inhparent = t.child_oid \
+            FROM tree t CROSS JOIN LATERAL ( \
+                SELECT i.inhrelid, i.inhparent FROM pg_inherits i \
+                WHERE i.inhparent = t.child_oid OFFSET 0) i \
         ) \
         SELECT \
             c.relname::text AS bare_name, \
             c.oid::int8 AS node_oid, \
             t.depth AS node_depth, \
-            pc.relname::text AS parent_bare, \
+            (SELECT pc.relname::text FROM pg_class pc WHERE pc.oid = t.parent_oid) AS parent_bare, \
             pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
             CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
                               WHEN 'h' THEN 'HASH' ELSE NULL END AS sub_strategy, \
@@ -398,9 +402,9 @@ pub(crate) fn list_partition_tree(
                                    AND a.attnum = k.attnum::smallint \
             ), ARRAY[]::text[]) AS sub_columns \
         FROM tree t \
-        JOIN pg_class c  ON c.oid = t.child_oid \
-        JOIN pg_class pc ON pc.oid = t.parent_oid \
-        LEFT JOIN pg_partitioned_table pt ON pt.partrelid = c.oid \
+        CROSS JOIN LATERAL (SELECT * FROM pg_class c WHERE c.oid = t.child_oid OFFSET 0) c \
+        LEFT JOIN LATERAL ( \
+            SELECT * FROM pg_partitioned_table pt WHERE pt.partrelid = c.oid OFFSET 0) pt ON true \
         ORDER BY t.depth, c.relname";
     match client.select(
         sql,

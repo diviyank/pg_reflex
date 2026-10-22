@@ -1853,6 +1853,27 @@ mod tests {
         Spi::connect(|client| crate::partition::list_partition_tree(client, root).len() as i64)
     }
 
+    #[pg_extern]
+    fn crate_test_list_partition_tree_rows(root: &str) -> String {
+        Spi::connect(|client| {
+            crate::partition::list_partition_tree(client, root)
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{}|{}|{}|{}|{}|{}",
+                        n.bare_name,
+                        n.depth,
+                        n.parent_bare,
+                        n.bound_expr,
+                        n.sub_strategy.clone().unwrap_or_default(),
+                        n.sub_columns.join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
     /// Drive the per-child DETACH/ATTACH swap primitive directly, on an
     /// arbitrary source-child name, and surface its `Result` as a string. The
     /// operator entry points resolve leaves before calling it, so this is the
