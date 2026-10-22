@@ -3119,17 +3119,14 @@ struct MirrorNode {
 }
 
 /// The node `leaf_bares` hang under, when they are exactly its children, none
-/// of them partitioned, and it is not the IMV root: an INSERT into the root
-/// fires its maintenance statement triggers.
+/// of them partitioned, and it has a partition constraint: the IMV root has
+/// none, and an INSERT into it fires its maintenance statement triggers.
 fn mirror_node_of_exactly(
     client: &pgrx::spi::SpiClient<'_>,
     schema: &str,
     leaf_bares: &[String],
 ) -> Option<MirrorNode> {
     let qual = read_immediate_parent_qual(client, schema, leaf_bares.first()?)?;
-    if is_partition_root(client, &qual) {
-        return None;
-    }
     let mut children: Vec<String> = list_partition_children(client, &qual)
         .into_iter()
         .map(|child| child.bare_name)
@@ -3146,23 +3143,6 @@ fn mirror_node_of_exactly(
     }
     let constraint = partition_constraint_def_of(client, &qual);
     (!constraint.is_empty()).then_some(MirrorNode { qual, constraint })
-}
-
-/// True unless `qual` provably resolves to a partition below its tree's root.
-fn is_partition_root(client: &pgrx::spi::SpiClient<'_>, qual: &str) -> bool {
-    let below_root =
-        client
-            .select(
-                "SELECT pg_partition_root(to_regclass($1)) <> to_regclass($1) AS below_root",
-                Some(1),
-                &[unsafe {
-                    DatumWithOid::new(qual.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .ok()
-            .and_then(|mut it| it.next())
-            .and_then(|r| r.get_by_name::<bool, _>("below_root").ok().flatten());
-    below_root != Some(true)
 }
 
 /// TRUNCATE the populated leaves of a qualifying node and refill it with one
