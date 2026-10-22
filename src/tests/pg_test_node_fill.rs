@@ -220,6 +220,44 @@ fn pg_node_fill_aggregate_fills_intermediate_then_target() {
 }
 
 #[pg_test]
+fn pg_node_fill_aggregate_fresh_nonempty_leaves() {
+    nf_source_with_dp1();
+    let nf_vn_sql = "SELECT dem_plan_id, order_date, product_id, SUM(qty) AS q, COUNT(*) AS c FROM nf_ss \
+                     GROUP BY dem_plan_id, order_date, product_id";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('nf_vn', '{}')",
+        nf_vn_sql.replace('\'', "''")
+    ))
+    .expect("create nf_vn")
+    .expect("create nf_vn result");
+    assert!(!created.starts_with("ERROR"), "create nf_vn: {created}");
+    nf_attach_new_dp(&[]);
+    // Immediate maintenance fills the new leaves before the node fill.
+    nf_load_dp_months("nf_ss", 2, &[1, 2]);
+    let count_dp2_intermediate = || {
+        Spi::get_one::<i64>("SELECT count(*) FROM __reflex_intermediate_nf_vn WHERE dem_plan_id = 2")
+            .expect("count intermediate")
+            .expect("count intermediate")
+    };
+    let intermediate_before = count_dp2_intermediate();
+    assert!(intermediate_before > 0, "maintenance wrote DP 2 intermediate rows");
+    let int_node = Spi::get_one::<String>(
+        "SELECT to_regclass('__reflex_intermediate_nf_vn_nf_ss_2')::text",
+    )
+    .expect("resolve intermediate node")
+    .expect("intermediate node exists");
+    nf_probe("int", &int_node);
+    nf_probe("tgt", "nf_vn_nf_ss_2");
+
+    nf_reconcile("nf_vn", "2");
+
+    assert_eq!(nf_hits("int"), 1, "the intermediate node is filled by one routed INSERT");
+    assert_eq!(nf_hits("tgt"), 1, "the target node is filled by one routed INSERT");
+    assert_eq!(count_dp2_intermediate(), intermediate_before, "intermediate rows are replaced, not duplicated");
+    assert_imv_correct("nf_vn", nf_vn_sql);
+}
+
+#[pg_test]
 fn pg_node_fill_mixed_node_keeps_per_leaf_path() {
     nf_fixture();
     Spi::run("TRUNCATE nf_v_nf_ss_1_2025_01").expect("empty one leaf");
@@ -251,8 +289,8 @@ fn pg_node_fill_depth_one_never_inserts_into_root() {
     assert_eq!(nf_hits("root"), 0, "a new DP leaf of the root is filled per leaf");
     assert_imv_correct("nf_v1", NF_V_SQL);
 
-    // Every child of the root empty and in the rebuild: only the root exclusion
-    // stands between the full reconcile and an INSERT into the root.
+    // Every child of the root empty and in the rebuild: only the empty-constraint
+    // refusal stands between the full reconcile and an INSERT into the root.
     Spi::run("TRUNCATE nf_v1_nf_ss_1, nf_v1_nf_ss_2").expect("empty every root child");
     let result = Spi::get_one::<String>("SELECT reflex_reconcile('nf_v1')")
         .expect("reconcile")
