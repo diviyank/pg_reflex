@@ -3122,6 +3122,51 @@ fn set_internal_swap_root(client: &mut pgrx::spi::SpiClient<'_>, root: Option<&s
     let _ = client.update(&sql, None, &[]);
 }
 
+/// Whether the mirror leaf of `src_child_bare` may be TRUNCATEd and refilled in
+/// place rather than swapped.
+///
+/// A mirror child with nothing worth preserving does not need the
+/// DETACH/ATTACH swap, and the swap costs an `AccessExclusiveLock` on the
+/// child's immediate parent — the IMV ROOT at mirror depth 1 — held to
+/// commit, which freezes every reader of the IMV including readers pruning
+/// to an unrelated partition. Two disjoint proofs qualify a child:
+///
+///   * it is EMPTY, so the in-place fill trivially reproduces what the swap
+///     would have built; or
+///   * it is FRESH — created by this transaction's sync (`is_fresh_partition`)
+///     — in which case whatever it holds arrived after transaction start and
+///     the swap would discard it anyway, so TRUNCATE + fill is equivalent.
+///     The load's own IMV maintenance delta lands in a brand-new child before
+///     the COMMIT-time reconcile reaches it, so the emptiness proof alone
+///     misses the commonest field shape (create/attach a partition and load it
+///     in one transaction).
+///
+/// TRUNCATE takes `AccessExclusive` on the CHILD only — never on the parent —
+/// and fires no statement-level TRUNCATE trigger of the root, so it inherits
+/// the swap's isolation without the swap's lock. Both probes fail toward
+/// "not qualified", so any doubt still takes the swap.
+fn leaf_fills_in_place(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_child_bare: &str,
+    end_query: &str,
+) -> bool {
+    let int_child_bare = intermediate_child_name(view_name, src_child_bare);
+    let tgt_child_bare = target_child_name(view_name, src_child_bare);
+    let int_def = read_partition_constraint_def(client, schema, &int_child_bare);
+    let tgt_def = read_partition_constraint_def(client, schema, &tgt_child_bare);
+    let int_child_qual = schema_prefix(view_name, &int_child_bare);
+    let tgt_child_qual = schema_prefix(view_name, &tgt_child_bare);
+    let int_is_empty = end_query.is_empty()
+        || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual));
+    let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual);
+    let int_is_fresh = end_query.is_empty()
+        || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual));
+    let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual);
+    (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn swap_partition_child_ddl(
     client: &mut pgrx::spi::SpiClient<'_>,
@@ -3186,34 +3231,11 @@ fn swap_partition_child_ddl(
         ));
     }
 
-    // A mirror child with nothing worth preserving does not need the
-    // DETACH/ATTACH swap, and the swap costs an `AccessExclusiveLock` on the
-    // child's immediate parent — the IMV ROOT at mirror depth 1 — held to
-    // commit, which freezes every reader of the IMV including readers pruning
-    // to an unrelated partition. Two disjoint proofs qualify a child:
-    //
-    //   * it is EMPTY, so the in-place fill trivially reproduces what the swap
-    //     would have built; or
-    //   * it is FRESH — created by this transaction's sync (`is_fresh_partition`)
-    //     — in which case whatever it holds arrived after transaction start and
-    //     the swap would discard it anyway, so TRUNCATE + fill is equivalent.
-    //     The load's own IMV maintenance delta lands in a brand-new child before
-    //     the COMMIT-time reconcile reaches it, so the emptiness proof alone
-    //     misses the commonest field shape (create/attach a partition and load it
-    //     in one transaction).
-    //
-    // TRUNCATE takes `AccessExclusive` on the CHILD only — never on the parent —
-    // and fires no statement-level TRUNCATE trigger of the root, so it inherits
-    // the swap's isolation without the swap's lock. Both probes fail toward
-    // "not qualified", so any doubt still takes the swap.
     let int_child_qual_probe = schema_prefix(view_name, &int_child_bare);
     let tgt_child_qual_probe = schema_prefix(view_name, &tgt_child_bare);
     let int_is_empty = end_query.is_empty()
         || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual_probe));
     let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual_probe);
-    let int_is_fresh = end_query.is_empty()
-        || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
-    let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
     // `tgt_is_empty` already proved the count is 0 two lines up — skip the
     // redundant `count(*)` round-trip in that (common) case.
     let rows_before_tgt: Option<i64> = if tgt_is_empty {
@@ -3288,7 +3310,7 @@ fn swap_partition_child_ddl(
         );
         return Ok(SwapOutcome::Diffed(staged_rows));
     }
-    if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
+    if leaf_fills_in_place(client, view_name, schema, src_child_bare, end_query) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
             &tgt_child_qual_probe,
