@@ -1183,3 +1183,45 @@ fn pg_subpart_attach_branch_skips_empty_months_keeps_correctness() {
     let orig = Spi::get_one::<i32>("SELECT qty FROM sev WHERE dem_plan_id=172 AND order_date='2025-01-15'").expect("q").expect("o");
     assert_eq!(orig, 10);
 }
+
+#[pg_test]
+fn pg_subpart_tree_rows_are_exact() {
+    Spi::run(
+        "CREATE TABLE nf_tree (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, region TEXT) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE nf_tree_1 PARTITION OF nf_tree FOR VALUES IN (1) PARTITION BY RANGE (order_date)")
+        .expect("range node");
+    Spi::run("CREATE TABLE nf_tree_1_2025_01 PARTITION OF nf_tree_1 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf jan");
+    Spi::run("CREATE TABLE nf_tree_1_2025_02 PARTITION OF nf_tree_1 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')")
+        .expect("leaf feb");
+    Spi::run("CREATE TABLE nf_tree_2 PARTITION OF nf_tree FOR VALUES IN (2) PARTITION BY LIST (region)")
+        .expect("list node");
+    Spi::run("CREATE TABLE nf_tree_2_n PARTITION OF nf_tree_2 FOR VALUES IN ('N')").expect("leaf n");
+    Spi::run("CREATE TABLE nf_tree_2_def PARTITION OF nf_tree_2 DEFAULT").expect("leaf default");
+    Spi::run("CREATE TABLE nf_tree_3 PARTITION OF nf_tree FOR VALUES IN (3)").expect("plain leaf");
+
+    let rows = |root: &str| {
+        Spi::get_one::<String>(&format!(
+            "SELECT tests.crate_test_list_partition_tree_rows('{root}'::text)"
+        ))
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(
+        rows("public.nf_tree"),
+        concat!(
+            "nf_tree_1|1|nf_tree|FOR VALUES IN ('1')|RANGE|order_date\n",
+            "nf_tree_2|1|nf_tree|FOR VALUES IN ('2')|LIST|region\n",
+            "nf_tree_3|1|nf_tree|FOR VALUES IN ('3')||\n",
+            "nf_tree_1_2025_01|2|nf_tree_1|FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')||\n",
+            "nf_tree_1_2025_02|2|nf_tree_1|FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')||\n",
+            "nf_tree_2_def|2|nf_tree_2|DEFAULT||\n",
+            "nf_tree_2_n|2|nf_tree_2|FOR VALUES IN ('N')||"
+        )
+    );
+    assert_eq!(rows("public.nf_tree_1_2025_01"), "");
+    assert_eq!(rows("public.nf_no_such_rel"), "");
+}
