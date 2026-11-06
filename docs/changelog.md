@@ -4,6 +4,18 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.12.4] — 2026-11-06
+
+A bug-fix release: an aggregate IMV LEFT JOINing a secondary on an aliased GROUP BY column (`t.to_location_id AS location_id`) failed every secondary-triggered flush with `column "to_location_id" does not exist`, silently marked known_stale under DEFERRED. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.4';`
+
+**Fixed**
+
+- The join-key-scoped secondary recompute deletes from the target by the GROUP BY column's projection alias, not its intermediate name (present since 1.10.1; hit every tenant's `stock_transfer_baseline_view`).
+
+**Migration**
+
+- [`sql/pg_reflex--1.12.3--1.12.4.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.12.3--1.12.4.sql) changes no SQL object; run `reflex_reconcile()` on each IMV the bug left known_stale.
+
 ## [1.12.3] — 2026-10-22
 
 A performance release for partition fills: a new key of a two-level partitioned IMV is filled with one routed INSERT per node instead of one base-query run per leaf, and the partition tree is looked up by oid. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.3';`

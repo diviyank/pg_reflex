@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+## [1.12.4] - 2026-11-06
+
+A bug-fix release. An aggregate IMV that LEFT JOINs a secondary on a
+GROUP BY column it projects under an alias (`t.to_location_id AS
+location_id`) failed every flush triggered by a write to that secondary
+with `column "to_location_id" does not exist`. Under DEFERRED the failure
+was swallowed: the IMV was marked known_stale and the staged delta
+discarded. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.4';`
+
+---
+
+### Fixed
+
+- **The join-key-scoped secondary recompute deletes from the target by
+  the aliased column.** `outer_join_secondary_stmts` built one membership
+  predicate from the intermediate column names and reused it for the
+  `DELETE FROM <target>`, which stores the GROUP BY column under its
+  projection alias. The target DELETE now maps each join key to its target
+  column through `target_group_columns`; the intermediate DELETE/INSERT and
+  the target INSERT are unchanged. Present since 1.10.1. Seen on every
+  tenant's `stock_transfer_baseline_view` (`LEFT JOIN
+  current_assortment_activity_view`) on db_dev and db_prod, where the
+  discarded deltas left `in_current_assortment` stale.
+
+### Tests
+
+- `pg_test_aliased_groupkey_secondary.rs`: an aliased join-key GROUP BY
+  column over a two-column secondary key, through a secondary UPDATE,
+  INSERT and DELETE, checked against a fresh recompute, under IMMEDIATE
+  and DEFERRED (the IMV must not be left known_stale). Both assert the
+  join-key-scoped path is taken, not a full rebuild.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.4';` changes no SQL object.
+  No IMV needs to be recreated. Run `reflex_reconcile()` on each IMV the
+  bug left known_stale.
+
+---
+
 ## [1.12.3] - 2026-10-22
 
 A performance release for partition fills. Filling a new key of a
