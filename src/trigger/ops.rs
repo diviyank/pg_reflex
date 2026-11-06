@@ -809,16 +809,33 @@ pub(crate) fn outer_join_secondary_stmts(
             }
             let changed_keys = format!("({}) __ck", sides.join(" UNION "));
             let pred = build_membership_predicate(&interm_cols, &interm_cols, &changed_keys);
+            // The target stores a GROUP BY column under its projection alias
+            // (`t.to_loc AS loc`), so its DELETE must name the alias, not the
+            // intermediate column. `join_key_scope_is_sound` guarantees every
+            // join key matches a GROUP BY column.
+            let target_names = target_group_columns(plan);
+            let target_key_cols: Vec<String> = join_keys
+                .iter()
+                .map(|(interm, _)| {
+                    plan.group_by_columns
+                        .iter()
+                        .position(|gb| normalized_column_name(gb).to_lowercase() == *interm)
+                        .and_then(|i| target_names.get(i).cloned())
+                        .unwrap_or_else(|| format!("\"{}\"", interm))
+                })
+                .collect();
+            let target_pred =
+                build_membership_predicate(&target_key_cols, &interm_cols, &changed_keys);
 
             // Recompute exactly the affected groups into the intermediate, then
-            // resync the target — every statement scoped by the same membership
-            // predicate so the base scan prunes to the changed join keys.
+            // resync the target — every statement scoped by the same changed
+            // join keys so the base scan prunes to them.
             stmts.push(format!("DELETE FROM {} WHERE {}", intermediate_tbl, pred));
             stmts.push(format!(
                 "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
                 intermediate_tbl, base_query, pred
             ));
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, pred));
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, target_pred));
             if end_query.is_empty() {
                 stmts.push(format!(
                     "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
