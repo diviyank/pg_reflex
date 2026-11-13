@@ -1338,13 +1338,7 @@ pub(crate) fn stamp_targeted_recovery(view_name: &str) {
         return;
     }
     Spi::connect_mut(|client| {
-        let _ = client.update(
-            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
-            None,
-            &[unsafe {
-                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-            }],
-        );
+        let _ = crate::sql_writer::registry::lock_imv(client, view_name);
         let _ = crate::sql_writer::registry::bump_rebuild_count(client, view_name);
     });
     if let Some(advisory) = rebuild_convergence_advisory(view_name) {

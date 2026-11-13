@@ -81,12 +81,19 @@ fn lo_await_lock_wait(query: &str) -> bool {
 /// the IMV's registry row, as a COMMIT-time flush does under that lock. The write
 /// must not wait on the queued operator. The IMV has a dependent so the rebuild
 /// takes the IMV's advisory lock (a dependent-less rebuild never does).
-fn lo_operator_waits_while_worker_writes_registry_row(dbname: &str, operator_call: &str) {
+fn lo_operator_waits_while_worker_writes_registry_row(
+    dbname: &str,
+    operator_call: &str,
+    with_dependent: bool,
+    expected_result: &str,
+) {
     probe_db_open(dbname);
     worker_exec("CREATE TABLE lo_src (k INT PRIMARY KEY, v INT)");
     worker_exec("INSERT INTO lo_src SELECT g, g FROM generate_series(1, 100) g");
     rbc_create_deferred("lo_v", LO_IMV_SQL, "k");
-    rbc_create_deferred("lo_dependent", "SELECT k, v FROM lo_v", "k");
+    if with_dependent {
+        rbc_create_deferred("lo_dependent", "SELECT k, v FROM lo_v", "k");
+    }
     lo_connect("lo_operator", dbname);
 
     worker_exec("BEGIN");
@@ -105,9 +112,14 @@ fn lo_operator_waits_while_worker_writes_registry_row(dbname: &str, operator_cal
         registry_write, "UPDATE 1",
         "the lock holder could not write the IMV's registry row: the queued operator holds it"
     );
-    assert_eq!(operator_result, "RECONCILED");
+    assert!(
+        operator_result.starts_with(expected_result),
+        "operator returned {operator_result}"
+    );
     assert_eq!(rbc_mismatch("lo_v", LO_IMV_SQL), 0);
-    assert_eq!(rbc_mismatch("lo_dependent", LO_IMV_SQL), 0);
+    if with_dependent {
+        assert_eq!(rbc_mismatch("lo_dependent", LO_IMV_SQL), 0);
+    }
     lo_disconnect("lo_operator");
     probe_db_close(dbname);
 }
@@ -117,6 +129,30 @@ fn pg_lock_order_rebuild_imv_takes_lock_before_registry_row() {
     lo_operator_waits_while_worker_writes_registry_row(
         "reflex_lo_rebuild",
         "SELECT reflex_rebuild_imv('lo_v')",
+        true,
+        "RECONCILED",
+    );
+}
+
+/// The invariant holds regardless of dependents: the lock comes from
+/// `stamp_targeted_recovery`, not from the dependent-propagating rebuild.
+#[pg_test]
+fn pg_lock_order_rebuild_imv_without_dependents_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(
+        "reflex_lo_nodep",
+        "SELECT reflex_rebuild_imv('lo_v')",
+        false,
+        "RECONCILED",
+    );
+}
+
+#[pg_test]
+fn pg_lock_order_setter_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(
+        "reflex_lo_setter",
+        "SELECT reflex_set_wipe_floor_rows('lo_v', 100)",
+        false,
+        "OK",
     );
 }
 
@@ -125,6 +161,8 @@ fn pg_lock_order_reconcile_takes_lock_before_registry_row() {
     lo_operator_waits_while_worker_writes_registry_row(
         "reflex_lo_reconcile",
         "SELECT reflex_reconcile('lo_v')",
+        true,
+        "RECONCILED",
     );
 }
 
