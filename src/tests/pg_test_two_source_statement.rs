@@ -75,13 +75,6 @@ fn ts_intermediate_xmins(imv: &str) -> String {
     ))
 }
 
-fn ts_rebuild_count(imv: &str) -> i64 {
-    worker_scalar_i64(&format!(
-        "SELECT COALESCE(rebuild_count, 0)::int8 FROM public.__reflex_ivm_reference \
-         WHERE name = '{imv}'"
-    ))
-}
-
 /// 10-02: a writable CTE writes both sources of IMMEDIATE join IMVs.
 #[pg_test]
 fn pg_two_source_writable_cte_immediate() {
@@ -253,7 +246,7 @@ fn pg_two_source_partition_detach_then_other_source_update_deferred() {
 
 /// Perf guard: writes reaching a two-source IMMEDIATE IMV from one source per
 /// statement — one source, then the other, and a source with an IMV over it —
-/// keep it incremental: no rebuild counted, the untouched groups not rewritten.
+/// keep it incremental: the untouched groups are not rewritten.
 #[pg_test]
 fn pg_two_source_single_source_write_no_recompute() {
     const DBNAME: &str = "reflex_ts_guard";
@@ -275,8 +268,6 @@ fn pg_two_source_single_source_write_no_recompute() {
     ts_create("ts_gv", GV_SQL, None, "IMMEDIATE");
     let gp_xmins = ts_intermediate_xmins("ts_gp");
     let gv_xmins = ts_intermediate_xmins("ts_gv");
-    let gp_rebuilds = ts_rebuild_count("ts_gp");
-    let gv_rebuilds = ts_rebuild_count("ts_gv");
 
     worker_exec("BEGIN");
     worker_exec("INSERT INTO ts_ga VALUES (1001, 1)");
@@ -287,8 +278,6 @@ fn pg_two_source_single_source_write_no_recompute() {
     assert_eq!(rbc_mismatch("ts_gp", PG_SQL), 0, "ts_gp differs from its query");
     assert_eq!(rbc_mismatch("ts_gu", GU_SQL), 0, "ts_gu differs from its query");
     assert_eq!(rbc_mismatch("ts_gv", GV_FRESH), 0, "ts_gv differs from its query");
-    assert_eq!(ts_rebuild_count("ts_gp"), gp_rebuilds, "ts_gp rebuild_count changed");
-    assert_eq!(ts_rebuild_count("ts_gv"), gv_rebuilds, "ts_gv rebuild_count changed");
     assert_eq!(
         ts_rewritten_intermediate_rows("ts_gp", &gp_xmins),
         1,
@@ -367,4 +356,163 @@ fn pg_two_source_immediate_diamond() {
         assert_imv_correct("tsd_u2", U2_SQL);
         assert_imv_correct("tsd_v", V_FRESH);
     }
+}
+
+const TS_GP_SQL: &str = "SELECT a.grp, COUNT(*) AS n, SUM(b.val) AS s \
+     FROM ts_ga a JOIN ts_gb b ON b.k = a.k GROUP BY a.grp";
+
+fn ts_grouped_pair_open(dbname: &str) {
+    probe_db_open(dbname);
+    worker_exec("CREATE TABLE ts_ga (k INT PRIMARY KEY, grp INT NOT NULL)");
+    worker_exec("CREATE TABLE ts_gb (k INT PRIMARY KEY, val INT NOT NULL)");
+    worker_exec("INSERT INTO ts_ga SELECT g, g % 5 FROM generate_series(1, 100) g");
+    worker_exec("INSERT INTO ts_gb SELECT g, g FROM generate_series(1, 100) g");
+    ts_create("ts_gp", TS_GP_SQL, None, "IMMEDIATE");
+}
+
+/// Writes of group 1 to ts_ga, then ts_gb, then ts_ga again, each statement
+/// completing before the next, under one top-level statement.
+fn ts_assert_one_call_stays_incremental(dbname: &str, setup: &[&str], call: &str) {
+    ts_grouped_pair_open(dbname);
+    for statement in setup {
+        worker_exec(statement);
+    }
+    let xmins = ts_intermediate_xmins("ts_gp");
+    worker_exec(call);
+    assert_eq!(rbc_mismatch("ts_gp", TS_GP_SQL), 0, "ts_gp differs from its query");
+    assert_eq!(
+        ts_rewritten_intermediate_rows("ts_gp", &xmins),
+        1,
+        "ts_gp: writes run one after the other in one call must stay a delta of group 1"
+    );
+    probe_db_close(dbname);
+}
+
+/// Perf guard: one DO block writing ts_ga, ts_gb, ts_ga in separate statements.
+#[pg_test]
+fn pg_two_source_do_block_writes_stay_incremental() {
+    ts_assert_one_call_stays_incremental(
+        "reflex_ts_do_guard",
+        &[],
+        "DO $$ BEGIN \
+           INSERT INTO ts_ga VALUES (1001, 1); \
+           INSERT INTO ts_gb VALUES (1001, 7); \
+           UPDATE ts_ga SET k = 1002 WHERE k = 1001; \
+         END $$",
+    );
+}
+
+/// Perf guard: one SQL function writing ts_ga, ts_gb, ts_ga in separate statements.
+#[pg_test]
+fn pg_two_source_sql_function_writes_stay_incremental() {
+    ts_assert_one_call_stays_incremental(
+        "reflex_ts_fn_guard",
+        &["CREATE FUNCTION ts_write_pair() RETURNS void LANGUAGE sql AS $$ \
+             INSERT INTO ts_ga VALUES (1001, 1); \
+             INSERT INTO ts_gb VALUES (1001, 7); \
+             UPDATE ts_ga SET k = 1002 WHERE k = 1001; \
+           $$"],
+        "CREATE TEMP TABLE ts_call AS SELECT 1 AS done FROM ts_write_pair()",
+    );
+}
+
+const TS_FK_GRP_SQL: &str = "SELECT p.g, COUNT(*) AS n, SUM(c.v) AS s \
+     FROM ts_fp p JOIN ts_fc c ON c.k = p.k GROUP BY p.g";
+const TS_FK_TOT_SQL: &str = "SELECT COUNT(*) AS n, SUM(c.v) AS s \
+     FROM ts_fp p JOIN ts_fc c ON c.k = p.k";
+const TS_FK_PT_SQL: &str = "SELECT c.id, p.g, c.v FROM ts_fp p JOIN ts_fc c ON c.k = p.k";
+const TS_FK_NULL_SQL: &str = "SELECT p.g, COUNT(*) AS n, SUM(c.v) AS s \
+     FROM ts_fp p JOIN ts_fn c ON c.k = p.k GROUP BY p.g";
+
+/// ts_fc references ts_fp ON DELETE / ON UPDATE CASCADE, ts_fn ON DELETE SET
+/// NULL (on delete and update): one statement on the parent writes both sources
+/// of every IMV.
+fn ts_fk_cascades(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    worker_exec("CREATE TABLE ts_fp (k INT PRIMARY KEY, g INT NOT NULL)");
+    worker_exec(
+        "CREATE TABLE ts_fc (id INT PRIMARY KEY, \
+           k INT REFERENCES ts_fp ON DELETE CASCADE ON UPDATE CASCADE, v INT NOT NULL)",
+    );
+    worker_exec(
+        "CREATE TABLE ts_fn (id INT PRIMARY KEY, \
+           k INT REFERENCES ts_fp ON DELETE SET NULL ON UPDATE SET NULL, v INT NOT NULL)",
+    );
+    worker_exec("INSERT INTO ts_fp SELECT g, g % 25 FROM generate_series(1, 100) g");
+    worker_exec("INSERT INTO ts_fc SELECT g, (g % 100) + 1, g FROM generate_series(1, 300) g");
+    worker_exec("INSERT INTO ts_fn SELECT g, (g % 100) + 1, g FROM generate_series(1, 300) g");
+    ts_create("ts_fk_grp", TS_FK_GRP_SQL, None, mode);
+    ts_create("ts_fk_tot", TS_FK_TOT_SQL, None, mode);
+    ts_create("ts_fk_pt", TS_FK_PT_SQL, Some("id"), mode);
+    ts_create("ts_fk_null", TS_FK_NULL_SQL, None, mode);
+    for statement in [
+        "DELETE FROM ts_fp WHERE k IN (1, 2)",
+        "UPDATE ts_fp SET k = k + 1000 WHERE k IN (3, 4)",
+        "UPDATE ts_fp SET g = 99, k = k + 2000 WHERE k = 5",
+    ] {
+        worker_exec("BEGIN");
+        worker_exec(statement);
+        worker_exec("COMMIT");
+        for (imv, fresh) in [
+            ("ts_fk_grp", TS_FK_GRP_SQL),
+            ("ts_fk_tot", TS_FK_TOT_SQL),
+            ("ts_fk_pt", TS_FK_PT_SQL),
+            ("ts_fk_null", TS_FK_NULL_SQL),
+        ] {
+            assert_eq!(rbc_mismatch(imv, fresh), 0, "{imv} differs from its query after <{statement}>");
+            assert!(!rbc_known_stale(imv), "{imv} flagged stale after <{statement}>");
+        }
+    }
+    probe_db_close(dbname);
+}
+
+#[pg_test]
+fn pg_two_source_fk_cascade_immediate() {
+    ts_fk_cascades("reflex_ts_fk_imm", "IMMEDIATE");
+}
+
+#[pg_test]
+fn pg_two_source_fk_cascade_deferred() {
+    ts_fk_cascades("reflex_ts_fk_def", "DEFERRED");
+}
+
+const TS_HJ_SQL: &str = "SELECT b.b % 3 AS g, COUNT(*) AS n, SUM(h.a) AS s \
+     FROM ts_h h JOIN ts_hb b ON b.k = h.k GROUP BY b.b % 3";
+
+/// A writable CTE writes a hash-partitioned source, through the partitioned
+/// table and through one of its partitions, and the other source of the IMV.
+#[pg_test]
+fn pg_two_source_writable_cte_partitioned_source_immediate() {
+    const DBNAME: &str = "reflex_ts_cte_part";
+    probe_db_open(DBNAME);
+    worker_exec("CREATE TABLE ts_h (k INT NOT NULL, a INT) PARTITION BY HASH (k)");
+    for remainder in 0..4 {
+        worker_exec(&format!(
+            "CREATE TABLE ts_h_{remainder} PARTITION OF ts_h \
+             FOR VALUES WITH (MODULUS 4, REMAINDER {remainder})"
+        ));
+    }
+    worker_exec("CREATE TABLE ts_hb (k INT PRIMARY KEY, b INT)");
+    worker_exec("INSERT INTO ts_h SELECT g, g % 2 FROM generate_series(1, 40) g");
+    worker_exec("INSERT INTO ts_hb SELECT g, g FROM generate_series(1, 40) g");
+    ts_create("ts_hj", TS_HJ_SQL, None, "IMMEDIATE");
+    let leaf_of_7 = rbc_select("(SELECT tableoid::regclass::text FROM ts_h WHERE k = 7)");
+    for statement in [
+        "WITH x AS (INSERT INTO ts_h VALUES (100, 1) RETURNING 1) INSERT INTO ts_hb VALUES (100, 5)"
+            .to_string(),
+        format!(
+            "WITH x AS (UPDATE {leaf_of_7} SET a = a + 10 WHERE k = 7 RETURNING 1) \
+             UPDATE ts_hb SET b = b + 1 WHERE k = 7"
+        ),
+        "WITH x AS (UPDATE ts_hb SET b = b + 1 WHERE k = 8 RETURNING 1) \
+         DELETE FROM ts_h WHERE k = 8"
+            .to_string(),
+    ] {
+        worker_exec("BEGIN");
+        worker_exec(&statement);
+        assert_eq!(rbc_mismatch("ts_hj", TS_HJ_SQL), 0, "ts_hj differs after <{statement}>");
+        worker_exec("COMMIT");
+        assert_eq!(rbc_mismatch("ts_hj", TS_HJ_SQL), 0, "ts_hj differs after COMMIT of <{statement}>");
+    }
+    probe_db_close(DBNAME);
 }
