@@ -519,9 +519,10 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
-    if delta_sources::delta_would_count_twice(view_name, source_table) {
+    if delta_sources::delta_owes_recompute(view_name, source_table) {
         return String::new();
     }
+    delta_sources::delta_would_count_twice(view_name, source_table);
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,

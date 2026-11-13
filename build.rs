@@ -112,6 +112,7 @@ __attribute__((weak)) unsigned int GetCurrentTransactionIdIfAny(void)   { return
 __attribute__((weak)) unsigned int GetCurrentTransactionId(void)        { return 0; }
 __attribute__((weak)) long  GetCurrentTransactionStartTimestamp(void)   { return 0; }
 __attribute__((weak)) long  GetCurrentStatementStartTimestamp(void)     { return 0; }
+__attribute__((weak)) _Bool AfterTriggerPendingOnRel(unsigned int r)    { return 0; }
 __attribute__((weak)) void  MemoryContextDelete(void *c)                {}
 __attribute__((weak)) void *MemoryContextGetParent(void *c)             { return NULL; }
 __attribute__((weak)) void *AllocSetContextCreateInternal()             { return NULL; }
