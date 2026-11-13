@@ -1207,11 +1207,42 @@ extension_sql!(
         _imv RECORD;
     BEGIN
         FOR _obj IN
-            SELECT object_identity, schema_name, object_name,
+            SELECT objid, object_identity, schema_name, object_name,
                    (schema_name || object_name) !~ '[."A-Z]' AS reads_back_unquoted
             FROM pg_event_trigger_dropped_objects()
             WHERE object_type = 'table'
         LOOP
+            -- A dropped partition of a tracked source: the table is gone, so its
+            -- root comes from the snapshot (matched by oid, never by name) and is
+            -- queued for the COMMIT-time partition flush, which classifies the
+            -- vanished child as a detach. Never queued for a root that is an IMV
+            -- (pg_reflex's own swap drops IMV partitions; the cascade is
+            -- code-driven) nor for a root dropped in the same statement (the
+            -- source branch below tears its IMVs down).
+            INSERT INTO public.__reflex_partition_pending (source_root)
+            SELECT DISTINCT s.source_root
+            FROM public.__reflex_source_partition_snapshot s
+            WHERE s.child_oid = _obj.objid::bigint
+              AND s.source_root NOT LIKE '%\_\_reflex\_%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_event_trigger_dropped_objects() d
+                  WHERE d.object_type = 'table'
+                    AND d.schema_name || '.' || d.object_name = s.source_root)
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.__reflex_ivm_reference r
+                  WHERE public.__reflex_named_relation(
+                            CASE WHEN r.target_schema IS NOT NULL AND r.name NOT LIKE '%.%'
+                                 THEN quote_ident(r.target_schema) || '.' || r.name
+                                 ELSE r.name END)
+                        = public.__reflex_named_relation(s.source_root))
+              AND EXISTS (
+                  SELECT 1 FROM public.__reflex_ivm_reference r
+                  WHERE r.enabled
+                    AND public.__reflex_reads_relation(r.depends_on, s.source_root))
+            ON CONFLICT (source_root)
+            DO UPDATE SET enqueued_at = statement_timestamp(),
+                          attempts    = public.__reflex_partition_pending.attempts + 1;
+
             -- A source is registered without a schema only when it is a table of
             -- public: a table of another schema with the same name is another table.
             -- A name PostgreSQL prints quoted but reads back bare (a non-ASCII
@@ -1995,6 +2026,7 @@ mod tests {
     include!("tests/pg_test_v112_deferred_partition.rs");
     include!("tests/pg_test_v112_shapes.rs");
     include!("tests/pg_test_v112_partition_dml.rs");
+    include!("tests/pg_test_drop_source_partition.rs");
     include!("tests/pg_test_v112_partition_review.rs");
     include!("tests/pg_test_v112_seam_review.rs");
     include!("tests/pg_test_v112_partition_locks.rs");
