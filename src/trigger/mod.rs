@@ -195,7 +195,7 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
-    if delta_sources::delta_would_count_twice(view_name, source_table) {
+    if delta_sources::delta_would_count_twice(view_name, source_table, base_query) {
         return recompute_sql(view_name, base_query, end_query, aggregations_json);
     }
     let cache_key = delta_sql_cache_key(
@@ -522,7 +522,7 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
     if delta_sources::delta_owes_recompute(view_name, source_table) {
         return String::new();
     }
-    delta_sources::delta_would_count_twice(view_name, source_table);
+    delta_sources::delta_would_count_twice(view_name, source_table, &base_query);
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,

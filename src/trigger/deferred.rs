@@ -1875,7 +1875,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     }
                 }
             }
-            if super::delta_sources::delta_would_count_twice(imv_name, source_table) {
+            if super::delta_sources::delta_would_count_twice(imv_name, source_table, base_query) {
                 // Flushed inside the statement that wrote another of its sources
                 // (`SET CONSTRAINTS ALL IMMEDIATE`): rebuilt from their final
                 // state, again if it was rebuilt earlier in the transaction.

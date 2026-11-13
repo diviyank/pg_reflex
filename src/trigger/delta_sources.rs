@@ -5,17 +5,26 @@
 //! Every AFTER STATEMENT trigger of one query fires after all of its writes: a
 //! writable CTE writing A and B leaves B holding ΔB when A's trigger applies
 //! ΔA ⋈ B, and B's trigger then applies A ⋈ ΔB against A holding ΔA, counting
-//! ΔA ⋈ ΔB twice. A user trigger on A writing B, and a pg_reflex flush fired
-//! inside a statement (`SET CONSTRAINTS ALL IMMEDIATE`), are the same. A source
-//! holds such writes exactly while after-trigger events on it are queued and
-//! not yet fired: when its delta arrives after another source's delta was
-//! applied during that window, the IMV is recomputed instead. Statements run
-//! one after the other (a function writing A then B) leave nothing queued, and
-//! an IMV read as a source is maintained, and its own events fired, before its
-//! readers' next delta (deepest first), so both stay incremental.
+//! ΔA ⋈ ΔB twice. A user trigger on A writing B, a cascading foreign key between
+//! A and B, and a pg_reflex flush fired inside a statement (`SET CONSTRAINTS ALL
+//! IMMEDIATE`), are the same. A source holds such writes exactly while
+//! after-trigger events on it are queued and not yet fired: when its delta
+//! arrives after another source's delta was applied during that window, the IMV
+//! is recomputed instead. Statements run one after the other (a function writing
+//! A then B) leave nothing queued, and an IMV read as a source is maintained, and
+//! its own events fired, before its readers' next delta (deepest first), so both
+//! stay incremental.
+//!
+//! Looking for queued events walks the whole queue once per relation, so a
+//! relation is only looked at when this transaction may have written it: a table
+//! whose transaction counters count a write, a partitioned source whose guard
+//! recorded one (then its partitioned tables and its written leaves), and any
+//! relation neither signal covers.
 
 use pgrx::prelude::*;
 use std::collections::HashMap;
+use std::ffi::CString;
+use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Default)]
@@ -25,9 +34,42 @@ struct DeltaSources {
     in_transaction: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum WriteSignal {
+    TransactionCounters,
+    Guard,
+    None,
+}
+
+#[derive(Clone, Copy)]
+struct Relation {
+    oid: pg_sys::Oid,
+    partitioned: bool,
+    signal: WriteSignal,
+}
+
+#[derive(Default)]
+struct Relations {
+    transaction: i64,
+    by_name: HashMap<String, Option<Relation>>,
+}
+
 fn sources_by_imv() -> &'static Mutex<HashMap<String, DeltaSources>> {
     static SOURCES: OnceLock<Mutex<HashMap<String, DeltaSources>>> = OnceLock::new();
     SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registered sources of an IMV, by IMV name and hashed definition.
+type SourceNames = HashMap<(String, u64), Vec<String>>;
+
+fn source_names_by_definition() -> &'static Mutex<SourceNames> {
+    static NAMES: OnceLock<Mutex<SourceNames>> = OnceLock::new();
+    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relations_of_this_transaction() -> &'static Mutex<Relations> {
+    static RELATIONS: OnceLock<Mutex<Relations>> = OnceLock::new();
+    RELATIONS.get_or_init(|| Mutex::new(Relations::default()))
 }
 
 /// What `running_statement` reads outside a PostgreSQL backend (the SQL-generation
@@ -55,47 +97,197 @@ fn text_arg(value: &str) -> pgrx::datum::DatumWithOid<'static> {
     }
 }
 
-fn relation_oid(relation: &str) -> Option<pg_sys::Oid> {
-    Spi::get_one_with_args::<pg_sys::Oid>("SELECT to_regclass($1)::oid", &[text_arg(relation)])
-        .unwrap_or(None)
-}
-
-/// The sources of `view_name` other than `source` with after-trigger events
-/// queued and not yet fired, on themselves or on one of their partitions.
-/// `None` when they cannot be read: every source then counts as holding writes.
-fn other_sources_holding_unapplied_writes(
-    view_name: &str,
-    source: Option<pg_sys::Oid>,
-) -> Option<Vec<pg_sys::Oid>> {
-    Spi::connect(|client| {
+/// The sources `view_name` reads, `None` when the registry cannot be read.
+fn source_names(view_name: &str, base_query: &str) -> Option<Vec<String>> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base_query.hash(&mut hasher);
+    let key = (view_name.to_string(), hasher.finish());
+    if let Some(names) = source_names_by_definition()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Some(names.clone());
+    }
+    let names: Vec<String> = Spi::connect(|client| {
         let rows = client
             .select(
-                "WITH s AS ( \
-                   SELECT DISTINCT to_regclass(d.src) AS rel \
-                   FROM public.__reflex_ivm_reference r \
-                   CROSS JOIN LATERAL unnest(r.depends_on) d(src) \
-                   WHERE r.name = $1 AND d.src NOT LIKE '<%') \
-                 SELECT s.rel::oid AS source, t.relid::oid AS rel \
-                 FROM s CROSS JOIN LATERAL ( \
-                   SELECT s.rel AS relid UNION SELECT relid FROM pg_partition_tree(s.rel)) t \
-                 WHERE s.rel IS NOT NULL",
+                "SELECT DISTINCT d.src::text AS src \
+                 FROM public.__reflex_ivm_reference r \
+                 CROSS JOIN LATERAL unnest(r.depends_on) d(src) \
+                 WHERE r.name = $1 AND d.src NOT LIKE '<%'",
                 None,
                 &[text_arg(view_name)],
             )
             .ok()?;
-        let mut holding: Vec<pg_sys::Oid> = Vec::new();
+        let mut names = Vec::new();
         for row in rows {
-            let other = row.get_by_name::<pg_sys::Oid, _>("source").ok()??;
-            let relation = row.get_by_name::<pg_sys::Oid, _>("rel").ok()??;
-            if Some(other) != source
-                && !holding.contains(&other)
-                && unsafe { pg_sys::AfterTriggerPendingOnRel(relation) }
-            {
-                holding.push(other);
+            names.push(row.get_by_name::<String, _>("src").ok()??);
+        }
+        Some(names)
+    })?;
+    if !names.is_empty() {
+        source_names_by_definition()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, names.clone());
+    }
+    Some(names)
+}
+
+fn read_relation(name: &str) -> Option<Relation> {
+    Spi::connect(|client| {
+        let row = client
+            .select(
+                "SELECT c.oid, c.relkind::text AS relkind, \
+                        EXISTS (SELECT 1 FROM pg_trigger t \
+                                WHERE t.tgrelid = c.oid AND t.tgname = $2) AS guarded \
+                 FROM pg_class c WHERE c.oid = to_regclass($1)",
+                Some(1),
+                &[
+                    text_arg(name),
+                    text_arg(&crate::schema_builder::partitioned_source_trigger_name(
+                        name,
+                    )),
+                ],
+            )
+            .ok()?
+            .next()?;
+        let oid = row.get_by_name::<pg_sys::Oid, _>("oid").ok()??;
+        let relkind = row.get_by_name::<String, _>("relkind").ok()??;
+        let guarded = row.get_by_name::<bool, _>("guarded").ok()??;
+        let partitioned = relkind == "p";
+        let signal = match relkind.as_str() {
+            "r" | "m" | "t" => WriteSignal::TransactionCounters,
+            "p" if guarded => WriteSignal::Guard,
+            _ => WriteSignal::None,
+        };
+        Some(Relation {
+            oid,
+            partitioned,
+            signal,
+        })
+    })
+}
+
+fn relation(name: &str, transaction: i64) -> Option<Relation> {
+    {
+        let mut relations = relations_of_this_transaction()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if relations.transaction != transaction {
+            relations.transaction = transaction;
+            relations.by_name.clear();
+        }
+        if let Some(known) = relations.by_name.get(name) {
+            return *known;
+        }
+    }
+    let read = read_relation(name);
+    relations_of_this_transaction()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_name
+        .insert(name.to_string(), read);
+    read
+}
+
+fn counts_writes() -> bool {
+    unsafe { pg_sys::pgstat_track_counts }
+}
+
+fn written_rows_counted(oid: pg_sys::Oid) -> bool {
+    let count = |function: unsafe fn(pg_sys::FunctionCallInfo) -> pg_sys::Datum| unsafe {
+        pgrx::direct_function_call::<i64>(function, &[oid.into_datum()]).unwrap_or(1)
+    };
+    count(pg_sys::pg_stat_get_xact_tuples_inserted) > 0
+        || count(pg_sys::pg_stat_get_xact_tuples_updated) > 0
+        || count(pg_sys::pg_stat_get_xact_tuples_deleted) > 0
+}
+
+fn guard_recorded_a_write(name: &str) -> bool {
+    let Ok(setting) = CString::new(crate::schema_builder::source_written_setting(name)) else {
+        return true;
+    };
+    let value = unsafe { pg_sys::GetConfigOption(setting.as_ptr(), true, false) };
+    !value.is_null() && unsafe { *value } != 0
+}
+
+fn may_have_been_written(name: &str, relation: &Relation) -> bool {
+    match relation.signal {
+        WriteSignal::TransactionCounters => !counts_writes() || written_rows_counted(relation.oid),
+        WriteSignal::Guard => guard_recorded_a_write(name),
+        WriteSignal::None => true,
+    }
+}
+
+/// The tables of a partitioned source whose queued events can hold its writes:
+/// the partitioned tables, which a statement naming them queues on, and the
+/// leaves this transaction may have written. `None` when they cannot be read.
+fn tables_that_may_queue_writes(root: pg_sys::Oid) -> Option<Vec<pg_sys::Oid>> {
+    Spi::connect(|client| {
+        let rows = client
+            .select(
+                "SELECT t.relid::oid AS rel FROM pg_partition_tree($1) t \
+                 JOIN pg_class c ON c.oid = t.relid \
+                 WHERE c.relkind NOT IN ('r', 'm', 't') \
+                    OR NOT current_setting('track_counts')::bool \
+                    OR pg_stat_get_xact_tuples_inserted(t.relid) \
+                       + pg_stat_get_xact_tuples_updated(t.relid) \
+                       + pg_stat_get_xact_tuples_deleted(t.relid) > 0",
+                None,
+                &[unsafe {
+                    pgrx::datum::DatumWithOid::new(
+                        root,
+                        pg_sys::PgBuiltInOids::OIDOID.oid().value(),
+                    )
+                }],
+            )
+            .ok()?;
+        let mut tables = vec![root];
+        for row in rows {
+            tables.push(row.get_by_name::<pg_sys::Oid, _>("rel").ok()??);
+        }
+        Some(tables)
+    })
+}
+
+fn holds_unapplied_writes(name: &str, relation: &Relation) -> bool {
+    if !may_have_been_written(name, relation) {
+        return false;
+    }
+    if !relation.partitioned {
+        return unsafe { pg_sys::AfterTriggerPendingOnRel(relation.oid) };
+    }
+    match tables_that_may_queue_writes(relation.oid) {
+        Some(tables) => tables
+            .into_iter()
+            .any(|oid| unsafe { pg_sys::AfterTriggerPendingOnRel(oid) }),
+        None => true,
+    }
+}
+
+/// The sources of `view_name` other than `source` holding writes not yet
+/// applied; `InvalidOid` stands for any source that cannot be resolved.
+fn other_sources_holding_unapplied_writes(
+    names: &[String],
+    source: Option<pg_sys::Oid>,
+    transaction: i64,
+) -> Vec<pg_sys::Oid> {
+    let mut holding: Vec<pg_sys::Oid> = Vec::new();
+    for name in names {
+        let found = match relation(name, transaction) {
+            None => Some(pg_sys::InvalidOid),
+            Some(other) if Some(other.oid) == source => None,
+            Some(other) => holds_unapplied_writes(name, &other).then_some(other.oid),
+        };
+        if let Some(oid) = found {
+            if !holding.contains(&oid) {
+                holding.push(oid);
             }
         }
-        Some(holding)
-    })
+    }
+    holding
 }
 
 fn entry_for_statement<'a>(
@@ -131,7 +323,16 @@ pub(crate) fn delta_owes_recompute(view_name: &str, source: &str) -> bool {
     if statement == NO_TRANSACTION {
         return false;
     }
-    let source_oid = relation_oid(source);
+    let nothing_owed = {
+        let mut by_imv = sources_by_imv().lock().unwrap_or_else(|e| e.into_inner());
+        entry_for_statement(&mut by_imv, view_name, statement)
+            .unapplied_at_earlier_delta
+            .is_empty()
+    };
+    if nothing_owed {
+        return false;
+    }
+    let source_oid = relation(source, statement.0).map(|r| r.oid);
     let mut by_imv = sources_by_imv().lock().unwrap_or_else(|e| e.into_inner());
     owed(
         entry_for_statement(&mut by_imv, view_name, statement),
@@ -142,29 +343,32 @@ pub(crate) fn delta_owes_recompute(view_name: &str, source: &str) -> bool {
 /// Records that `source`'s delta reaches `view_name` now, and tells whether it
 /// would join rows already counted: `source` held writes not yet applied when
 /// another source's delta reached `view_name` earlier in this statement. Then
-/// `view_name` must be recomputed from its sources instead.
-pub(crate) fn delta_would_count_twice(view_name: &str, source: &str) -> bool {
+/// `view_name` must be recomputed from its sources instead. An IMV over one
+/// source is never looked at.
+pub(crate) fn delta_would_count_twice(view_name: &str, source: &str, base_query: &str) -> bool {
     let statement = running_statement();
     if statement == NO_TRANSACTION {
         return false;
     }
-    let source_oid = relation_oid(source);
-    let holding = other_sources_holding_unapplied_writes(view_name, source_oid);
+    let names = source_names(view_name, base_query);
+    if names.as_ref().is_some_and(|names| names.len() < 2) {
+        return false;
+    }
+    let source_oid = relation(source, statement.0).map(|r| r.oid);
+    let holding = match &names {
+        Some(names) => other_sources_holding_unapplied_writes(names, source_oid, statement.0),
+        None => vec![pg_sys::InvalidOid],
+    };
     let mut by_imv = sources_by_imv().lock().unwrap_or_else(|e| e.into_inner());
     let entry = entry_for_statement(&mut by_imv, view_name, statement);
     let twice = owed(entry, source_oid);
     entry
         .unapplied_at_earlier_delta
         .retain(|oid| Some(*oid) != source_oid || *oid == pg_sys::InvalidOid);
-    match holding {
-        Some(holding) => {
-            for oid in holding {
-                if !entry.unapplied_at_earlier_delta.contains(&oid) {
-                    entry.unapplied_at_earlier_delta.push(oid);
-                }
-            }
+    for oid in holding {
+        if !entry.unapplied_at_earlier_delta.contains(&oid) {
+            entry.unapplied_at_earlier_delta.push(oid);
         }
-        None => entry.unapplied_at_earlier_delta.push(pg_sys::InvalidOid),
     }
     if !entry.in_transaction.iter().any(|s| s == source) {
         entry.in_transaction.push(source.to_string());
