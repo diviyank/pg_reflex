@@ -114,10 +114,9 @@ __attribute__((weak)) long  GetCurrentTransactionStartTimestamp(void)   { return
 __attribute__((weak)) long  GetCurrentStatementStartTimestamp(void)     { return 0; }
 __attribute__((weak)) _Bool AfterTriggerPendingOnRel(unsigned int r)    { return 0; }
 __attribute__((weak)) _Bool pgstat_track_counts = 0;
+__attribute__((weak)) unsigned int MyDatabaseId = 0;
 __attribute__((weak)) const char *GetConfigOption()                     { return NULL; }
-__attribute__((weak)) unsigned long pg_stat_get_xact_tuples_inserted()  { return 0; }
-__attribute__((weak)) unsigned long pg_stat_get_xact_tuples_updated()   { return 0; }
-__attribute__((weak)) unsigned long pg_stat_get_xact_tuples_deleted()   { return 0; }
+__attribute__((weak)) void *pgstat_fetch_pending_entry()                { return NULL; }
 __attribute__((weak)) void  MemoryContextDelete(void *c)                {}
 __attribute__((weak)) void *MemoryContextGetParent(void *c)             { return NULL; }
 __attribute__((weak)) void *AllocSetContextCreateInternal()             { return NULL; }

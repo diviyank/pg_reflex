@@ -16,9 +16,11 @@
 //! stay incremental.
 //!
 //! Looking for queued events walks the whole queue once per relation, so a
-//! relation is only looked at when this transaction may have written it: a table
-//! whose transaction counters count a write, a partitioned source whose guard
-//! recorded one (then its partitioned tables and its written leaves), and any
+//! relation is only looked at when this transaction may have written it: a heap
+//! table whose statistics hold counts of this transaction (the per-transaction
+//! part of its pending statistics, which earlier transactions never leave
+//! behind), a partitioned source whose guard recorded a write (then its
+//! partitioned tables and its leaves written in this transaction), and any
 //! relation neither signal covers.
 
 use pgrx::prelude::*;
@@ -139,7 +141,7 @@ fn read_relation(name: &str) -> Option<Relation> {
     Spi::connect(|client| {
         let row = client
             .select(
-                "SELECT c.oid, c.relkind::text AS relkind, \
+                "SELECT c.oid, c.relkind::text AS relkind, c.relam = 2 AS heap, \
                         EXISTS (SELECT 1 FROM pg_trigger t \
                                 WHERE t.tgrelid = c.oid AND t.tgname = $2) AS guarded \
                  FROM pg_class c WHERE c.oid = to_regclass($1)",
@@ -156,9 +158,10 @@ fn read_relation(name: &str) -> Option<Relation> {
         let oid = row.get_by_name::<pg_sys::Oid, _>("oid").ok()??;
         let relkind = row.get_by_name::<String, _>("relkind").ok()??;
         let guarded = row.get_by_name::<bool, _>("guarded").ok()??;
+        let heap = row.get_by_name::<bool, _>("heap").ok()?.unwrap_or(false);
         let partitioned = relkind == "p";
         let signal = match relkind.as_str() {
-            "r" | "m" | "t" => WriteSignal::TransactionCounters,
+            "r" | "m" | "t" if heap => WriteSignal::TransactionCounters,
             "p" if guarded => WriteSignal::Guard,
             _ => WriteSignal::None,
         };
@@ -196,13 +199,52 @@ fn counts_writes() -> bool {
     unsafe { pg_sys::pgstat_track_counts }
 }
 
-fn written_rows_counted(oid: pg_sys::Oid) -> bool {
-    let count = |function: unsafe fn(pg_sys::FunctionCallInfo) -> pg_sys::Datum| unsafe {
-        pgrx::direct_function_call::<i64>(function, &[oid.into_datum()]).unwrap_or(1)
-    };
-    count(pg_sys::pg_stat_get_xact_tuples_inserted) > 0
-        || count(pg_sys::pg_stat_get_xact_tuples_updated) > 0
-        || count(pg_sys::pg_stat_get_xact_tuples_deleted) > 0
+/// `pgstat_fetch_pending_entry`, of `utils/pgstat_internal.h`, with the layout
+/// of `PgStat_EntryRef` and the value of `PGSTAT_KIND_RELATION` shared by
+/// PostgreSQL 15 to 18.
+mod pending_statistics {
+    use pgrx::pg_sys;
+
+    pub(super) const KIND_RELATION: u32 = 2;
+
+    #[repr(C)]
+    pub(super) struct EntryRef {
+        shared_entry: *mut core::ffi::c_void,
+        shared_stats: *mut core::ffi::c_void,
+        generation: u32,
+        pub(super) pending: *mut core::ffi::c_void,
+    }
+
+    #[cfg(not(feature = "pg18"))]
+    pub(super) type ObjectId = u32;
+    #[cfg(feature = "pg18")]
+    pub(super) type ObjectId = u64;
+
+    unsafe extern "C" {
+        pub(super) fn pgstat_fetch_pending_entry(
+            kind: u32,
+            dboid: pg_sys::Oid,
+            objid: ObjectId,
+        ) -> *mut EntryRef;
+    }
+}
+
+/// Whether the statistics of `oid` count a row written by the running
+/// transaction or one of its live subtransactions: the per-transaction counts
+/// (`trans`) exist from the first counted write until the (sub)transaction ends.
+fn rows_written_in_this_transaction(oid: pg_sys::Oid) -> bool {
+    unsafe {
+        let entry = pending_statistics::pgstat_fetch_pending_entry(
+            pending_statistics::KIND_RELATION,
+            pg_sys::MyDatabaseId,
+            pending_statistics::ObjectId::from(oid.to_u32()),
+        );
+        if entry.is_null() || (*entry).pending.is_null() {
+            return false;
+        }
+        let status = (*entry).pending as *const pg_sys::PgStat_TableStatus;
+        !(*status).trans.is_null()
+    }
 }
 
 fn guard_recorded_a_write(name: &str) -> bool {
@@ -215,26 +257,27 @@ fn guard_recorded_a_write(name: &str) -> bool {
 
 fn may_have_been_written(name: &str, relation: &Relation) -> bool {
     match relation.signal {
-        WriteSignal::TransactionCounters => !counts_writes() || written_rows_counted(relation.oid),
+        WriteSignal::TransactionCounters => {
+            !counts_writes() || rows_written_in_this_transaction(relation.oid)
+        }
         WriteSignal::Guard => guard_recorded_a_write(name),
         WriteSignal::None => true,
     }
 }
 
 /// The tables of a partitioned source whose queued events can hold its writes:
-/// the partitioned tables, which a statement naming them queues on, and the
-/// leaves this transaction may have written. `None` when they cannot be read.
+/// the partitioned tables, which a statement naming them queues on, the leaves
+/// this transaction wrote, and any leaf no signal covers. `None` when they
+/// cannot be read.
 fn tables_that_may_queue_writes(root: pg_sys::Oid) -> Option<Vec<pg_sys::Oid>> {
+    let counts = counts_writes();
     Spi::connect(|client| {
         let rows = client
             .select(
-                "SELECT t.relid::oid AS rel FROM pg_partition_tree($1) t \
-                 JOIN pg_class c ON c.oid = t.relid \
-                 WHERE c.relkind NOT IN ('r', 'm', 't') \
-                    OR NOT current_setting('track_counts')::bool \
-                    OR pg_stat_get_xact_tuples_inserted(t.relid) \
-                       + pg_stat_get_xact_tuples_updated(t.relid) \
-                       + pg_stat_get_xact_tuples_deleted(t.relid) > 0",
+                "SELECT t.relid::oid AS rel, \
+                        c.relkind IN ('r', 'm', 't') AND c.relam = 2 AS heap \
+                 FROM pg_partition_tree($1) t JOIN pg_class c ON c.oid = t.relid \
+                 WHERE t.relid::oid <> $1",
                 None,
                 &[unsafe {
                     pgrx::datum::DatumWithOid::new(
@@ -246,7 +289,11 @@ fn tables_that_may_queue_writes(root: pg_sys::Oid) -> Option<Vec<pg_sys::Oid>> {
             .ok()?;
         let mut tables = vec![root];
         for row in rows {
-            tables.push(row.get_by_name::<pg_sys::Oid, _>("rel").ok()??);
+            let table = row.get_by_name::<pg_sys::Oid, _>("rel").ok()??;
+            let heap = row.get_by_name::<bool, _>("heap").ok()?.unwrap_or(false);
+            if !heap || !counts || rows_written_in_this_transaction(table) {
+                tables.push(table);
+            }
         }
         Some(tables)
     })
