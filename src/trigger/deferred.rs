@@ -1875,6 +1875,49 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     }
                 }
             }
+            if super::delta_sources::delta_would_count_twice(imv_name, source_table) {
+                // Flushed inside the statement that wrote another of its sources
+                // (`SET CONSTRAINTS ALL IMMEDIATE`): rebuilt from their final
+                // state, again if it was rebuilt earlier in the transaction.
+                ensure_temp_table(
+                    client,
+                    "__reflex_deferred_rebuild",
+                    crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                );
+                ensure_temp_table(
+                    client,
+                    "__reflex_deferred_reconciled_batch",
+                    RECONCILED_BATCH_TABLE_DDL,
+                );
+                client
+                    .update(
+                        "DELETE FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = $1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                imv_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report();
+                client
+                    .update(
+                        "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                         VALUES ($1, TRUE) \
+                         ON CONFLICT (name) DO UPDATE SET reconcile = TRUE, attempts = 0",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                imv_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report();
+                total_processed += 1;
+                continue;
+            }
             if !scoped.is_empty() {
                 // Partition- or key-scoped rebuilds of this IMV in this
                 // transaction: the rows staged before one of them in its slice

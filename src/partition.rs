@@ -4492,6 +4492,72 @@ fn source_written_in_this_transaction(client: &pgrx::spi::SpiClient<'_>, source:
         .unwrap_or(true)
 }
 
+/// The partition delta also double counts when another source of the IMV was
+/// written in this transaction: that write was applied (or is staged) against
+/// the source holding the partition, and the partition delta joins its new rows.
+/// Written means its delta reached the IMV, is staged for it, or its TRUNCATE
+/// rebuilt it.
+fn another_source_written_in_this_transaction(
+    client: &pgrx::spi::SpiClient<'_>,
+    imv: &str,
+    depends_on: &[String],
+    source: &str,
+) -> bool {
+    if crate::trigger::delta_sources::reached_from_another_source_in_this_transaction(imv, source) {
+        return true;
+    }
+    let others: Vec<String> = depends_on
+        .iter()
+        .filter(|d| d.as_str() != source && !d.starts_with('<'))
+        .cloned()
+        .collect();
+    if others.is_empty() {
+        return false;
+    }
+    let staged_check = if deferred_pending_table_exists(client) {
+        "EXISTS (SELECT 1 FROM public.__reflex_deferred_pending \
+                 WHERE operation <> 'TRUNCATE' AND source_table = ANY($1))"
+    } else {
+        "FALSE"
+    };
+    let truncate_marks: Vec<String> = others
+        .iter()
+        .map(|d| crate::schema_builder::source_written_setting(d))
+        .collect();
+    client
+        .select(
+            &format!(
+                "SELECT {staged_check} \
+                     OR EXISTS (SELECT 1 FROM unnest($2::text[]) m \
+                                WHERE COALESCE(current_setting(m, true), '') <> '') AS written"
+            ),
+            Some(1),
+            &[
+                unsafe { DatumWithOid::new(others, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                unsafe {
+                    DatumWithOid::new(truncate_marks, PgBuiltInOids::TEXTARRAYOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("written").ok().flatten())
+        .unwrap_or(true)
+}
+
+fn deferred_pending_table_exists(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    client
+        .select(
+            "SELECT to_regclass('public.__reflex_deferred_pending') IS NOT NULL AS e",
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("e").ok().flatten())
+        .unwrap_or(true)
+}
+
 /// True when the pending partition change of `root` was queued by the running
 /// transaction and no flush attempted it: only then does the transaction-local
 /// record of writes cover every statement since the partitions changed.
@@ -4964,7 +5030,10 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill))
                     || (!actions.is_empty()
                         && (!partitions_changed_in_this_untouched_transaction
-                            || source_written_in_this_transaction(client, &source)));
+                            || source_written_in_this_transaction(client, &source)
+                            || another_source_written_in_this_transaction(
+                                client, imv, deps, &source,
+                            )));
 
                 let mut delta_stmts: Vec<String> = Vec::new();
                 if !force_reconcile {

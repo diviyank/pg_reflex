@@ -109,6 +109,9 @@ __attribute__((weak)) void *format_type_extended()                      { return
 __attribute__((weak)) int   IsBinaryCoercible()                         { return 0; }
 __attribute__((weak)) int   GetDatabaseEncoding(void)                   { return 0; }
 __attribute__((weak)) unsigned int GetCurrentTransactionIdIfAny(void)   { return 0; }
+__attribute__((weak)) unsigned int GetCurrentTransactionId(void)        { return 0; }
+__attribute__((weak)) long  GetCurrentTransactionStartTimestamp(void)   { return 0; }
+__attribute__((weak)) long  GetCurrentStatementStartTimestamp(void)     { return 0; }
 __attribute__((weak)) void  MemoryContextDelete(void *c)                {}
 __attribute__((weak)) void *MemoryContextGetParent(void *c)             { return NULL; }
 __attribute__((weak)) void *AllocSetContextCreateInternal()             { return NULL; }

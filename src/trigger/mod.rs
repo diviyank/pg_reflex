@@ -195,6 +195,9 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
+    if delta_sources::delta_would_count_twice(view_name, source_table) {
+        return recompute_sql(view_name, base_query, end_query, aggregations_json);
+    }
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -216,13 +219,7 @@ pub fn reflex_build_delta_sql(
     // (which is infallible). A malformed
     // value would mean catalog corruption, not user error; failing loudly
     // beats silently emitting empty SQL.
-    let json = aggregations_json.unwrap_or("{}");
-    let plan: AggregationPlan = serde_json::from_str(json).unwrap_or_else(|e| {
-        panic!(
-            "pg_reflex: __reflex_ivm_reference.aggregations for '{}' must be valid JSON (catalog invariant violated: {})",
-            view_name, e
-        )
-    });
+    let plan = registered_plan(view_name, aggregations_json);
 
     let intermediate_tbl = intermediate_table_name(view_name);
     // Use the transition table names directly (no temp table copy needed).
@@ -431,6 +428,35 @@ pub fn reflex_build_delta_sql(
     result
 }
 
+fn registered_plan(view_name: &str, aggregations_json: Option<&str>) -> AggregationPlan {
+    serde_json::from_str(aggregations_json.unwrap_or("{}")).unwrap_or_else(|e| {
+        panic!(
+            "pg_reflex: __reflex_ivm_reference.aggregations for '{}' must be valid JSON (catalog invariant violated: {})",
+            view_name, e
+        )
+    })
+}
+
+/// Recomputes `view_name` from its sources as they are now
+/// ([`delta_sources::delta_would_count_twice`]).
+fn recompute_sql(
+    view_name: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+) -> String {
+    let mut stmts: Vec<String> = Vec::new();
+    full_refresh_stmts(
+        view_name,
+        base_query,
+        end_query,
+        &intermediate_table_name(view_name),
+        &registered_plan(view_name, aggregations_json),
+        &mut stmts,
+    );
+    stmts.join("\n--<<REFLEX_SEP>>--\n")
+}
+
 /// Returns the rewritten scratch-fill SQL for an `INSERT_PROMOTED`
 /// bulk-INSERT: `base_query` with `source_table` rewritten to its
 /// `__reflex_new_*` transition table, identical to what the bulk-INSERT
@@ -493,6 +519,9 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
+    if delta_sources::delta_would_count_twice(view_name, source_table) {
+        return String::new();
+    }
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -727,6 +756,7 @@ pub fn reflex_execute_separated(sql: &str) {
 }
 
 pub(crate) mod deferred;
+pub(crate) mod delta_sources;
 mod dispatch;
 mod expression_subquery;
 mod merge;
