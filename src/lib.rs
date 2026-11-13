@@ -2013,6 +2013,7 @@ mod tests {
     include!("tests/pg_test_v1122_unread_column_check.rs");
     include!("tests/pg_test_node_fill.rs");
     include!("tests/pg_test_joint_delta.rs");
+    include!("tests/pg_test_two_source_statement.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
