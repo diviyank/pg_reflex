@@ -1715,9 +1715,11 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // net delta were applied independently: every per-source delta joins
         // against the OTHER sources' already-committed NEW state, so the cross
         // product is added once per mutated source instead of once total.
-        // IMMEDIATE mode is immune (per-statement triggers apply deltas
-        // sequentially, each seeing the correct intermediate state); the
-        // hazard is unique to the commit-time batch flush. Detect the batch
+        // (One source and an IMV over it, both read by an IMV, is exact through
+        // the deepest-first order of the per-source loops, here and in the
+        // IMMEDIATE statement triggers; two IMVs over the same source read by
+        // one IMV — a diamond — reach that IMV as two pending sources and are
+        // made correct only by this guard's rebuild.) Detect the batch
         // shape once here — the per-IMV loop lists any affected IMV for one
         // COMMIT-time full rebuild (`rebuild_listed`), and every delta staged for
         // it before that rebuild is skipped. 'TRUNCATE' rows are
