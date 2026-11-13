@@ -76,30 +76,61 @@ fn lo_await_lock_wait(query: &str) -> bool {
     .unwrap_or(false)
 }
 
+const LO_IGNORING_IMV_SQL: &str = "SELECT s.k, s.v FROM lo_src s JOIN lo_dim d ON d.k = s.k";
+
+/// One operator entry point under test: the call, the shape of the IMV it runs
+/// on, and the prefix of the result a healthy call returns.
+struct LoCase {
+    dbname: &'static str,
+    operator_call: &'static str,
+    with_dependent: bool,
+    ignores_dimension: bool,
+    expected_result: &'static str,
+}
+
+impl LoCase {
+    fn imv_sql(&self) -> &'static str {
+        if self.ignores_dimension {
+            LO_IGNORING_IMV_SQL
+        } else {
+            LO_IMV_SQL
+        }
+    }
+
+    fn create_imv(&self) {
+        worker_exec("CREATE TABLE lo_src (k INT PRIMARY KEY, v INT)");
+        worker_exec("INSERT INTO lo_src SELECT g, g FROM generate_series(1, 100) g");
+        if self.ignores_dimension {
+            worker_exec("CREATE TABLE lo_dim (k INT PRIMARY KEY)");
+            worker_exec("INSERT INTO lo_dim SELECT g FROM generate_series(1, 100) g");
+            let created = rbc_select(&format!(
+                "create_reflex_ivm('lo_v', {}, 'k', 'UNLOGGED', 'DEFERRED', '!lo_dim')",
+                sql_lit(self.imv_sql())
+            ));
+            assert!(!created.starts_with("ERROR"), "create lo_v: {created}");
+        } else {
+            rbc_create_deferred("lo_v", self.imv_sql(), "k");
+        }
+        if self.with_dependent {
+            rbc_create_deferred("lo_dependent", "SELECT k, v FROM lo_v", "k");
+        }
+    }
+}
+
 /// The worker holds IMV `lo_v`'s advisory lock in an open transaction while an
 /// operator call on a second connection queues behind it; the worker then writes
 /// the IMV's registry row, as a COMMIT-time flush does under that lock. The write
-/// must not wait on the queued operator. The IMV has a dependent so the rebuild
-/// takes the IMV's advisory lock (a dependent-less rebuild never does).
-fn lo_operator_waits_while_worker_writes_registry_row(
-    dbname: &str,
-    operator_call: &str,
-    with_dependent: bool,
-    expected_result: &str,
-) {
-    probe_db_open(dbname);
-    worker_exec("CREATE TABLE lo_src (k INT PRIMARY KEY, v INT)");
-    worker_exec("INSERT INTO lo_src SELECT g, g FROM generate_series(1, 100) g");
-    rbc_create_deferred("lo_v", LO_IMV_SQL, "k");
-    if with_dependent {
-        rbc_create_deferred("lo_dependent", "SELECT k, v FROM lo_v", "k");
-    }
-    lo_connect("lo_operator", dbname);
+/// must not wait on the queued operator. A rebuild only takes the IMV's own lock
+/// from its entry point, so cases cover IMVs with and without dependents.
+fn lo_operator_waits_while_worker_writes_registry_row(case: &LoCase) {
+    probe_db_open(case.dbname);
+    case.create_imv();
+    lo_connect("lo_operator", case.dbname);
 
     worker_exec("BEGIN");
     rbc_select("pg_advisory_xact_lock(hashtext('lo_v'), hashtext(reverse('lo_v')))");
-    lo_send("lo_operator", operator_call);
-    let operator_queued = lo_await_lock_wait(operator_call);
+    lo_send("lo_operator", case.operator_call);
+    let operator_queued = lo_await_lock_wait(case.operator_call);
     let registry_write = lo_worker_status(
         "SET lock_timeout = '2s'; \
          UPDATE public.__reflex_ivm_reference SET last_update_date = now() WHERE name = 'lo_v'",
@@ -113,90 +144,160 @@ fn lo_operator_waits_while_worker_writes_registry_row(
         "the lock holder could not write the IMV's registry row: the queued operator holds it"
     );
     assert!(
-        operator_result.starts_with(expected_result),
+        operator_result.starts_with(case.expected_result),
         "operator returned {operator_result}"
     );
-    assert_eq!(rbc_mismatch("lo_v", LO_IMV_SQL), 0);
-    if with_dependent {
+    assert_eq!(rbc_mismatch("lo_v", case.imv_sql()), 0);
+    if case.with_dependent {
         assert_eq!(rbc_mismatch("lo_dependent", LO_IMV_SQL), 0);
     }
     lo_disconnect("lo_operator");
-    probe_db_close(dbname);
+    probe_db_close(case.dbname);
 }
 
 #[pg_test]
 fn pg_lock_order_rebuild_imv_takes_lock_before_registry_row() {
-    lo_operator_waits_while_worker_writes_registry_row(
-        "reflex_lo_rebuild",
-        "SELECT reflex_rebuild_imv('lo_v')",
-        true,
-        "RECONCILED",
-    );
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_rebuild",
+        operator_call: "SELECT reflex_rebuild_imv('lo_v')",
+        with_dependent: true,
+        ignores_dimension: false,
+        expected_result: "RECONCILED",
+    });
 }
 
 /// The invariant holds regardless of dependents: the lock comes from
 /// `stamp_targeted_recovery`, not from the dependent-propagating rebuild.
 #[pg_test]
 fn pg_lock_order_rebuild_imv_without_dependents_takes_lock_before_registry_row() {
-    lo_operator_waits_while_worker_writes_registry_row(
-        "reflex_lo_nodep",
-        "SELECT reflex_rebuild_imv('lo_v')",
-        false,
-        "RECONCILED",
-    );
-}
-
-#[pg_test]
-fn pg_lock_order_setter_takes_lock_before_registry_row() {
-    lo_operator_waits_while_worker_writes_registry_row(
-        "reflex_lo_setter",
-        "SELECT reflex_set_wipe_floor_rows('lo_v', 100)",
-        false,
-        "OK",
-    );
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_nodep",
+        operator_call: "SELECT reflex_rebuild_imv('lo_v')",
+        with_dependent: false,
+        ignores_dimension: false,
+        expected_result: "RECONCILED",
+    });
 }
 
 #[pg_test]
 fn pg_lock_order_reconcile_takes_lock_before_registry_row() {
-    lo_operator_waits_while_worker_writes_registry_row(
-        "reflex_lo_reconcile",
-        "SELECT reflex_reconcile('lo_v')",
-        true,
-        "RECONCILED",
-    );
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_reconcile",
+        operator_call: "SELECT reflex_reconcile('lo_v')",
+        with_dependent: true,
+        ignores_dimension: false,
+        expected_result: "RECONCILED",
+    });
 }
 
-/// Chain `lo_u` -> `lo_w`, both DEFERRED; two operators rebuild one node each
-/// while a writer commits a change to both nodes' sources. No session may be a
-/// deadlock victim and both IMVs must end correct.
 #[pg_test]
-fn pg_lock_order_two_operators_and_writer_no_deadlock() {
+fn pg_lock_order_reconcile_two_arg_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_reconcile2",
+        operator_call: "SELECT reflex_reconcile('lo_v', TRUE)",
+        with_dependent: true,
+        ignores_dimension: false,
+        expected_result: "RECONCILED",
+    });
+}
+
+#[pg_test]
+fn pg_lock_order_set_wipe_floor_rows_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_floor",
+        operator_call: "SELECT reflex_set_wipe_floor_rows('lo_v', 100)",
+        with_dependent: false,
+        ignores_dimension: false,
+        expected_result: "OK",
+    });
+}
+
+#[pg_test]
+fn pg_lock_order_set_wipe_threshold_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_threshold",
+        operator_call: "SELECT reflex_set_wipe_threshold('lo_v', 0.5)",
+        with_dependent: false,
+        ignores_dimension: false,
+        expected_result: "OK",
+    });
+}
+
+#[pg_test]
+fn pg_lock_order_set_partition_dispatch_cost_cap_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_costcap",
+        operator_call: "SELECT reflex_set_partition_dispatch_cost_cap('lo_v', 1000)",
+        with_dependent: false,
+        ignores_dimension: false,
+        expected_result: "OK",
+    });
+}
+
+#[pg_test]
+fn pg_lock_order_ack_ignore_source_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_ack",
+        operator_call: "SELECT reflex_ack_ignore_source('lo_v', 'lo_dim')",
+        with_dependent: false,
+        ignores_dimension: true,
+        expected_result: "ACKNOWLEDGED",
+    });
+}
+
+#[pg_test]
+fn pg_lock_order_rebuild_imv_metadata_takes_lock_before_registry_row() {
+    lo_operator_waits_while_worker_writes_registry_row(&LoCase {
+        dbname: "reflex_lo_metadata",
+        operator_call: "SELECT reflex_rebuild_imv_metadata('lo_v')",
+        with_dependent: false,
+        ignores_dimension: false,
+        expected_result: "pg_reflex: rebuilt metadata",
+    });
+}
+
+/// Chain `lo_u` -> `lo_w`. The worker holds both locks upstream first, the order
+/// the flush takes them, while one operator per node queues behind it. Once both
+/// are provably queued the worker writes both registry rows; neither write may
+/// wait on a queued operator. Both operators then finish without a deadlock and
+/// both IMVs are correct.
+#[pg_test]
+fn pg_lock_order_chain_operators_queue_behind_flush_in_graph_order() {
     const DBNAME: &str = "reflex_lo_chain";
     const W_SQL: &str = "SELECT u.k, u.v + b.w AS s FROM lo_u u JOIN lo_b b ON b.k = u.k";
     const W_FRESH: &str = "SELECT u.k, u.v + b.w FROM lo_src u JOIN lo_b b ON b.k = u.k";
+    const OPERATOR_U: &str = "SELECT reflex_rebuild_imv('lo_u')";
+    const OPERATOR_W: &str = "SELECT reflex_rebuild_imv('lo_w')";
     probe_db_open(DBNAME);
     worker_exec("CREATE TABLE lo_src (k INT PRIMARY KEY, v INT)");
     worker_exec("CREATE TABLE lo_b (k INT PRIMARY KEY, w INT)");
-    worker_exec("INSERT INTO lo_src SELECT g, g FROM generate_series(1, 20000) g");
-    worker_exec("INSERT INTO lo_b SELECT g, 2 * g FROM generate_series(1, 20000) g");
+    worker_exec("INSERT INTO lo_src SELECT g, g FROM generate_series(1, 100) g");
+    worker_exec("INSERT INTO lo_b SELECT g, 2 * g FROM generate_series(1, 100) g");
     rbc_create_deferred("lo_u", "SELECT k, v FROM lo_src", "k");
     rbc_create_deferred("lo_w", W_SQL, "k");
     lo_connect("lo_operator_u", DBNAME);
     lo_connect("lo_operator_w", DBNAME);
 
-    lo_send("lo_operator_u", "SELECT reflex_rebuild_imv('lo_u')");
-    lo_send("lo_operator_w", "SELECT reflex_rebuild_imv('lo_w')");
-    let writer = lo_worker_status(
-        "BEGIN; \
-         INSERT INTO lo_src VALUES (900001, 1); \
-         INSERT INTO lo_b VALUES (900001, 1); \
-         UPDATE lo_src SET v = v + 1 WHERE k <= 50; \
-         COMMIT",
+    worker_exec("BEGIN");
+    rbc_select("pg_advisory_xact_lock(hashtext('lo_u'), hashtext(reverse('lo_u')))");
+    rbc_select("pg_advisory_xact_lock(hashtext('lo_w'), hashtext(reverse('lo_w')))");
+    lo_send("lo_operator_u", OPERATOR_U);
+    lo_send("lo_operator_w", OPERATOR_W);
+    let both_queued = lo_await_lock_wait(OPERATOR_U) && lo_await_lock_wait(OPERATOR_W);
+    let registry_writes = lo_worker_status(
+        "SET lock_timeout = '2s'; \
+         UPDATE public.__reflex_ivm_reference SET last_update_date = now() \
+          WHERE name IN ('lo_u', 'lo_w')",
     );
+    worker_exec("COMMIT");
     let result_u = lo_result("lo_operator_u");
     let result_w = lo_result("lo_operator_w");
 
-    assert_eq!(writer, "COMMIT", "writer transaction failed");
+    assert!(both_queued, "both operators were not observed blocked");
+    assert_eq!(
+        registry_writes, "UPDATE 2",
+        "the flush-order lock holder could not write the chain's registry rows"
+    );
     assert_eq!(result_u, "RECONCILED", "operator on lo_u: {result_u}");
     assert_eq!(result_w, "RECONCILED", "operator on lo_w: {result_w}");
     assert_eq!(rbc_mismatch("lo_u", "SELECT k, v FROM lo_src"), 0);
