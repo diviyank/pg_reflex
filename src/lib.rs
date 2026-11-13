@@ -2012,6 +2012,7 @@ mod tests {
     include!("tests/pg_test_v1122_guc_empty_cast.rs");
     include!("tests/pg_test_v1122_unread_column_check.rs");
     include!("tests/pg_test_node_fill.rs");
+    include!("tests/pg_test_partitioned_reconcile_dependents.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
