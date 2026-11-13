@@ -1341,6 +1341,11 @@ fn flush_staged_deltas(source_table: &str) -> String {
     // source in `ignore_sources` are excluded — the array-overlap check matches
     // both the qualified ($1) and bare ($2) forms, mirroring the trigger-body
     // runtime skip so the ignore contract holds on the deferred path too.
+    //
+    // Deepest first: an IMV V that reads this source and a DEFERRED IMV U over it
+    // must apply this delta against U's state before U absorbs it. U then stages
+    // its own delta, which V receives from U's flush against this source's new
+    // state: ΔX ⋈ U_old + X_new ⋈ ΔU, the joint term counted once.
     let bare_source = source_table
         .split('.')
         .next_back()
@@ -1364,7 +1369,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
                    AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
                    AND NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) && ARRAY[$1, $2]::TEXT[]) \
-                 ORDER BY graph_depth, name",
+                 ORDER BY graph_depth DESC, name",
                 None,
                 &args,
             )
