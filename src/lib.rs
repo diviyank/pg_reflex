@@ -1205,6 +1205,7 @@ extension_sql!(
     DECLARE
         _obj RECORD;
         _imv RECORD;
+        _stale_root TEXT;
     BEGIN
         FOR _obj IN
             SELECT objid, object_identity, schema_name, object_name,
@@ -1217,36 +1218,45 @@ extension_sql!(
             -- queued for the COMMIT-time partition flush, which classifies the
             -- vanished child as a detach. Never queued for a root that is an IMV
             -- (pg_reflex's own swap drops IMV partitions; the cascade is
-            -- code-driven) nor for a root dropped in the same statement (the
-            -- source branch below tears its IMVs down).
-            -- INSERT ... SELECT checks the privilege on the queue even when it
-            -- selects no row, so a role without access to the queue and the
-            -- snapshot (a plain table owner dropping any table) must not reach it.
-            IF has_table_privilege('public.__reflex_partition_pending', 'INSERT, UPDATE')
-               AND has_table_privilege('public.__reflex_source_partition_snapshot', 'SELECT') THEN
-                INSERT INTO public.__reflex_partition_pending (source_root)
-                SELECT DISTINCT s.source_root
-                FROM public.__reflex_source_partition_snapshot s
-                WHERE s.child_oid = _obj.objid::bigint
-                  AND s.source_root NOT LIKE '%\_\_reflex\_%'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM pg_event_trigger_dropped_objects() d
-                      WHERE d.object_type = 'table'
-                        AND d.schema_name || '.' || d.object_name = s.source_root)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM public.__reflex_ivm_reference r
-                      WHERE public.__reflex_named_relation(
-                                CASE WHEN r.target_schema IS NOT NULL AND r.name NOT LIKE '%.%'
-                                     THEN quote_ident(r.target_schema) || '.' || r.name
-                                     ELSE r.name END)
-                            = public.__reflex_named_relation(s.source_root))
-                  AND EXISTS (
-                      SELECT 1 FROM public.__reflex_ivm_reference r
-                      WHERE r.enabled
-                        AND public.__reflex_reads_relation(r.depends_on, s.source_root))
-                ON CONFLICT (source_root)
-                DO UPDATE SET enqueued_at = statement_timestamp(),
-                              attempts    = public.__reflex_partition_pending.attempts + 1;
+            -- code-driven). A root dropped in the same statement is reported
+            -- before its partitions, so its IMVs are already torn down by the
+            -- source branch below and no enabled reader is left to match.
+            -- A role that cannot read the snapshot cannot tell a tracked partition
+            -- from any other table, so it is skipped: reading it would raise on
+            -- every unrelated DROP. A role that finds a tracked partition but
+            -- cannot write the queue (INSERT .. ON CONFLICT DO UPDATE needs
+            -- SELECT, INSERT and UPDATE on it) is told loudly instead.
+            IF has_table_privilege('public.__reflex_source_partition_snapshot', 'SELECT') THEN
+                FOR _stale_root IN
+                    SELECT DISTINCT s.source_root
+                    FROM public.__reflex_source_partition_snapshot s
+                    WHERE s.child_oid = _obj.objid::bigint
+                      AND s.source_root NOT LIKE '%\_\_reflex\_%'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM public.__reflex_ivm_reference r
+                          WHERE public.__reflex_named_relation(
+                                    CASE WHEN r.target_schema IS NOT NULL AND r.name NOT LIKE '%.%'
+                                         THEN quote_ident(r.target_schema) || '.' || r.name
+                                         ELSE r.name END)
+                                = public.__reflex_named_relation(s.source_root))
+                      AND EXISTS (
+                          SELECT 1 FROM public.__reflex_ivm_reference r
+                          WHERE r.enabled
+                            AND public.__reflex_reads_relation(r.depends_on, s.source_root))
+                LOOP
+                    IF has_table_privilege('public.__reflex_partition_pending', 'SELECT')
+                       AND has_table_privilege('public.__reflex_partition_pending', 'INSERT')
+                       AND has_table_privilege('public.__reflex_partition_pending', 'UPDATE') THEN
+                        INSERT INTO public.__reflex_partition_pending (source_root)
+                        VALUES (_stale_root)
+                        ON CONFLICT (source_root)
+                        DO UPDATE SET enqueued_at = statement_timestamp(),
+                                      attempts    = public.__reflex_partition_pending.attempts + 1;
+                    ELSE
+                        RAISE WARNING 'pg_reflex: dropped partition % of source %, but this role cannot write the partition queue; the IMVs over it are stale — run SELECT reflex_flush_partition_source(''%'') as a role that can',
+                            _obj.object_identity, _stale_root, _stale_root;
+                    END IF;
+                END LOOP;
             END IF;
 
             -- A source is registered without a schema only when it is a table of
