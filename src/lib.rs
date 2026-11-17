@@ -2016,6 +2016,7 @@ mod tests {
     include!("tests/pg_test_two_source_statement.rs");
     include!("tests/pg_test_two_source_counters.rs");
     include!("tests/pg_test_two_source_exact.rs");
+    include!("tests/pg_test_two_source_stash.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
