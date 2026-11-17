@@ -2033,7 +2033,10 @@ pub mod pg_test {
         // transaction end. Raise the per-transaction lock budget so larger ad-hoc
         // runs (PG_REFLEX_FUZZ_CASES up to a few hundred) don't hit "out of shared
         // memory". Very large runs still need batching.
-        vec!["max_locks_per_transaction = 4096"]
+        vec![
+            "max_locks_per_transaction = 4096",
+            "max_prepared_transactions = 4",
+        ]
     }
 }
 

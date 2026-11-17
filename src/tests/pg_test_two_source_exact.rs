@@ -305,6 +305,10 @@ fn pg_two_source_exact_randomised() {
             format!("{write} RETURNING 1")
         }
     };
+    let mut corrected: Vec<(&str, i64)> = ["tsx_r_sum", "tsx_r_avg", "tsx_r_tot", "tsx_r_pt", "tsx_f_sum"]
+        .into_iter()
+        .map(|imv| (imv, 0))
+        .collect();
     for iteration in 0..90 {
         let statement = match next(6) {
             0 | 1 => format!(
@@ -326,10 +330,26 @@ fn pg_two_source_exact_randomised() {
             4 => ra_write(&mut next),
             _ => rb_write(&mut next),
         };
+        worker_exec("BEGIN");
         worker_exec(&statement);
+        for (imv, total) in corrected.iter_mut() {
+            *total += tsx_corrected(imv);
+        }
+        worker_exec("COMMIT");
         tsx_assert_correct(&imvs, &format!("after statement {iteration} <{statement}>"));
     }
+    for (imv, total) in corrected {
+        assert!(total > 0, "{imv}: no delta of the run was corrected, every one recomputed");
+    }
     probe_db_close(DBNAME);
+}
+
+/// The deltas of `imv` corrected in the running transaction of the worker.
+fn tsx_corrected(imv: &str) -> i64 {
+    worker_scalar_i64(&format!(
+        "SELECT COALESCE(NULLIF(current_setting('{}', true), ''), '0')::int8",
+        crate::trigger::joint::corrections_setting(imv)
+    ))
 }
 
 /// False positive (a): a user DEFERRED constraint event stays queued on rb while
@@ -598,4 +618,189 @@ fn pg_two_source_exact_role_without_temp_recomputes() {
     tsx_assert_correct(&TSX_R_OTHERS, "after the writes of the role without TEMP");
     probe_db_close(DBNAME);
     admin_exec(&format!("DROP ROLE IF EXISTS {ROLE}"));
+}
+
+const TSX_BR_SUM: &str = "SELECT xa.g, COUNT(*) AS n, SUM(xa.a) AS sa, SUM(sb.b) AS sbb \
+     FROM xa JOIN sb ON sb.k = xa.k GROUP BY xa.g";
+const TSX_BR_TOT: &str = "SELECT COUNT(*) AS n, SUM(xa.a + sb.b) AS s FROM xa JOIN sb ON sb.k = xa.k";
+const TSX_BR_PT: &str = "SELECT sb.id, xa.g, xa.a, sb.b FROM xa JOIN sb ON sb.k = xa.k";
+const TSX_BR_IMVS: [(&str, &str); 3] = [
+    ("tsx_br_sum", TSX_BR_SUM),
+    ("tsx_br_tot", TSX_BR_TOT),
+    ("tsx_br_pt", TSX_BR_PT),
+];
+
+/// A BEFORE ROW trigger on sb writes xa: each of its UPDATEs of xa applies xa's
+/// delta while the rows sb inserted before it are visible but sb's delta is not
+/// queued yet. `foreign_key` adds sb's RI trigger, whose queued event on sb
+/// hides that sb holds unapplied writes.
+fn tsx_before_row_trigger_case(dbname: &str, foreign_key: bool) {
+    probe_db_open(dbname);
+    let reference = if foreign_key { "REFERENCES xa" } else { "" };
+    for statement in [
+        "CREATE TABLE xa (k INT PRIMARY KEY, g INT NOT NULL, a INT NOT NULL)".to_string(),
+        format!("CREATE TABLE sb (id INT PRIMARY KEY, k INT NOT NULL {reference}, b INT NOT NULL)"),
+        "INSERT INTO xa SELECT g, g % 10, g FROM generate_series(1, 100) g".to_string(),
+        "INSERT INTO sb SELECT g, (g % 100) + 1, g FROM generate_series(1, 200) g".to_string(),
+        "CREATE FUNCTION tsx_bump() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN UPDATE xa SET a = a + 1 WHERE k = NEW.k; RETURN NEW; END $$"
+            .to_string(),
+        "CREATE TRIGGER tsx_bump BEFORE INSERT OR UPDATE ON sb \
+         FOR EACH ROW EXECUTE FUNCTION tsx_bump()"
+            .to_string(),
+    ] {
+        worker_exec(&statement);
+    }
+    for (imv, sql) in TSX_BR_IMVS {
+        let key = (imv == "tsx_br_pt").then_some("id");
+        ts_create(imv, sql, key, "IMMEDIATE");
+    }
+    for statement in [
+        "INSERT INTO sb VALUES (1001, 7, 1), (1002, 7, 1), (1003, 7, 1)",
+        "INSERT INTO sb VALUES (1004, 8, 1), (1005, 9, 1)",
+        "INSERT INTO sb VALUES (1006, 10, 1)",
+        "UPDATE sb SET b = b + 1 WHERE k = 11",
+        "UPDATE sb SET k = 12 WHERE id IN (1001, 1002)",
+    ] {
+        tsx_step(&[], &TSX_BR_IMVS, statement, 0);
+    }
+    probe_db_close(dbname);
+}
+
+#[pg_test]
+fn pg_two_source_exact_before_row_trigger_writing_other_source() {
+    tsx_before_row_trigger_case("reflex_tsx_br", false);
+}
+
+#[pg_test]
+fn pg_two_source_exact_before_row_trigger_writing_other_source_with_fk() {
+    tsx_before_row_trigger_case("reflex_tsx_br_fk", true);
+}
+
+/// Writes to sc whose delta every IMV skips (an UPDATE of a column no IMV reads,
+/// a source the IMV ignores) leave no unapplied writes behind: the later writes
+/// of xa and sc in the same transaction stay deltas of the group they write.
+#[pg_test]
+fn pg_two_source_exact_skipped_delta_leaves_later_writes_incremental() {
+    const DBNAME: &str = "reflex_tsx_skip";
+    const SUM: &str = "SELECT xa.g, COUNT(*) AS n, SUM(sc.b) AS s, SUM(xa.a) AS sa \
+         FROM xa JOIN sc ON sc.k = xa.k GROUP BY xa.g";
+    const IGNORING: &str = "SELECT xa.g, COUNT(*) AS n, SUM(sc.b) AS s, SUM(xa.a) AS sa \
+         FROM xa JOIN sc ON sc.k = xa.k GROUP BY xa.g";
+    probe_db_open(DBNAME);
+    for statement in [
+        "CREATE TABLE xa (k INT PRIMARY KEY, g INT NOT NULL, a INT NOT NULL)",
+        "CREATE TABLE sc (k INT PRIMARY KEY, b INT NOT NULL, note TEXT)",
+        "INSERT INTO xa SELECT g, g % 10, g FROM generate_series(1, 200) g",
+        "INSERT INTO sc SELECT g, g * 2, NULL FROM generate_series(1, 150) g",
+    ] {
+        worker_exec(statement);
+    }
+    ts_create("tsx_sk_sum", SUM, None, "IMMEDIATE");
+    let ignoring = rbc_select(&format!(
+        "create_reflex_ivm('tsx_sk_ign', {}, NULL, NULL, 'IMMEDIATE', '!sc')",
+        sql_lit(IGNORING)
+    ));
+    assert!(!ignoring.starts_with("ERROR"), "create tsx_sk_ign: {ignoring}");
+    let sc = worker_scalar_i64("SELECT 'sc'::regclass::oid::int8");
+    let stash_of_sc = crate::trigger::joint::stash_setting(
+        "tsx_sk_ign",
+        pg_sys::Oid::from(u32::try_from(sc).expect("oid")),
+    );
+    let xmins = ts_intermediate_xmins("tsx_sk_sum");
+    worker_exec("BEGIN");
+    for statement in [
+        "UPDATE sc SET note = 'skipped' WHERE k IN (5, 6)",
+        "UPDATE sc SET b = b + 1 WHERE k = 1",
+        "UPDATE xa SET a = a + 1 WHERE k = 11",
+        "UPDATE sc SET b = b + 1 WHERE k = 21",
+    ] {
+        worker_exec(statement);
+        tsx_assert_correct(&[("tsx_sk_sum", SUM)], &format!("after <{statement}>"));
+    }
+    let stash_in_worker = worker_scalar_i64(&format!(
+        "SELECT length(COALESCE(current_setting('{stash_of_sc}', true), ''))::int8"
+    ));
+    worker_exec("COMMIT");
+    tsx_assert_correct(&[("tsx_sk_sum", SUM)], "after COMMIT");
+    assert_eq!(
+        ts_rewritten_intermediate_rows("tsx_sk_sum", &xmins),
+        1,
+        "tsx_sk_sum: writes of group 1 after skipped deltas must stay a delta of group 1"
+    );
+    assert_eq!(
+        stash_in_worker, 0,
+        "tsx_sk_ign ignores sc: xa's delta must not stash rows for sc"
+    );
+    probe_db_close(DBNAME);
+}
+
+/// 2000 statements writing both sources in one transaction keep the IMVs exact
+/// and take no lock per statement: the lock count stays within the default
+/// max_locks_per_transaction budget.
+#[pg_test]
+fn pg_two_source_exact_many_corrected_statements_hold_few_locks() {
+    const DBNAME: &str = "reflex_tsx_locks";
+    let corrected_loop = |from: i32, to: i32| {
+        format!(
+            "DO $$ BEGIN FOR i IN {from}..{to} LOOP \
+               WITH x AS (INSERT INTO ra VALUES (10000 + i, i % 10, i) RETURNING 1) \
+               INSERT INTO rb VALUES (10000 + i, i); \
+               WITH x AS (UPDATE ra SET a = a + 1 WHERE k = 10000 + i RETURNING 1) \
+               UPDATE rb SET b = b + 1 WHERE k = 10000 + i; \
+             END LOOP; END $$"
+        )
+    };
+    let own_locks = "SELECT count(*)::int8 FROM pg_locks WHERE pid = pg_backend_pid()";
+    tsx_pair_open(DBNAME);
+    worker_exec("BEGIN");
+    worker_exec(&corrected_loop(1, 5));
+    let locks_after_few = worker_scalar_i64(own_locks);
+    worker_exec(&corrected_loop(6, 1000));
+    let locks_after_many = worker_scalar_i64(own_locks);
+    tsx_assert_correct(&TSX_R_GROUPED, "after 2000 statements writing both sources");
+    tsx_assert_correct(&TSX_R_OTHERS, "after 2000 statements writing both sources");
+    worker_exec("COMMIT");
+    tsx_assert_correct(&TSX_R_GROUPED, "after COMMIT");
+    tsx_assert_correct(&TSX_R_OTHERS, "after COMMIT");
+    assert!(
+        locks_after_many <= locks_after_few + 4,
+        "2000 statements hold {locks_after_many} locks, after the first 10 they held {locks_after_few}"
+    );
+    probe_db_close(DBNAME);
+}
+
+/// A transaction writing both sources in one statement can be prepared and
+/// committed as a two-phase transaction.
+#[pg_test]
+fn pg_two_source_exact_prepared_transaction() {
+    const DBNAME: &str = "reflex_tsx_2pc";
+    tsx_pair_open(DBNAME);
+    let try_exec = |statement: &str| -> String {
+        Spi::get_one::<String>(&format!(
+            "SELECT CASE WHEN dblink_exec('reflex_lock_worker', {}, false) = 'ERROR' \
+                    THEN dblink_error_message('reflex_lock_worker') ELSE 'OK' END",
+            sql_lit(statement)
+        ))
+        .expect("dblink")
+        .unwrap_or_default()
+    };
+    worker_exec("BEGIN");
+    worker_exec(
+        "WITH x AS (INSERT INTO ra VALUES (1001, 1, 5) RETURNING 1) INSERT INTO rb VALUES (1001, 7)",
+    );
+    worker_exec(
+        "WITH x AS (UPDATE ra SET a = a + 10 WHERE k = 11 RETURNING 1) \
+         UPDATE rb SET b = b + 1 WHERE k = 11",
+    );
+    let prepared = try_exec("PREPARE TRANSACTION 'tsx_2pc'");
+    if prepared != "OK" {
+        try_exec("ROLLBACK");
+    }
+    let committed = try_exec("COMMIT PREPARED 'tsx_2pc'");
+    assert_eq!(prepared, "OK", "PREPARE TRANSACTION after writes of both sources");
+    assert_eq!(committed, "OK", "COMMIT PREPARED");
+    tsx_assert_correct(&TSX_R_GROUPED, "after COMMIT PREPARED");
+    tsx_assert_correct(&TSX_R_OTHERS, "after COMMIT PREPARED");
+    probe_db_close(DBNAME);
 }
