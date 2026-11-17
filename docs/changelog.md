@@ -4,6 +4,22 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.12.5] — 2026-11-17
+
+A correctness release: an operator call (`reflex_rebuild_imv`, `reflex_reconcile`, the `reflex_set_*` setters) could deadlock with a COMMIT flush; a join IMV double counted ΔA ⋈ ΔB when two of its sources changed together (one statement, an FK cascade, or an IMV over one of its own sources); a DROP TABLE of a filled source partition left its rows in the IMVs. The update adds six functions, replaces the `sql_drop` event trigger and rewrites every source's trigger bodies in place. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.5';`
+
+**Fixed**
+
+- Every operator entry point that writes an IMV's registry row takes the IMV's advisory lock first, so it waits for a running flush instead of deadlocking it (40P01).
+- Within one source's delta, IMVs are maintained readers first (`graph_depth DESC`), so an IMV joining a source and an IMV over that source counts the joint delta once; exact, no recompute.
+- Two sources of a join IMV written in one statement (writable CTE, MERGE, upsert, a trigger, an FK cascade, `SET CONSTRAINTS ALL IMMEDIATE`): an IMMEDIATE SUM / COUNT / AVG or passthrough IMV over inner equi-joins is corrected exactly; other shapes are recomputed at the second delta; DEFERRED IMVs are rebuilt at COMMIT as before.
+- A partition attach or detach plus a write to another source of the same IMV in one transaction reconciles the IMV at the partition flush instead of applying the partition delta twice.
+- `DROP TABLE` of a source partition that holds rows queues the partition's root for the COMMIT flush, which removes the dropped rows from every IMV over the source and its dependents.
+
+**Migration**
+
+- [`sql/pg_reflex--1.12.4--1.12.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.12.4--1.12.5.sql) creates six functions, replaces `__reflex_on_sql_drop()` and regenerates the trigger bodies by rewriting each source's delta trigger functions in place into the 1.12.5 rendering (INFO with the count; a WARNING lists any body it could not match, with its remedy). Run it before creating IMVs with the new library. Recommended, not required: `reflex_reconcile` each join IMV whose sources may have been written together in one statement or through an `ON DELETE CASCADE` foreign key, or that reads both a source and an IMMEDIATE IMV over it.
+
 ## [1.12.4] — 2026-11-06
 
 A bug-fix release: an aggregate IMV LEFT JOINing a secondary on an aliased GROUP BY column (`t.to_location_id AS location_id`) failed every secondary-triggered flush with `column "to_location_id" does not exist`, silently marked known_stale under DEFERRED. No SQL changes. `ALTER EXTENSION pg_reflex UPDATE TO '1.12.4';`
