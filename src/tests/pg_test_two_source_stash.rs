@@ -258,3 +258,36 @@ fn pg_two_source_stash_imv_created_after_its_sources_were_written() {
     );
     probe_db_close(DBNAME);
 }
+
+/// The library can run before ALTER EXTENSION UPDATE has re-rendered the
+/// trigger bodies and created the functions that keep rows exactly. Such a body
+/// calls `reflex_build_delta_sql`, which never resolves a stash: its deltas
+/// keep no rows, call none of those functions, and recompute.
+#[pg_test]
+fn pg_two_source_stash_trigger_body_older_than_the_library_keeps_no_rows() {
+    const DBNAME: &str = "reflex_tss_older_body";
+    tss_keyed_open(DBNAME, "INT", "", &["1", "2"], &[]);
+    worker_exec(
+        "DO $$ DECLARE body TEXT; BEGIN \
+           FOR body IN SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
+                       WHERE p.prosrc LIKE '%reflex_build_delta_sql_resolving(%' LOOP \
+             EXECUTE replace(body, 'reflex_build_delta_sql_resolving(', 'reflex_build_delta_sql('); \
+           END LOOP; END $$",
+    );
+    assert_eq!(
+        worker_scalar_i64(
+            "SELECT count(*)::int8 FROM pg_proc WHERE prosrc LIKE '%reflex_build_delta_sql_resolving(%'"
+        ),
+        0,
+        "every trigger body calls the older entry point"
+    );
+    worker_exec("ALTER EXTENSION pg_reflex DROP FUNCTION public.reflex_joint_stash_text(anyarray)");
+    worker_exec(
+        "ALTER EXTENSION pg_reflex DROP FUNCTION public.reflex_joint_stashed_rows(text, anyarray)",
+    );
+    worker_exec("DROP FUNCTION public.reflex_joint_stash_text(anyarray)");
+    worker_exec("DROP FUNCTION public.reflex_joint_stashed_rows(text, anyarray)");
+    let (_, last) = tss_keyed_joint_writes("2");
+    assert_eq!(last, 0, "a body that resolves no stash corrects no delta");
+    probe_db_close(DBNAME);
+}
