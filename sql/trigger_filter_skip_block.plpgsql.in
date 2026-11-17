@@ -27,5 +27,5 @@ SELECT string_agg(
              _skip_cols, '__REFLEX_SLOT_REF_NEW__', _skip_pred_clause
            );
            EXECUTE _skip_sql INTO _filter_skip;
-           IF _filter_skip THEN __REFLEX_SLOT_SKIPPED__ CONTINUE; END IF;
+           IF _filter_skip AND __REFLEX_SLOT_MAY_SKIP__ THEN __REFLEX_SLOT_SKIPPED__ CONTINUE; END IF;
          END IF;

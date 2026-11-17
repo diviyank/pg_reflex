@@ -245,6 +245,17 @@ pub fn reflex_joint_resolved_delta_sql(
     joint::resolved_delta_sql(view_name, source_table, operation, counted, group_missing)
 }
 
+/// Whether the statement trigger of `source_table` may skip its delta for the
+/// IMV: not when a delta of another source was applied over its writes.
+#[pg_extern]
+pub fn reflex_joint_delta_may_be_skipped(
+    view_name: &str,
+    source_table: &str,
+    base_query: &str,
+) -> bool {
+    joint::delta_may_be_skipped(view_name, source_table, base_query)
+}
+
 /// The bookkeeping of a delta the statement trigger skips, over the rows of
 /// `transition_table`.
 #[pg_extern]

@@ -19,7 +19,10 @@
 //!
 //! `applied`, the stash and its rows live in transaction-local settings, so a
 //! rolled back subtransaction rolls them back with V's own rows, and the
-//! correction creates no relation.
+//! correction creates no relation. The rows are kept as text, written and read
+//! back under pinned settings (`reflex_joint_stash_text`,
+//! `reflex_joint_stashed_rows`) and only for column types whose text is then
+//! exact ([`EXACT_TEXT_TYPES`]).
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -52,6 +55,35 @@ const STASH_ROW_LIMIT: i64 = 10_000;
 
 const SEPARATOR: &str = "\n--<<REFLEX_SEP>>--\n";
 const POISONED: &str = "poison";
+
+/// The built-in types (and the arrays of them) whose text output, read back,
+/// gives the value written, under the settings `reflex_joint_stash_text` and
+/// `reflex_joint_stashed_rows` pin and whatever else the session sets. A source
+/// holding a column of any other type (money reads `lc_monetary`, the reg*
+/// types `search_path`, a user type anything) keeps no stash: its IMVs are
+/// recomputed.
+const EXACT_TEXT_TYPES: [&str; 20] = [
+    "bool",
+    "int2",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+    "numeric",
+    "text",
+    "varchar",
+    "bpchar",
+    "uuid",
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "bytea",
+    "json",
+    "jsonb",
+];
 
 static PARTITION_DELTAS_RUNNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -167,7 +199,7 @@ pub(crate) fn corrections_setting(view_name: &str) -> String {
 }
 
 /// One side (`new` or `old`) of the transition rows of `by` stashed for
-/// `pending`: kept as the text of an array of `by`'s row type in a
+/// `pending`: kept as the exact text of an array of `by`'s row type in a
 /// transaction-local setting, read back under `name`.
 struct StashedSide {
     name: String,
@@ -222,6 +254,10 @@ fn set_setting_sql(name: &str, value: &str) -> String {
 
 /// Leaves no stash for `pending`: `meta` is the stash setting's new value.
 fn replace_stash_sql(view_name: &str, pending: pg_sys::Oid, meta: &str) -> String {
+    format!("SELECT {}", replace_stash_sets(view_name, pending, meta).join(", "))
+}
+
+fn replace_stash_sets(view_name: &str, pending: pg_sys::Oid, meta: &str) -> Vec<String> {
     let mut sets = vec![format!(
         "set_config('{}', '{meta}', true)",
         stash_setting(view_name, pending)
@@ -234,7 +270,7 @@ fn replace_stash_sql(view_name: &str, pending: pg_sys::Oid, meta: &str) -> Strin
             ));
         }
     }
-    format!("SELECT {}", sets.join(", "))
+    sets
 }
 
 fn literal(value: &str) -> String {
@@ -333,12 +369,28 @@ fn applies_linear_delta(imv: &Imv, plan: &AggregationPlan, source: &str, operati
 }
 
 /// The schema-qualified row type of `relation`, which its stashed rows are
-/// read back as.
-fn row_type(relation: pg_sys::Oid) -> Option<String> {
+/// read back as. `None` when a column's text is not known to be exact
+/// ([`EXACT_TEXT_TYPES`]): its rows are not stashed.
+fn exact_text_row_type(relation: pg_sys::Oid) -> Option<String> {
+    let exact_types = EXACT_TEXT_TYPES
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("'pg_catalog.{name}'"),
+                format!("'pg_catalog._{name}'"),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     Spi::get_one_with_args::<String>(
-        "SELECT format('%I.%I', n.nspname, t.typname) FROM pg_class c \
-         JOIN pg_type t ON t.oid = c.reltype JOIN pg_namespace n ON n.oid = t.typnamespace \
-         WHERE c.oid = $1",
+        &format!(
+            "SELECT format('%I.%I', n.nspname, t.typname) FROM pg_class c \
+             JOIN pg_type t ON t.oid = c.reltype JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE c.oid = $1 AND NOT EXISTS (\
+               SELECT 1 FROM pg_attribute a \
+               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 AND a.atttypid <> ALL (ARRAY[{exact_types}]::regtype[]::oid[]))"
+        ),
         &[unsafe {
             pgrx::datum::DatumWithOid::new(relation, pg_sys::PgBuiltInOids::OIDOID.oid().value())
         }],
@@ -446,6 +498,14 @@ fn recompute(imv: &Imv) -> String {
         imv.end_query,
         imv.aggregations,
     )];
+    stmts.extend(every_write_applied(imv));
+    stmts.join(SEPARATOR)
+}
+
+/// Records every write of every source as applied and drops their stashes: the
+/// IMV was just read from its sources as they are now.
+fn every_write_applied(imv: &Imv) -> Vec<String> {
+    let mut stmts = Vec::new();
     for (_, relation) in &imv.sources {
         let writes = delta_sources::source_writes(relation)
             .map(|w| w.to_string())
@@ -456,7 +516,36 @@ fn recompute(imv: &Imv) -> String {
         ));
         stmts.push(replace_stash_sql(imv.name, relation.oid, ""));
     }
-    stmts.join(SEPARATOR)
+    stmts
+}
+
+/// A new IMV holds every row its sources hold, the ones this transaction wrote
+/// before it was created included: none of those writes is owed a delta.
+pub(crate) fn baseline_applied_writes(view_name: &str) {
+    let statement = delta_sources::running_statement();
+    if statement == delta_sources::NO_TRANSACTION {
+        return;
+    }
+    let Some((base_query, end_query, aggregations)) = registry_row(view_name) else {
+        return;
+    };
+    let names = delta_sources::source_names(view_name, &base_query);
+    if names.as_ref().is_some_and(|names| names.len() < 2) {
+        return;
+    }
+    let imv = imv(
+        view_name,
+        &base_query,
+        &end_query,
+        Some(&aggregations),
+        names,
+        statement,
+    );
+    for stmt in every_write_applied(&imv) {
+        Spi::run(&stmt).unwrap_or_else(|e| {
+            error!("pg_reflex: could not record the applied writes of '{view_name}': {e}")
+        });
+    }
 }
 
 /// The other sources holding writes no delta applied: their write counts differ
@@ -486,7 +575,7 @@ fn bookkeeping(imv: &Imv, source: &str, source_oid: pg_sys::Oid, operation: &str
         return stmts;
     }
     let plan = registered_plan(imv.name, imv.aggregations);
-    let source_row_type = row_type(source_oid);
+    let source_row_type = exact_text_row_type(source_oid);
     let stashable = pending.len() == 1
         && applies_linear_delta(imv, &plan, source, operation)
         && corrects_exactly(imv, &plan)
@@ -523,9 +612,10 @@ fn bookkeeping(imv: &Imv, source: &str, source_oid: pg_sys::Oid, operation: &str
 }
 
 /// Stashes the transition rows of `source` for `pending`, after the rows
-/// already stashed (`stashed_before`), as the text of arrays of `source`'s row
-/// type in transaction-local settings: a rolled back subtransaction rolls them
-/// back. Past [`STASH_ROW_LIMIT`] rows the stash is poisoned instead.
+/// already stashed (`stashed_before`), as the exact text of arrays of
+/// `source`'s row type in transaction-local settings: a rolled back
+/// subtransaction rolls them back. Past [`STASH_ROW_LIMIT`] rows the stash is
+/// poisoned instead.
 /// Passthrough corrections read no stashed rows.
 #[allow(clippy::too_many_arguments)]
 fn stash_rows_sql(
@@ -558,15 +648,19 @@ fn stash_rows_sql(
         let stashed = stashed_side(imv.name, pending, source_oid, side);
         let added = if transitions.contains(&transition) {
             rows.push(format!("(SELECT count(*) FROM \"{transition}\")"));
-            format!("COALESCE((SELECT array_agg(t)::text FROM \"{transition}\" t), '{{}}')")
+            format!(
+                "COALESCE((SELECT public.reflex_joint_stash_text(array_agg(t)) \
+                 FROM \"{transition}\" t), '{{}}')"
+            )
         } else {
             "'{}'".to_string()
         };
         let value = match stashed_before {
             None => added,
             Some(_) => format!(
-                "(current_setting('{}')::{row_type}[] || {added}::{row_type}[])::text",
-                stashed.setting
+                "public.reflex_joint_stash_text({} || {})",
+                stashed_rows(&format!("current_setting('{}')", stashed.setting), row_type),
+                stashed_rows(&added, row_type)
             ),
         };
         sets.push(format!(
@@ -581,6 +675,11 @@ fn stash_rows_sql(
     )
 }
 
+/// The rows of type `row_type` the expression `stashed_text` holds the text of.
+fn stashed_rows(stashed_text: &str, row_type: &str) -> String {
+    format!("public.reflex_joint_stashed_rows({stashed_text}, NULL::{row_type}[])")
+}
+
 /// `query` reading the stashed `sides` of rows of type `row_type` under their
 /// names.
 fn with_stashed(query: &str, sides: &[&StashedSide], row_type: &str) -> String {
@@ -588,8 +687,9 @@ fn with_stashed(query: &str, sides: &[&StashedSide], row_type: &str) -> String {
         .iter()
         .map(|side| {
             format!(
-                "\"{}\" AS (SELECT * FROM unnest(current_setting('{}')::{row_type}[]))",
-                side.name, side.setting
+                "\"{}\" AS (SELECT * FROM unnest({}))",
+                side.name,
+                stashed_rows(&format!("current_setting('{}')", side.setting), row_type)
             )
         })
         .collect::<Vec<_>>()
@@ -641,7 +741,7 @@ fn exactness_check(
     let mut stmts = Vec::new();
     let mut group_missing = "false".to_string();
     if !plan.is_passthrough && reads_new(operation) {
-        let Some(row_type) = row_type(by) else {
+        let Some(row_type) = exact_text_row_type(by) else {
             return recompute(imv);
         };
         if let Some(check) = missing_group_sql(imv, &plan) {
@@ -704,7 +804,7 @@ pub(crate) fn resolved_delta_sql(
     group_missing: bool,
 ) -> String {
     let Some((base_query, end_query, aggregations)) = registry_row(view_name) else {
-        return String::new();
+        error!("pg_reflex: '{view_name}' is not a registered IMV, its delta cannot be resolved");
     };
     let statement = delta_sources::running_statement();
     let names = delta_sources::source_names(view_name, &base_query);
@@ -726,7 +826,7 @@ pub(crate) fn resolved_delta_sql(
     let Some(stasher) = imv.source_with_oid(by).map(str::to_string) else {
         return recompute(&imv);
     };
-    let row_type = row_type(by);
+    let row_type = exact_text_row_type(by);
     let exact = corrects_exactly(&imv, &plan)
         && delta_sources::source_writes(&relation) == Some(seen)
         && counted == seen - applied(view_name, relation.oid)
@@ -910,13 +1010,35 @@ fn correction(
     stmts
 }
 
+/// Whether the trigger of `source` may skip its delta for the IMV (rows no IMV
+/// predicate or relevant column sees). A skip proves that the rows written
+/// leave the IMV unchanged between the statement's start and its end, not that
+/// a delta applied in between, while they were half written, read them exactly.
+/// So the delta is applied, and is corrected or recomputes, when another
+/// source's delta was applied over these writes (a stash is held for `source`)
+/// or the IMV was recomputed earlier in the statement.
+pub(crate) fn delta_may_be_skipped(view_name: &str, source: &str, base_query: &str) -> bool {
+    let statement = delta_sources::running_statement();
+    if statement == delta_sources::NO_TRANSACTION {
+        return true;
+    }
+    let names = delta_sources::source_names(view_name, base_query);
+    if names.as_ref().is_some_and(|names| names.len() < 2) {
+        return true;
+    }
+    if recomputed_earlier_in_statement(view_name, statement) {
+        return false;
+    }
+    let imv = imv(view_name, base_query, "", None, names, statement);
+    imv.source_named(source)
+        .is_none_or(|relation| matches!(stash(view_name, relation.oid), Stash::Absent))
+}
+
 /// The bookkeeping of a delta of `source` its trigger skips (an ignored source,
-/// rows no IMV predicate or relevant column sees, Path C's bulk insert): its
-/// rows count as applied, up to the source's writes: a recompute earlier in the
-/// statement already counted them. A stash for `source` holding exactly these rows is
-/// dropped, as X's delta that took it joined rows contributing nothing to the
-/// IMV (or Path C ran with no stash, nothing pending); any other stash is
-/// poisoned.
+/// Path C's bulk insert, or a skip [`delta_may_be_skipped`] allowed): its rows
+/// count as applied, up to the source's writes, as a recompute earlier in the
+/// statement already counted them. A stash for `source` is never resolved by a
+/// skip: it is poisoned, so the next delta of `source` recomputes.
 pub(crate) fn skipped_delta_sql(
     view_name: &str,
     source: &str,
@@ -936,8 +1058,7 @@ pub(crate) fn skipped_delta_sql(
         return String::new();
     };
     let applied_before = applied(view_name, relation.oid);
-    let writes = delta_sources::source_writes(&relation);
-    let applied_after = match writes {
+    let applied_after = match delta_sources::source_writes(&relation) {
         Some(writes) => format!("LEAST({writes}, {applied_before} + c.n)"),
         None => format!("{applied_before} + c.n"),
     };
@@ -945,24 +1066,8 @@ pub(crate) fn skipped_delta_sql(
         "set_config('{}', ({applied_after})::text, true)",
         applied_setting(view_name, relation.oid)
     )];
-    let held = stash(view_name, relation.oid);
-    if !matches!(held, Stash::Absent) {
-        let accounted = match writes {
-            Some(writes) => format!("{writes} = {applied_before} + c.n"),
-            None => "false".to_string(),
-        };
-        sets.push(format!(
-            "set_config('{}', CASE WHEN {accounted} THEN '' ELSE '{POISONED}' END, true)",
-            stash_setting(view_name, relation.oid)
-        ));
-    }
-    if let Stash::Taken { by, .. } = held {
-        for side in ["new", "old"] {
-            sets.push(format!(
-                "set_config('{}', '', true)",
-                stashed_side(view_name, relation.oid, by, side).setting
-            ));
-        }
+    if !matches!(stash(view_name, relation.oid), Stash::Absent) {
+        sets.extend(replace_stash_sets(view_name, relation.oid, POISONED));
     }
     format!(
         "SELECT {} FROM (SELECT count(*) AS n FROM \"{transition}\") c",

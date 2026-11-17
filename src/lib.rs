@@ -550,6 +550,24 @@ extension_sql!(
         RETURN _value;
     END;
     $fn$;
+
+    -- The rows a two-source delta keeps for the other source's delta are
+    -- written as text and read back by these two functions only. Each pins, for
+    -- the time of its call, every setting the text of the column types kept
+    -- depends on, to a value under which that text is exact (the ones pg_dump
+    -- pins, plus the time zone and the bytea format): the session's settings,
+    -- and a change to them between the write and the read, have no effect.
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stash_text(stashed anyarray)
+    RETURNS text LANGUAGE sql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS 'SELECT $1::text';
+
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stashed_rows(stashed text, row_type anyarray)
+    RETURNS anyarray LANGUAGE plpgsql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS $fn$ DECLARE parsed ALIAS FOR $0; BEGIN parsed := stashed; RETURN parsed; END $fn$;
     "#,
     name = "pg_reflex_init",
 );
