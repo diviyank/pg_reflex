@@ -302,6 +302,15 @@ fn temp_relation_exists(name: &str) -> bool {
     .unwrap_or(true)
 }
 
+/// The stash and the staged copies are temporary tables: a role without TEMP
+/// on the database recomputes instead.
+fn may_create_temp_tables() -> bool {
+    Spi::get_one::<bool>("SELECT has_database_privilege(current_database(), 'TEMP')")
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
 fn row_count(table: &str) -> Option<i64> {
     Spi::get_one::<i64>(&format!("SELECT count(*) FROM \"{table}\""))
         .ok()
@@ -441,7 +450,8 @@ fn bookkeeping(imv: &Imv, source: &str, source_oid: pg_sys::Oid, operation: &str
     let plan = registered_plan(imv.name, imv.aggregations);
     let stashable = pending.len() == 1
         && applies_linear_delta(imv, &plan, source, operation)
-        && corrects_exactly(imv, &plan);
+        && corrects_exactly(imv, &plan)
+        && may_create_temp_tables();
     for (oid, writes) in pending {
         let meta = stash_setting(imv.name, oid);
         match (stashable, writes, stash(imv.name, oid)) {
@@ -532,7 +542,7 @@ fn stash_lost_no_group(
 /// ([`staged_delta_sql`]) reads in a nested SPI call.
 fn staged(imv: &Imv, source: &str, operation: &str) -> String {
     let transitions = transition_tables(source, operation);
-    if transitions.iter().any(|t| temp_relation_exists(t)) {
+    if !may_create_temp_tables() || transitions.iter().any(|t| temp_relation_exists(t)) {
         return recompute(imv);
     }
     let mut stmts: Vec<String> = transitions

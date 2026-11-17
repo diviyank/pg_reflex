@@ -550,3 +550,52 @@ fn pg_two_source_exact_merge_and_upsert_with_other_source() {
     }
     probe_db_close(DBNAME);
 }
+
+/// A role that may not create temporary tables writes both sources in one
+/// statement: the correction, which stashes rows in temporary tables, gives way
+/// to the recompute instead of raising.
+#[pg_test]
+fn pg_two_source_exact_role_without_temp_recomputes() {
+    const DBNAME: &str = "reflex_tsx_notemp";
+    const ROLE: &str = "tsx_notemp_writer";
+    tsx_pair_open(DBNAME);
+    worker_exec(&format!("REVOKE TEMP ON DATABASE {DBNAME} FROM PUBLIC"));
+    worker_exec(&format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{ROLE}') THEN \
+           CREATE ROLE {ROLE}; END IF; END $$"
+    ));
+    worker_exec(&format!("GRANT USAGE ON SCHEMA public TO {ROLE}"));
+    worker_exec(&format!("GRANT ALL ON ALL TABLES IN SCHEMA public TO {ROLE}"));
+    worker_exec(&format!("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {ROLE}"));
+    worker_exec(&format!("SET ROLE {ROLE}"));
+    let may_create_temp =
+        worker_scalar_i64("SELECT has_database_privilege(current_database(), 'TEMP')::int::int8");
+    let mut outcomes = Vec::new();
+    for statement in [
+        "INSERT INTO rb VALUES (1002, 3)",
+        "WITH x AS (INSERT INTO ra VALUES (1001, 1, 5) RETURNING 1) INSERT INTO rb VALUES (1001, 7)",
+        "WITH x AS (UPDATE ra SET a = a + 10 WHERE k = 11 RETURNING 1) \
+         UPDATE rb SET b = b + 1 WHERE k = 11",
+    ] {
+        let outcome = Spi::get_one::<String>(&format!(
+            "SELECT CASE WHEN dblink_exec('reflex_lock_worker', {}, false) = 'ERROR' \
+                    THEN dblink_error_message('reflex_lock_worker') ELSE 'OK' END",
+            sql_lit(statement)
+        ))
+        .expect("dblink")
+        .unwrap_or_default();
+        outcomes.push((statement, outcome));
+    }
+    worker_exec("RESET ROLE");
+    worker_exec(&format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {ROLE}"));
+    worker_exec(&format!("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {ROLE}"));
+    worker_exec(&format!("REVOKE USAGE ON SCHEMA public FROM {ROLE}"));
+    assert_eq!(may_create_temp, 0, "fixture: the role may not create temporary tables");
+    for (statement, outcome) in outcomes {
+        assert_eq!(outcome, "OK", "<{statement}> as a role without TEMP raised");
+    }
+    tsx_assert_correct(&TSX_R_GROUPED, "after the writes of the role without TEMP");
+    tsx_assert_correct(&TSX_R_OTHERS, "after the writes of the role without TEMP");
+    probe_db_close(DBNAME);
+    admin_exec(&format!("DROP ROLE IF EXISTS {ROLE}"));
+}
