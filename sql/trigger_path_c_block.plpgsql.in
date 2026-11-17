@@ -69,6 +69,7 @@ IF _directional_op = 'INSERT_PROMOTED' THEN
                    EXECUTE format('INSERT INTO %s %s', _pc_target_qv, _pc_end_q);
                    EXECUTE format('ANALYZE %s', _pc_int_tbl);
                    UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = _rec.name;
+                   __REFLEX_SLOT_SKIPPED__
                    CONTINUE;
                  END IF;
                END IF;

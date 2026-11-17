@@ -3224,6 +3224,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     ) {
         warning!("{}", msg);
     }
+    crate::trigger::joint::baseline_applied_writes(view_name);
     info!("pg_reflex: created IMV '{}'", view_name);
     "CREATE REFLEX INCREMENTAL VIEW"
 }

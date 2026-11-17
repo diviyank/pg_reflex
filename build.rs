@@ -109,6 +109,14 @@ __attribute__((weak)) void *format_type_extended()                      { return
 __attribute__((weak)) int   IsBinaryCoercible()                         { return 0; }
 __attribute__((weak)) int   GetDatabaseEncoding(void)                   { return 0; }
 __attribute__((weak)) unsigned int GetCurrentTransactionIdIfAny(void)   { return 0; }
+__attribute__((weak)) unsigned int GetCurrentTransactionId(void)        { return 0; }
+__attribute__((weak)) long  GetCurrentTransactionStartTimestamp(void)   { return 0; }
+__attribute__((weak)) long  GetCurrentStatementStartTimestamp(void)     { return 0; }
+__attribute__((weak)) _Bool AfterTriggerPendingOnRel(unsigned int r)    { return 0; }
+__attribute__((weak)) _Bool pgstat_track_counts = 0;
+__attribute__((weak)) unsigned int MyDatabaseId = 0;
+__attribute__((weak)) const char *GetConfigOption()                     { return NULL; }
+__attribute__((weak)) void *pgstat_fetch_pending_entry()                { return NULL; }
 __attribute__((weak)) void  MemoryContextDelete(void *c)                {}
 __attribute__((weak)) void *MemoryContextGetParent(void *c)             { return NULL; }
 __attribute__((weak)) void *AllocSetContextCreateInternal()             { return NULL; }

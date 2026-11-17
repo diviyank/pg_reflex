@@ -550,6 +550,24 @@ extension_sql!(
         RETURN _value;
     END;
     $fn$;
+
+    -- The rows a two-source delta keeps for the other source's delta are
+    -- written as text and read back by these two functions only. Each pins, for
+    -- the time of its call, every setting the text of the column types kept
+    -- depends on, to a value under which that text is exact (the ones pg_dump
+    -- pins, plus the time zone and the bytea format): the session's settings,
+    -- and a change to them between the write and the read, have no effect.
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stash_text(stashed anyarray)
+    RETURNS text LANGUAGE sql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS 'SELECT $1::text';
+
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stashed_rows(stashed text, row_type anyarray)
+    RETURNS anyarray LANGUAGE plpgsql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS $fn$ DECLARE parsed ALIAS FOR $0; BEGIN parsed := stashed; RETURN parsed; END $fn$;
     "#,
     name = "pg_reflex_init",
 );
@@ -2062,6 +2080,11 @@ mod tests {
     include!("tests/pg_test_v1122_unread_column_check.rs");
     include!("tests/pg_test_node_fill.rs");
     include!("tests/pg_test_partitioned_reconcile_dependents.rs");
+    include!("tests/pg_test_joint_delta.rs");
+    include!("tests/pg_test_two_source_statement.rs");
+    include!("tests/pg_test_two_source_counters.rs");
+    include!("tests/pg_test_two_source_exact.rs");
+    include!("tests/pg_test_two_source_stash.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
@@ -2079,7 +2102,10 @@ pub mod pg_test {
         // transaction end. Raise the per-transaction lock budget so larger ad-hoc
         // runs (PG_REFLEX_FUZZ_CASES up to a few hundred) don't hit "out of shared
         // memory". Very large runs still need batching.
-        vec!["max_locks_per_transaction = 4096"]
+        vec![
+            "max_locks_per_transaction = 4096",
+            "max_prepared_transactions = 4",
+        ]
     }
 }
 

@@ -7,7 +7,7 @@ BEGIN
              COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate, ignored_sources
       FROM public.__reflex_ivm_reference
       WHERE '__REFLEX_SLOT_SOURCE_TABLE__' = ANY(depends_on) AND enabled = TRUE
-      ORDER BY graph_depth, name
+      ORDER BY graph_depth DESC, name
     LOOP
       IF _rec.ignored_sources IS NOT NULL AND ('__REFLEX_SLOT_SOURCE_TABLE__' = ANY(_rec.ignored_sources) OR '__REFLEX_SLOT_BARE_SOURCE__' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF;
       IF _rec.where_predicate IS NOT NULL THEN

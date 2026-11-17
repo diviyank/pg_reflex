@@ -195,6 +195,127 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
+    build_delta_sql(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+        false,
+    )
+}
+
+/// [`reflex_build_delta_sql`] for the IMMEDIATE statement triggers, which
+/// replace a last statement marked `--<<REFLEX_THEN>>--` with the statements it
+/// returns.
+#[pg_extern]
+pub fn reflex_build_delta_sql_resolving(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+) -> String {
+    build_delta_sql(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+        true,
+    )
+}
+
+/// The second stage of a corrected delta, given the rows of the transition
+/// table and whether a group its correction subtracts from is missing.
+#[pg_extern]
+pub fn reflex_joint_resolved_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    counted: i64,
+    group_missing: bool,
+) -> String {
+    joint::resolved_delta_sql(view_name, source_table, operation, counted, group_missing)
+}
+
+/// Whether the statement trigger of `source_table` may skip its delta for the
+/// IMV: not when a delta of another source was applied over its writes.
+#[pg_extern]
+pub fn reflex_joint_delta_may_be_skipped(
+    view_name: &str,
+    source_table: &str,
+    base_query: &str,
+) -> bool {
+    joint::delta_may_be_skipped(view_name, source_table, base_query)
+}
+
+/// The bookkeeping of a delta the statement trigger skips, over the rows of
+/// `transition_table`.
+#[pg_extern]
+pub fn reflex_joint_skipped_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    base_query: &str,
+    transition_table: &str,
+) -> String {
+    joint::skipped_delta_sql(view_name, source_table, base_query, transition_table)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+    resolves: bool,
+) -> String {
+    if operation != NETTED_UPDATE_OP && !joint::in_partition_delta() {
+        return joint::delta_sql(
+            view_name,
+            source_table,
+            operation,
+            base_query,
+            end_query,
+            aggregations_json,
+            orig_base_query,
+            resolves,
+        );
+    }
+    if delta_sources::delta_would_count_twice(view_name, source_table, base_query) {
+        return recompute_sql(view_name, base_query, end_query, aggregations_json);
+    }
+    delta_statements(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+    )
+}
+
+/// The statements applying one source's delta to an IMV, as if no other source
+/// held writes not yet applied.
+pub(crate) fn delta_statements(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+) -> String {
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -216,13 +337,7 @@ pub fn reflex_build_delta_sql(
     // (which is infallible). A malformed
     // value would mean catalog corruption, not user error; failing loudly
     // beats silently emitting empty SQL.
-    let json = aggregations_json.unwrap_or("{}");
-    let plan: AggregationPlan = serde_json::from_str(json).unwrap_or_else(|e| {
-        panic!(
-            "pg_reflex: __reflex_ivm_reference.aggregations for '{}' must be valid JSON (catalog invariant violated: {})",
-            view_name, e
-        )
-    });
+    let plan = registered_plan(view_name, aggregations_json);
 
     let intermediate_tbl = intermediate_table_name(view_name);
     // Use the transition table names directly (no temp table copy needed).
@@ -431,6 +546,35 @@ pub fn reflex_build_delta_sql(
     result
 }
 
+fn registered_plan(view_name: &str, aggregations_json: Option<&str>) -> AggregationPlan {
+    serde_json::from_str(aggregations_json.unwrap_or("{}")).unwrap_or_else(|e| {
+        panic!(
+            "pg_reflex: __reflex_ivm_reference.aggregations for '{}' must be valid JSON (catalog invariant violated: {})",
+            view_name, e
+        )
+    })
+}
+
+/// Recomputes `view_name` from its sources as they are now
+/// ([`delta_sources::delta_would_count_twice`]).
+fn recompute_sql(
+    view_name: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+) -> String {
+    let mut stmts: Vec<String> = Vec::new();
+    full_refresh_stmts(
+        view_name,
+        base_query,
+        end_query,
+        &intermediate_table_name(view_name),
+        &registered_plan(view_name, aggregations_json),
+        &mut stmts,
+    );
+    stmts.join("\n--<<REFLEX_SEP>>--\n")
+}
+
 /// Returns the rewritten scratch-fill SQL for an `INSERT_PROMOTED`
 /// bulk-INSERT: `base_query` with `source_table` rewritten to its
 /// `__reflex_new_*` transition table, identical to what the bulk-INSERT
@@ -493,6 +637,9 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
+    if !joint::path_c_keeps_exact(view_name, source_table, &base_query) {
+        return String::new();
+    }
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -727,8 +874,10 @@ pub fn reflex_execute_separated(sql: &str) {
 }
 
 pub(crate) mod deferred;
+pub(crate) mod delta_sources;
 mod dispatch;
 mod expression_subquery;
+pub(crate) mod joint;
 mod merge;
 mod minmax_bulk_replace;
 mod ops;
