@@ -308,3 +308,20 @@ fn pg_two_source_stash_source_with_a_column_named_t() {
     assert!(first > 0, "the rows of a source with a column named t are kept: corrected");
     probe_db_close(DBNAME);
 }
+
+/// A source with a column named as the alias the stash gives its transition
+/// table now: the rows are read as `alias.*`, which no column name captures.
+#[pg_test]
+fn pg_two_source_stash_source_with_a_column_named_as_the_stash_alias() {
+    const DBNAME: &str = "reflex_tss_column_alias";
+    tss_keyed_open(
+        DBNAME,
+        "INT",
+        ", __reflex_stashed_row TIMETZ DEFAULT '10:00:00+01'",
+        &["1", "2"],
+        &[],
+    );
+    let (first, _) = tss_keyed_joint_writes("2");
+    assert!(first > 0, "the rows of a source with a column named as the alias are kept: corrected");
+    probe_db_close(DBNAME);
+}
