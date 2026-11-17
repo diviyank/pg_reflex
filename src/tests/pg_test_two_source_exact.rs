@@ -445,6 +445,85 @@ fn pg_two_source_exact_subtransaction_rollback() {
     probe_db_close(DBNAME);
 }
 
+/// (c), with the stash tables already created by an earlier statement of the
+/// transaction: bookkeeping surviving the rollback would apply that statement's
+/// stashed rows of rb to the rows of ra written again.
+#[pg_test]
+fn pg_two_source_exact_subtransaction_rollback_over_earlier_stash() {
+    const DBNAME: &str = "reflex_tsx_pin_c2";
+    tsx_pair_open(DBNAME);
+    worker_exec(
+        "CREATE FUNCTION tsx_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF current_setting('tsx.fail', true) = 'on' THEN \
+              RAISE EXCEPTION 'tsx abort'; END IF; RETURN NULL; END $$",
+    );
+    worker_exec(
+        "CREATE TRIGGER zz_tsx_fail_rb AFTER INSERT ON rb \
+         FOR EACH STATEMENT EXECUTE FUNCTION tsx_fail()",
+    );
+    worker_exec("BEGIN");
+    worker_exec(
+        "WITH x AS (INSERT INTO ra VALUES (1002, 2, 4) RETURNING 1) INSERT INTO rb VALUES (1001, 8)",
+    );
+    tsx_assert_correct(&TSX_R_GROUPED, "after the earlier statement");
+    worker_exec(
+        "DO $$ BEGIN \
+           PERFORM set_config('tsx.fail', 'on', true); \
+           BEGIN \
+             WITH x AS (INSERT INTO ra VALUES (1001, 1, 4) RETURNING 1) \
+             INSERT INTO rb VALUES (1003, 8); \
+           EXCEPTION WHEN raise_exception THEN NULL; \
+           END; \
+           PERFORM set_config('tsx.fail', 'off', true); \
+         END $$",
+    );
+    tsx_assert_correct(&TSX_R_GROUPED, "after the rolled back subtransaction");
+    for statement in [
+        "INSERT INTO ra VALUES (1001, 1, 4)",
+        "INSERT INTO rb VALUES (1003, 8)",
+    ] {
+        worker_exec(statement);
+        tsx_assert_correct(&TSX_R_GROUPED, &format!("after <{statement}>"));
+        tsx_assert_correct(&TSX_R_OTHERS, &format!("after <{statement}>"));
+    }
+    worker_exec("COMMIT");
+    tsx_assert_correct(&TSX_R_GROUPED, "after COMMIT");
+    tsx_assert_correct(&TSX_R_OTHERS, "after COMMIT");
+    probe_db_close(DBNAME);
+}
+
+/// (e): a consumed stash is cleared, so later single-source writes of the same
+/// transaction stay deltas of the group they write.
+#[pg_test]
+fn pg_two_source_exact_consumed_stash_leaves_later_writes_incremental() {
+    const DBNAME: &str = "reflex_tsx_pin_e";
+    tsx_pair_open(DBNAME);
+    let xmins: Vec<String> = TSX_R_GROUPED
+        .iter()
+        .map(|(imv, _)| ts_intermediate_xmins(imv))
+        .collect();
+    worker_exec("BEGIN");
+    for statement in [
+        "WITH x AS (INSERT INTO ra VALUES (1001, 1, 4) RETURNING 1) INSERT INTO rb VALUES (1001, 8)",
+        "UPDATE rb SET b = b + 1 WHERE k = 11",
+        "UPDATE ra SET a = a + 1 WHERE k = 21",
+    ] {
+        worker_exec(statement);
+        tsx_assert_correct(&TSX_R_GROUPED, &format!("after <{statement}>"));
+        tsx_assert_correct(&TSX_R_OTHERS, &format!("after <{statement}>"));
+    }
+    worker_exec("COMMIT");
+    tsx_assert_correct(&TSX_R_GROUPED, "after COMMIT");
+    for ((imv, _), before) in TSX_R_GROUPED.iter().zip(&xmins) {
+        assert_eq!(
+            ts_rewritten_intermediate_rows(imv, before),
+            1,
+            "{imv}: writes of group 1 must stay a delta of group 1"
+        );
+    }
+    probe_db_close(DBNAME);
+}
+
 /// (d): MERGE inserting and updating rb, in one statement with a write to ra.
 #[pg_test]
 fn pg_two_source_exact_merge_and_upsert_with_other_source() {
