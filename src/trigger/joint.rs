@@ -254,7 +254,10 @@ fn set_setting_sql(name: &str, value: &str) -> String {
 
 /// Leaves no stash for `pending`: `meta` is the stash setting's new value.
 fn replace_stash_sql(view_name: &str, pending: pg_sys::Oid, meta: &str) -> String {
-    format!("SELECT {}", replace_stash_sets(view_name, pending, meta).join(", "))
+    format!(
+        "SELECT {}",
+        replace_stash_sets(view_name, pending, meta).join(", ")
+    )
 }
 
 fn replace_stash_sets(view_name: &str, pending: pg_sys::Oid, meta: &str) -> Vec<String> {
