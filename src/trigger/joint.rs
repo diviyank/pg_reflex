@@ -1040,8 +1040,9 @@ fn correction(
 /// a delta applied in between, while they were half written, read them exactly.
 /// So the delta is applied, and is corrected or recomputes, when another
 /// source's delta was applied over these writes (a stash is held for `source`)
-/// or the IMV was recomputed earlier in the statement. A source that does not
-/// resolve to a relation the IMV reads cannot be judged: its delta is applied,
+/// or the IMV was recomputed earlier in the statement. Both are known from
+/// `source` alone, whether or not the other sources resolve; when `source`
+/// itself does not resolve to a relation the IMV reads, its delta is applied,
 /// where it recomputes.
 pub(crate) fn delta_may_be_skipped(view_name: &str, source: &str, base_query: &str) -> bool {
     let statement = delta_sources::running_statement();
@@ -1056,10 +1057,8 @@ pub(crate) fn delta_may_be_skipped(view_name: &str, source: &str, base_query: &s
         return false;
     }
     let imv = imv(view_name, base_query, "", None, names, statement);
-    imv.every_source_resolved
-        && imv
-            .source_named(source)
-            .is_some_and(|relation| matches!(stash(view_name, relation.oid), Stash::Absent))
+    imv.source_named(source)
+        .is_some_and(|relation| matches!(stash(view_name, relation.oid), Stash::Absent))
 }
 
 /// The bookkeeping of a delta of `source` its trigger skips (an ignored source,
