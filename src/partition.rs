@@ -5184,6 +5184,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 .map_err(|e| {
                     format!("flush: stamping last_attempt_at for {} failed: {}", root, e)
                 })?;
+            let _partition_delta = crate::trigger::joint::PartitionDeltaGuard::enter();
             client
                 .update(&do_block, None, &[])
                 .map_err(|e| format!("flush: DO block dispatch for root {} failed: {}", root, e))?;

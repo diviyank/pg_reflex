@@ -195,9 +195,45 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
+    if let Some(operation) = operation.strip_prefix(joint::STAGED_OP_PREFIX) {
+        return joint::staged_delta_sql(view_name, source_table, operation);
+    }
+    if operation != NETTED_UPDATE_OP && !joint::in_partition_delta() {
+        return joint::delta_sql(
+            view_name,
+            source_table,
+            operation,
+            base_query,
+            end_query,
+            aggregations_json,
+            orig_base_query,
+        );
+    }
     if delta_sources::delta_would_count_twice(view_name, source_table, base_query) {
         return recompute_sql(view_name, base_query, end_query, aggregations_json);
     }
+    delta_statements(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+    )
+}
+
+/// The statements applying one source's delta to an IMV, as if no other source
+/// held writes not yet applied.
+pub(crate) fn delta_statements(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+) -> String {
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -519,10 +555,9 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
-    if delta_sources::delta_owes_recompute(view_name, source_table) {
+    if !joint::path_c_keeps_exact(view_name, source_table, &base_query) {
         return String::new();
     }
-    delta_sources::delta_would_count_twice(view_name, source_table, &base_query);
     let cache_key = delta_sql_cache_key(
         view_name,
         source_table,
@@ -760,6 +795,7 @@ pub(crate) mod deferred;
 pub(crate) mod delta_sources;
 mod dispatch;
 mod expression_subquery;
+pub(crate) mod joint;
 mod merge;
 mod minmax_bulk_replace;
 mod ops;

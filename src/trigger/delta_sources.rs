@@ -8,9 +8,10 @@
 //! ΔA ⋈ ΔB twice. A user trigger on A writing B, a cascading foreign key between
 //! A and B, and a pg_reflex flush fired inside a statement (`SET CONSTRAINTS ALL
 //! IMMEDIATE`), are the same. A source holds such writes exactly while
-//! after-trigger events on it are queued and not yet fired: when its delta
-//! arrives after another source's delta was applied during that window, the IMV
-//! is recomputed instead. Statements run one after the other (a function writing
+//! after-trigger events on it are queued and not yet fired. An IMMEDIATE delta
+//! is then corrected (`super::joint`); the DEFERRED flush and a partition delta,
+//! when a source's delta arrives after another source's delta was applied during
+//! that window, recompute the IMV instead. Statements run one after the other (a function writing
 //! A then B) leave nothing queued, and an IMV read as a source is maintained, and
 //! its own events fired, before its readers' next delta (deepest first), so both
 //! stay incremental.
@@ -44,8 +45,8 @@ enum WriteSignal {
 }
 
 #[derive(Clone, Copy)]
-struct Relation {
-    oid: pg_sys::Oid,
+pub(super) struct Relation {
+    pub(super) oid: pg_sys::Oid,
     partitioned: bool,
     signal: WriteSignal,
 }
@@ -76,9 +77,9 @@ fn relations_of_this_transaction() -> &'static Mutex<Relations> {
 
 /// What `running_statement` reads outside a PostgreSQL backend (the SQL-generation
 /// unit tests), where no source can have been written.
-const NO_TRANSACTION: (i64, i64) = (0, 0);
+pub(super) const NO_TRANSACTION: (i64, i64) = (0, 0);
 
-fn running_statement() -> (i64, i64) {
+pub(super) fn running_statement() -> (i64, i64) {
     if cfg!(test) {
         return NO_TRANSACTION;
     }
@@ -90,7 +91,7 @@ fn running_statement() -> (i64, i64) {
     }
 }
 
-fn text_arg(value: &str) -> pgrx::datum::DatumWithOid<'static> {
+pub(super) fn text_arg(value: &str) -> pgrx::datum::DatumWithOid<'static> {
     unsafe {
         pgrx::datum::DatumWithOid::new(
             value.to_string(),
@@ -100,7 +101,7 @@ fn text_arg(value: &str) -> pgrx::datum::DatumWithOid<'static> {
 }
 
 /// The sources `view_name` reads, `None` when the registry cannot be read.
-fn source_names(view_name: &str, base_query: &str) -> Option<Vec<String>> {
+pub(super) fn source_names(view_name: &str, base_query: &str) -> Option<Vec<String>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     base_query.hash(&mut hasher);
     let key = (view_name.to_string(), hasher.finish());
@@ -173,7 +174,7 @@ fn read_relation(name: &str) -> Option<Relation> {
     })
 }
 
-fn relation(name: &str, transaction: i64) -> Option<Relation> {
+pub(super) fn relation(name: &str, transaction: i64) -> Option<Relation> {
     {
         let mut relations = relations_of_this_transaction()
             .lock()
@@ -271,8 +272,7 @@ pub(crate) fn transaction_writes(oid: pg_sys::Oid) -> Option<i64> {
             if (*level).truncdropped {
                 return None;
             }
-            writes += ((*level).tuples_inserted + (*level).tuples_updated + (*level).tuples_deleted)
-                as i64;
+            writes += (*level).tuples_inserted + (*level).tuples_updated + (*level).tuples_deleted;
             level = (*level).upper;
         }
         Some(writes)
@@ -331,7 +331,7 @@ fn tables_that_may_queue_writes(root: pg_sys::Oid) -> Option<Vec<pg_sys::Oid>> {
     })
 }
 
-fn holds_unapplied_writes(name: &str, relation: &Relation) -> bool {
+pub(super) fn holds_unapplied_writes(name: &str, relation: &Relation) -> bool {
     if !may_have_been_written(name, relation) {
         return false;
     }
@@ -344,6 +344,48 @@ fn holds_unapplied_writes(name: &str, relation: &Relation) -> bool {
             .any(|oid| unsafe { pg_sys::AfterTriggerPendingOnRel(oid) }),
         None => true,
     }
+}
+
+/// The rows of a source the running transaction wrote ([`transaction_writes`]),
+/// over every leaf of a partitioned source. `None` when they are not counted,
+/// or a leaf is not a heap table.
+pub(super) fn source_writes(relation: &Relation) -> Option<i64> {
+    match relation.signal {
+        WriteSignal::TransactionCounters => transaction_writes(relation.oid),
+        WriteSignal::Guard | WriteSignal::None if relation.partitioned => leaf_writes(relation.oid),
+        _ => None,
+    }
+}
+
+fn leaf_writes(root: pg_sys::Oid) -> Option<i64> {
+    let leaves: Vec<(pg_sys::Oid, bool)> = Spi::connect(|client| {
+        let rows = client
+            .select(
+                "SELECT t.relid::oid AS rel, c.relkind = 'r' AND c.relam = 2 AS heap \
+                 FROM pg_partition_tree($1) t JOIN pg_class c ON c.oid = t.relid \
+                 WHERE t.isleaf",
+                None,
+                &[unsafe {
+                    pgrx::datum::DatumWithOid::new(
+                        root,
+                        pg_sys::PgBuiltInOids::OIDOID.oid().value(),
+                    )
+                }],
+            )
+            .ok()?;
+        let mut leaves = Vec::new();
+        for row in rows {
+            let leaf = row.get_by_name::<pg_sys::Oid, _>("rel").ok()??;
+            let heap = row.get_by_name::<bool, _>("heap").ok()?.unwrap_or(false);
+            leaves.push((leaf, heap));
+        }
+        Some(leaves)
+    })?;
+    leaves.into_iter().try_fold(0i64, |total, (leaf, heap)| {
+        heap.then(|| transaction_writes(leaf))
+            .flatten()
+            .map(|writes| total + writes)
+    })
 }
 
 /// The sources of `view_name` other than `source` holding writes not yet
@@ -395,28 +437,17 @@ fn owed(entry: &DeltaSources, source: Option<pg_sys::Oid>) -> bool {
     }
 }
 
-/// Whether `source`'s delta, applied to `view_name` now, would join rows
-/// already counted, without recording the application.
-pub(crate) fn delta_owes_recompute(view_name: &str, source: &str) -> bool {
+/// Records that `source`'s delta reaches `view_name` in the running transaction.
+pub(crate) fn record_delta_reached(view_name: &str, source: &str) {
     let statement = running_statement();
     if statement == NO_TRANSACTION {
-        return false;
+        return;
     }
-    let nothing_owed = {
-        let mut by_imv = sources_by_imv().lock().unwrap_or_else(|e| e.into_inner());
-        entry_for_statement(&mut by_imv, view_name, statement)
-            .unapplied_at_earlier_delta
-            .is_empty()
-    };
-    if nothing_owed {
-        return false;
-    }
-    let source_oid = relation(source, statement.0).map(|r| r.oid);
     let mut by_imv = sources_by_imv().lock().unwrap_or_else(|e| e.into_inner());
-    owed(
-        entry_for_statement(&mut by_imv, view_name, statement),
-        source_oid,
-    )
+    let entry = entry_for_statement(&mut by_imv, view_name, statement);
+    if !entry.in_transaction.iter().any(|s| s == source) {
+        entry.in_transaction.push(source.to_string());
+    }
 }
 
 /// Records that `source`'s delta reaches `view_name` now, and tells whether it
