@@ -735,9 +735,38 @@ fn pg_two_source_exact_skipped_delta_leaves_later_writes_incremental() {
     probe_db_close(DBNAME);
 }
 
+/// A recompute counts every write of the other source as applied, including a
+/// write whose delta has not fired yet. When that delta is then skipped (rb's
+/// recompute fires first, ra's UPDATE touches no column the IMV reads), the
+/// skip must not count its rows a second time: a later statement writing both
+/// sources would then miss ra's write and apply the joint term twice.
+#[pg_test]
+fn pg_two_source_exact_skip_after_recompute_keeps_later_writes_exact() {
+    const DBNAME: &str = "reflex_tsx_skip_recompute";
+    tsx_pair_open(DBNAME);
+    worker_exec("BEGIN");
+    worker_exec(
+        "DO $$ BEGIN \
+           WITH x AS (INSERT INTO ra SELECT g, g % 10, g FROM generate_series(20001, 30001) g RETURNING 1) \
+           INSERT INTO rb SELECT g, g FROM generate_series(20001, 30001) g; \
+           WITH x AS (UPDATE ra SET a = a + 1 WHERE k = 1 RETURNING 1) \
+           UPDATE rb SET b = b + 1 WHERE k = 1; \
+         END $$",
+    );
+    tsx_assert_correct(&TSX_R_GROUPED, "after a recompute and a skipped delta");
+    worker_exec(
+        "WITH x AS (INSERT INTO ra VALUES (40006, 6, 6) RETURNING 1) INSERT INTO rb VALUES (40006, 6)",
+    );
+    tsx_assert_correct(&TSX_R_GROUPED, "after a later statement writing both sources");
+    tsx_assert_correct(&TSX_R_OTHERS, "after a later statement writing both sources");
+    worker_exec("COMMIT");
+    tsx_assert_correct(&TSX_R_GROUPED, "after COMMIT");
+    probe_db_close(DBNAME);
+}
+
 /// 2000 statements writing both sources in one transaction keep the IMVs exact
-/// and take no lock per statement: the lock count stays within the default
-/// max_locks_per_transaction budget.
+/// and take no lock per statement: the lock count does not grow with the
+/// number of statements.
 #[pg_test]
 fn pg_two_source_exact_many_corrected_statements_hold_few_locks() {
     const DBNAME: &str = "reflex_tsx_locks";

@@ -912,7 +912,8 @@ fn correction(
 
 /// The bookkeeping of a delta of `source` its trigger skips (an ignored source,
 /// rows no IMV predicate or relevant column sees, Path C's bulk insert): its
-/// rows count as applied. A stash for `source` holding exactly these rows is
+/// rows count as applied, up to the source's writes: a recompute earlier in the
+/// statement already counted them. A stash for `source` holding exactly these rows is
 /// dropped, as X's delta that took it joined rows contributing nothing to the
 /// IMV (or Path C ran with no stash, nothing pending); any other stash is
 /// poisoned.
@@ -935,13 +936,18 @@ pub(crate) fn skipped_delta_sql(
         return String::new();
     };
     let applied_before = applied(view_name, relation.oid);
+    let writes = delta_sources::source_writes(&relation);
+    let applied_after = match writes {
+        Some(writes) => format!("LEAST({writes}, {applied_before} + c.n)"),
+        None => format!("{applied_before} + c.n"),
+    };
     let mut sets = vec![format!(
-        "set_config('{}', ({applied_before} + c.n)::text, true)",
+        "set_config('{}', ({applied_after})::text, true)",
         applied_setting(view_name, relation.oid)
     )];
     let held = stash(view_name, relation.oid);
     if !matches!(held, Stash::Absent) {
-        let accounted = match delta_sources::source_writes(&relation) {
+        let accounted = match writes {
             Some(writes) => format!("{writes} = {applied_before} + c.n"),
             None => "false".to_string(),
         };
