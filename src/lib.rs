@@ -1977,6 +1977,7 @@ mod tests {
     include!("tests/pg_test_ignored_source_heal.rs");
     include!("tests/pg_test_reconcile_log_noise.rs");
     include!("tests/pg_test_rebuild_commit.rs");
+    include!("tests/pg_test_lock_order.rs");
     include!("tests/pg_test_deferred_marker.rs");
     include!("tests/pg_test_deferred_reconcile.rs");
     include!("tests/pg_test_v112_utf8.rs");
