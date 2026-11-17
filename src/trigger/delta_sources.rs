@@ -247,6 +247,38 @@ fn rows_written_in_this_transaction(oid: pg_sys::Oid) -> bool {
     }
 }
 
+/// The rows of `oid` the running transaction and its live subtransactions
+/// inserted, updated or deleted, as counted by its statistics: one per row
+/// written. `None` when a TRUNCATE (or a dropped table) reset the counts, which
+/// then no longer grow with every row written.
+pub(crate) fn transaction_writes(oid: pg_sys::Oid) -> Option<i64> {
+    if !counts_writes() {
+        return None;
+    }
+    unsafe {
+        let entry = pending_statistics::pgstat_fetch_pending_entry(
+            pending_statistics::KIND_RELATION,
+            pg_sys::MyDatabaseId,
+            pending_statistics::ObjectId::from(oid.to_u32()),
+        );
+        if entry.is_null() || (*entry).pending.is_null() {
+            return Some(0);
+        }
+        let status = (*entry).pending as *const pg_sys::PgStat_TableStatus;
+        let mut level = (*status).trans;
+        let mut writes: i64 = 0;
+        while !level.is_null() {
+            if (*level).truncdropped {
+                return None;
+            }
+            writes += ((*level).tuples_inserted + (*level).tuples_updated + (*level).tuples_deleted)
+                as i64;
+            level = (*level).upper;
+        }
+        Some(writes)
+    }
+}
+
 fn guard_recorded_a_write(name: &str) -> bool {
     let Ok(setting) = CString::new(crate::schema_builder::source_written_setting(name)) else {
         return true;

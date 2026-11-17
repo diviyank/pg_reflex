@@ -2014,6 +2014,7 @@ mod tests {
     include!("tests/pg_test_node_fill.rs");
     include!("tests/pg_test_joint_delta.rs");
     include!("tests/pg_test_two_source_statement.rs");
+    include!("tests/pg_test_two_source_counters.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
