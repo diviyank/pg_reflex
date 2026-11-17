@@ -450,7 +450,13 @@ pub(crate) fn delta_sql(
     match stash(view_name, source_relation.oid) {
         Stash::Absent => {
             let mut stmts = vec![own_delta()];
-            stmts.extend(bookkeeping(&imv, source, source_relation.oid, operation));
+            stmts.extend(bookkeeping(
+                &imv,
+                source,
+                source_relation.oid,
+                operation,
+                resolves,
+            ));
             stmts.join(SEPARATOR)
         }
         Stash::Taken { seen, by, .. } if resolves => {
@@ -562,8 +568,17 @@ fn pending_sources(imv: &Imv, source_oid: pg_sys::Oid) -> Vec<(pg_sys::Oid, Opti
 }
 
 /// Records the rows of `source`'s delta as applied, and stashes its transition
-/// rows for the other source holding unapplied writes.
-fn bookkeeping(imv: &Imv, source: &str, source_oid: pg_sys::Oid, operation: &str) -> Vec<String> {
+/// rows for the other source holding unapplied writes. `resolves`: the
+/// triggers resolve a stash. The trigger bodies older than the library do not
+/// (they recompute), and can run before the functions keeping the rows exist:
+/// they keep none.
+fn bookkeeping(
+    imv: &Imv,
+    source: &str,
+    source_oid: pg_sys::Oid,
+    operation: &str,
+    resolves: bool,
+) -> Vec<String> {
     let counted = applied_setting(imv.name, source_oid);
     let mut stmts = vec![format!(
         "SELECT set_config('{counted}', (COALESCE(NULLIF(current_setting('{counted}', true), ''), '0')::bigint \
@@ -576,7 +591,8 @@ fn bookkeeping(imv: &Imv, source: &str, source_oid: pg_sys::Oid, operation: &str
     }
     let plan = registered_plan(imv.name, imv.aggregations);
     let source_row_type = exact_text_row_type(source_oid);
-    let stashable = pending.len() == 1
+    let stashable = resolves
+        && pending.len() == 1
         && applies_linear_delta(imv, &plan, source, operation)
         && corrects_exactly(imv, &plan)
         && (plan.is_passthrough || source_row_type.is_some());
@@ -853,7 +869,7 @@ pub(crate) fn resolved_delta_sql(
         Some(&aggregations),
         &base_query,
     ));
-    stmts.extend(bookkeeping(&imv, source, relation.oid, operation));
+    stmts.extend(bookkeeping(&imv, source, relation.oid, operation, true));
     stmts.push(replace_stash_sql(view_name, relation.oid, ""));
     let corrections = corrections_setting(view_name);
     stmts.push(format!(
