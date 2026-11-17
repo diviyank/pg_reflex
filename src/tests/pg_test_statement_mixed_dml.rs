@@ -313,9 +313,24 @@ fn pg_smd_immediate_unpartitioned_aggregate_merge() {
     assert_imv_correct("smd18_v", sql);
 }
 
+/// The trigger-body rewrite (step 4) of the 1.12.4 → 1.12.5 migration.
+fn smd_migration_1_12_5_trigger_rewrite() -> &'static str {
+    let migration = include_str!("../../sql/pg_reflex--1.12.4--1.12.5.sql");
+    let start = migration.find("DO $regen$").expect("1.12.5 migration step 4");
+    let end = migration[start..]
+        .find("$regen$;")
+        .expect("step 4 terminates")
+        + start
+        + "$regen$;".len();
+    &migration[start..end]
+}
+
 /// The 1.11.5 migration cuts the rebuild out of each installed 1.11.4
-/// statement-trigger body, leaving exactly what 1.11.5 renders, and the source's
-/// mixed upsert is then maintained correctly.
+/// statement-trigger body, and the 1.11.5 → … → 1.12.5 migrations chained after
+/// it leave exactly what the current library renders; the source's mixed upsert
+/// is then maintained correctly. The fixture's sub-blocks are rendered from the
+/// current templates and call the 1.12.5 skip hooks, so its DECLARE carries
+/// their two variables; real 1.12.4 bodies are pinned by `pg_test_upgrade_1_12_5.rs`.
 #[pg_test]
 fn pg_smd_migration_removes_rebuild_from_statement_trigger_bodies() {
     smd_plain_source("smd19", true);
@@ -357,6 +372,7 @@ fn pg_smd_migration_removes_rebuild_from_statement_trigger_bodies() {
         + start
         + "$stmt_triggers$;".len();
     Spi::run(&migration[start..end]).expect("migration step 5");
+    Spi::run(smd_migration_1_12_5_trigger_rewrite()).expect("1.12.5 migration step 4");
 
     assert_eq!(rebuilding(), 0, "a statement-trigger body still rebuilds");
     for ddl in &crate::schema_builder::build_trigger_ddls("smd19")[..3] {
