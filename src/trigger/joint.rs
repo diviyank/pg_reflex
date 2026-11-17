@@ -537,7 +537,12 @@ fn staged(imv: &Imv, source: &str, operation: &str) -> String {
     }
     let mut stmts: Vec<String> = transitions
         .iter()
-        .map(|t| format!("CREATE TEMP TABLE \"{t}\" ON COMMIT DROP AS SELECT * FROM \"{t}\""))
+        .flat_map(|t| {
+            [
+                format!("CREATE TEMP TABLE \"{t}\" ON COMMIT DROP AS SELECT * FROM \"{t}\""),
+                format!("ANALYZE pg_temp.\"{t}\""),
+            ]
+        })
         .collect();
     stmts.push(format!(
         "SELECT public.reflex_execute_separated(public.reflex_build_delta_sql({}, {}, {}, '', '', NULL, ''))",
