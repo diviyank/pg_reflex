@@ -195,9 +195,79 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
-    if let Some(operation) = operation.strip_prefix(joint::STAGED_OP_PREFIX) {
-        return joint::staged_delta_sql(view_name, source_table, operation);
-    }
+    build_delta_sql(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+        false,
+    )
+}
+
+/// [`reflex_build_delta_sql`] for the IMMEDIATE statement triggers, which
+/// replace a last statement marked `--<<REFLEX_THEN>>--` with the statements it
+/// returns.
+#[pg_extern]
+pub fn reflex_build_delta_sql_resolving(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+) -> String {
+    build_delta_sql(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+        true,
+    )
+}
+
+/// The second stage of a corrected delta, given the rows of the transition
+/// table and whether a group its correction subtracts from is missing.
+#[pg_extern]
+pub fn reflex_joint_resolved_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    counted: i64,
+    group_missing: bool,
+) -> String {
+    joint::resolved_delta_sql(view_name, source_table, operation, counted, group_missing)
+}
+
+/// The bookkeeping of a delta the statement trigger skips, over the rows of
+/// `transition_table`.
+#[pg_extern]
+pub fn reflex_joint_skipped_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    base_query: &str,
+    transition_table: &str,
+) -> String {
+    joint::skipped_delta_sql(view_name, source_table, base_query, transition_table)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_delta_sql(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+    resolves: bool,
+) -> String {
     if operation != NETTED_UPDATE_OP && !joint::in_partition_delta() {
         return joint::delta_sql(
             view_name,
@@ -207,6 +277,7 @@ pub fn reflex_build_delta_sql(
             end_query,
             aggregations_json,
             orig_base_query,
+            resolves,
         );
     }
     if delta_sources::delta_would_count_twice(view_name, source_table, base_query) {

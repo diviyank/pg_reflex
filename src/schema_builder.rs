@@ -576,6 +576,13 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     build_trigger_ddls_from_body(source_table, include_str!("../sql/trigger_body.plpgsql.in"))
 }
 
+/// Spliced before each `CONTINUE` skipping an IMV's delta in the statement
+/// trigger body: the skipped rows count as applied for the exact two-source
+/// deltas (`trigger::joint`).
+const SKIPPED_DELTA_BOOKKEEPING: &str = "_skipped_sql := public.reflex_joint_skipped_delta_sql(\
+     _rec.name, '__REFLEX_SLOT_SOURCE_TABLE__', _rec.base_query, '__REFLEX_SLOT_TRANSITION_TBL__'); \
+     IF _skipped_sql <> '' THEN EXECUTE _skipped_sql; END IF;";
+
 /// `build_trigger_ddls` with the statement-trigger body template given, so a
 /// migration test can render the bodies an older template produced.
 pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &str) -> Vec<String> {
@@ -758,9 +765,6 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
         slot_replace(
             body_template,
             &[
-                ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
-                ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
-                ("__REFLEX_SLOT_TRANSITION_TBL__", transition_tbl),
                 ("__REFLEX_SLOT_PRED_CHECK_BLOCK__", pred_check_block),
                 ("__REFLEX_SLOT_FILTER_SKIP_BLOCK__", filter_skip_block),
                 (
@@ -768,6 +772,10 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
                     directional_probe_block,
                 ),
                 ("__REFLEX_SLOT_PATH_C_BLOCK__", path_c_block),
+                ("__REFLEX_SLOT_SKIPPED__", SKIPPED_DELTA_BOOKKEEPING),
+                ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+                ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
+                ("__REFLEX_SLOT_TRANSITION_TBL__", transition_tbl),
                 ("__REFLEX_SLOT_OP_VALUE__", op_value),
             ],
         )
