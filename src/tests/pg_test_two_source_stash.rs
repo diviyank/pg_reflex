@@ -291,3 +291,20 @@ fn pg_two_source_stash_trigger_body_older_than_the_library_keeps_no_rows() {
     assert_eq!(last, 0, "a body that resolves no stash corrects no delta");
     probe_db_close(DBNAME);
 }
+
+/// A source with a column named `t`, the alias the stash once gave its
+/// transition table: the rows kept are the rows, not that column.
+#[pg_test]
+fn pg_two_source_stash_source_with_a_column_named_t() {
+    const DBNAME: &str = "reflex_tss_column_t";
+    tss_keyed_open(
+        DBNAME,
+        "INT",
+        ", t TIMETZ DEFAULT '10:00:00+01', c INT DEFAULT 3, n INT DEFAULT 4",
+        &["1", "2"],
+        &[],
+    );
+    let (first, _) = tss_keyed_joint_writes("2");
+    assert!(first > 0, "the rows of a source with a column named t are kept: corrected");
+    probe_db_close(DBNAME);
+}
