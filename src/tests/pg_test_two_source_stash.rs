@@ -325,3 +325,29 @@ fn pg_two_source_stash_source_with_a_column_named_as_the_stash_alias() {
     assert!(first > 0, "the rows of a source with a column named as the alias are kept: corrected");
     probe_db_close(DBNAME);
 }
+
+/// The other source is named bare and lives in a schema the writing session's
+/// search_path excludes. An UPDATE of s.x touching no column the IMV reads is
+/// still skipped: the skip needs s.x alone, and reads no source.
+#[pg_test]
+fn pg_two_source_stash_skip_with_the_other_source_out_of_the_search_path() {
+    const DBNAME: &str = "reflex_tss_bare_other";
+    const SUM: &str = "SELECT x.g, COUNT(*) AS n, SUM(x.a) AS sa, SUM(ya.b) AS sb \
+         FROM s.x JOIN ya ON ya.k = x.k GROUP BY x.g";
+    probe_db_open(DBNAME);
+    for statement in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.x (k INT PRIMARY KEY, g INT NOT NULL, a INT NOT NULL, note TEXT)",
+        "CREATE TABLE ya (k INT PRIMARY KEY, b INT NOT NULL)",
+        "INSERT INTO s.x SELECT g, g % 5, g, 'n' FROM generate_series(1, 40) g",
+        "INSERT INTO ya SELECT g, g * 2 FROM generate_series(1, 30) g",
+    ] {
+        worker_exec(statement);
+    }
+    ts_create("tss_bare_other", SUM, None, "IMMEDIATE");
+    worker_exec("SET search_path = s");
+    worker_exec("UPDATE s.x SET note = note || '!' WHERE k IN (1, 2)");
+    worker_exec("RESET search_path");
+    tsx_assert_correct(&[("tss_bare_other", SUM)], "after the UPDATE of an unread column");
+    probe_db_close(DBNAME);
+}
