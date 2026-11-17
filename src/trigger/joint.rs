@@ -53,6 +53,11 @@ const THEN_MARKER: &str = "--<<REFLEX_THEN>>--";
 /// The most transition rows a stash keeps: past it, V is recomputed instead.
 const STASH_ROW_LIMIT: i64 = 10_000;
 
+/// The alias of a transition table whose rows are stashed. They are read as
+/// `alias.*`, which names the row even when the source has a column of that
+/// name: a bare `alias` would then name the column.
+const STASHED_ROW: &str = "__reflex_stashed_row";
+
 const SEPARATOR: &str = "\n--<<REFLEX_SEP>>--\n";
 const POISONED: &str = "poison";
 
@@ -668,8 +673,8 @@ fn stash_rows_sql(
         let added = if transitions.contains(&transition) {
             rows.push(format!("(SELECT count(*) FROM \"{transition}\")"));
             format!(
-                "COALESCE((SELECT public.reflex_joint_stash_text(array_agg(t)) \
-                 FROM \"{transition}\" t), '{{}}')"
+                "COALESCE((SELECT public.reflex_joint_stash_text(array_agg({STASHED_ROW}.*)) \
+                 FROM \"{transition}\" {STASHED_ROW}), '{{}}')"
             )
         } else {
             "'{}'".to_string()
@@ -1035,7 +1040,9 @@ fn correction(
 /// a delta applied in between, while they were half written, read them exactly.
 /// So the delta is applied, and is corrected or recomputes, when another
 /// source's delta was applied over these writes (a stash is held for `source`)
-/// or the IMV was recomputed earlier in the statement.
+/// or the IMV was recomputed earlier in the statement. A source that does not
+/// resolve to a relation the IMV reads cannot be judged: its delta is applied,
+/// where it recomputes.
 pub(crate) fn delta_may_be_skipped(view_name: &str, source: &str, base_query: &str) -> bool {
     let statement = delta_sources::running_statement();
     if statement == delta_sources::NO_TRANSACTION {
@@ -1049,8 +1056,10 @@ pub(crate) fn delta_may_be_skipped(view_name: &str, source: &str, base_query: &s
         return false;
     }
     let imv = imv(view_name, base_query, "", None, names, statement);
-    imv.source_named(source)
-        .is_none_or(|relation| matches!(stash(view_name, relation.oid), Stash::Absent))
+    imv.every_source_resolved
+        && imv
+            .source_named(source)
+            .is_some_and(|relation| matches!(stash(view_name, relation.oid), Stash::Absent))
 }
 
 /// The bookkeeping of a delta of `source` its trigger skips (an ignored source,
