@@ -2,6 +2,138 @@
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-11-18
+
+A correctness release. An operator call (`reflex_rebuild_imv`,
+`reflex_reconcile`, the `reflex_set_*` setters) could deadlock with a
+COMMIT-time flush and abort the application's transaction. A join IMV
+counted the joint term ΔA ⋈ ΔB twice when two of its sources changed
+together: in one statement (writable CTE, MERGE, a trigger or a foreign
+key cascade writing the other source), or through an IMV over one of
+its own sources. A DROP TABLE of a source partition left the IMVs over
+the source holding the dropped rows. The update adds six functions,
+replaces the `sql_drop` event trigger function and rewrites the trigger
+functions of every source in place.
+`ALTER EXTENSION pg_reflex UPDATE TO '1.12.5';`
+
+---
+
+### Fixed
+
+- **Operator calls take the IMV's lock before its registry row.**
+  `reflex_rebuild_imv` and `reflex_reconcile` updated the IMV's
+  `__reflex_ivm_reference` row (the rebuild count) before taking the IMV's
+  advisory lock, while a COMMIT flush holds that lock and then updates the
+  same row: a deadlock (40P01) whose victim could be the writer. Every
+  operator entry point that writes an IMV's registry row now takes its
+  lock first: `reflex_rebuild_imv`, `reflex_reconcile` (both forms),
+  `reflex_set_wipe_threshold`, `reflex_set_wipe_floor_rows`,
+  `reflex_set_partition_dispatch_cost_cap`, `reflex_ack_ignore_source`
+  and `reflex_rebuild_imv_metadata`.
+- **An IMV joining a source and an IMV over that source counts the joint
+  delta once.** Within one source's delta, the IMVs were maintained in
+  ascending dependency depth, so the IMV over the source absorbed ΔX
+  before its reader joined ΔX against it: ΔX ⋈ ΔU was counted twice. The
+  DEFERRED flush and the IMMEDIATE and DEFERRED trigger bodies now
+  maintain readers first (`graph_depth DESC`): the reader joins ΔX with
+  the old state, and the change of the inner IMV then reaches it as its
+  own delta. Exact, no recompute.
+- **Two sources of a join IMV written in one statement.** A writable CTE,
+  a MERGE or upsert, a user trigger on one source writing the other, an
+  `ON DELETE` / `ON UPDATE CASCADE` or `SET NULL` foreign key between two
+  sources, or `SET CONSTRAINTS ALL IMMEDIATE` over staged deltas, applied
+  each source's delta against the other's new state, so ΔA ⋈ ΔB landed
+  twice (a wrong aggregate, or a 23505 on a passthrough key).
+  - An IMMEDIATE IMV of SUM / COUNT / AVG aggregates or a passthrough over
+    inner equi-joins is corrected exactly: the second source's delta
+    subtracts the joint term computed from the rows the first delta kept
+    (`reflex_build_delta_sql_resolving`). Whether the first delta saw all
+    of the other source's writes is decided from the transaction's own
+    write counters; in any doubt the IMV is recomputed. A partitioned
+    source whose partitions were attached, detached or dropped earlier in
+    the transaction is in doubt for the rest of it.
+  - Cost, release build, pg17, a one-row two-source CTE on a 200 K ⋈ 200 K
+    join: 14 → 28 ms with 2 000 groups and 100 → 163 ms with 100 000
+    groups, against 1.12.4's double-counting path. Most of it is one
+    `ANALYZE` of the IMV's intermediate table per correction. A write to
+    one source costs what it did.
+  - Other shapes (MIN / MAX, outer joins, subqueries, more than two
+    sources written, a source holding a column whose type is outside the
+    exact-text whitelist, such as an enum, a domain or money) recompute
+    the IMV at the second delta. So does an IMMEDIATE IMV over a source
+    that also has a DEFERRED IMV: its trigger bodies do not resolve the
+    correction.
+  - DEFERRED IMVs are rebuilt at COMMIT when two of their sources were
+    written, as before.
+  - A partition attach or detach of one source plus a write to another
+    source of the same IMV in one transaction reconciles the IMV at the
+    partition flush instead of applying the partition delta twice.
+- **DROP TABLE of a source partition that holds rows.** The `sql_drop`
+  event trigger queues the partition's root (taken from the partition
+  snapshot, matched by oid) for the COMMIT-time partition flush, which
+  removes the dropped rows from every IMV over the source and its
+  dependents. A role that cannot write the partition queue gets a WARNING
+  naming `reflex_flush_partition_source('<root>')`; the DROP succeeds.
+
+### Tests
+
+- `pg_test_lock_order.rs`: each operator entry point waits for the IMV's
+  lock held by a flush before touching its registry row (two sessions),
+  and two operators queued behind a flush finish in graph order.
+- `pg_test_joint_delta.rs`: the joint delta of a source and an IMV over
+  it, DEFERRED and IMMEDIATE, three levels, group moves and a diamond.
+- `pg_test_two_source_statement.rs`, `pg_test_two_source_counters.rs`,
+  `pg_test_two_source_exact.rs`, `pg_test_two_source_stash.rs`: writable
+  CTEs, FK cascades, user and BEFORE ROW triggers, upserts, MERGE,
+  subtransactions, PREPARE TRANSACTION, a seeded random mix, and stash
+  round trips under other DateStyle / TimeZone / float settings, each
+  against the `EXCEPT ALL` oracle; corrected statements are checked to
+  rewrite only the groups they touch.
+- `pg_test_two_source_correction_cost.rs`: a corrected statement analyzes
+  the intermediate and affected tables once per correction, not once per
+  piece.
+- `pg_test_two_source_partition_set.rs`: a written partition detached or
+  dropped (a leaf or a branch), or a written table attached, before a
+  statement writing both sources keeps the IMMEDIATE IMV exact inside the
+  transaction.
+- `pg_test_drop_source_partition.rs`: DROP of a filled partition and of a
+  sub-partitioned branch, IMMEDIATE and DEFERRED, nine IMV shapes and a
+  dependent; the privilege and exclusion guards.
+- `pg_test_partitioned_reconcile_dependents.rs`: repeated reconciles of a
+  partitioned IMV keep its partitioned and plain dependents correct
+  (the 2026-07-28 report no longer reproduces on 1.12.4).
+- `pg_test_upgrade_1_12_5.rs`: 1.12.4-rendered trigger bodies on real IMVs
+  are rewritten by this migration into exactly what a 1.12.5 create
+  renders, after which a two-source CTE is corrected instead of
+  recomputed.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.5';` creates
+  `reflex_build_delta_sql_resolving`, `reflex_joint_resolved_delta_sql`,
+  `reflex_joint_skipped_delta_sql`, `reflex_joint_delta_may_be_skipped`,
+  `reflex_joint_stash_text` and `reflex_joint_stashed_rows`, replaces
+  `__reflex_on_sql_drop()`, and regenerates the trigger bodies: it
+  rewrites the delta trigger function of every source in place into what
+  1.12.5 renders (readers first; the exact two-source correction). It
+  reports the count (INFO) and lists any body it could not match in a
+  WARNING with its remedy. No registry column changes; no IMV needs to be
+  recreated.
+- Run the update right after installing the library and before creating
+  IMVs: an IMV created in between renders bodies that call the new
+  functions, and writes to its sources fail until the update runs. Bodies
+  not yet rewritten stay correct (they recompute a two-source statement).
+- Recommended, not required: `reflex_reconcile` each join IMV whose
+  sources may have been written together before the upgrade — two of its
+  sources in one statement (writable CTE, MERGE, a trigger on one source
+  writing another) or through an `ON DELETE CASCADE` foreign key between
+  two of its sources — and each join IMV that reads both a source and an
+  IMMEDIATE IMV over that source. Such IMVs may hold rows double counted
+  by 1.12.4. A DEFERRED IMV whose sources were written in one transaction
+  was rebuilt at COMMIT and is not affected.
+
+---
+
 ## [1.12.4] - 2026-11-06
 
 A bug-fix release. An aggregate IMV that LEFT JOINs a secondary on a

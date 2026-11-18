@@ -550,6 +550,24 @@ extension_sql!(
         RETURN _value;
     END;
     $fn$;
+
+    -- The rows a two-source delta keeps for the other source's delta are
+    -- written as text and read back by these two functions only. Each pins, for
+    -- the time of its call, every setting the text of the column types kept
+    -- depends on, to a value under which that text is exact (the ones pg_dump
+    -- pins, plus the time zone and the bytea format): the session's settings,
+    -- and a change to them between the write and the read, have no effect.
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stash_text(stashed anyarray)
+    RETURNS text LANGUAGE sql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS 'SELECT $1::text';
+
+    CREATE OR REPLACE FUNCTION public.reflex_joint_stashed_rows(stashed text, row_type anyarray)
+    RETURNS anyarray LANGUAGE plpgsql STABLE
+    SET extra_float_digits = 3 SET DateStyle = 'ISO, YMD' SET IntervalStyle = 'postgres'
+    SET TimeZone = 'UTC' SET bytea_output = 'hex'
+    AS $fn$ DECLARE parsed ALIAS FOR $0; BEGIN parsed := stashed; RETURN parsed; END $fn$;
     "#,
     name = "pg_reflex_init",
 );
@@ -1205,13 +1223,60 @@ extension_sql!(
     DECLARE
         _obj RECORD;
         _imv RECORD;
+        _stale_root TEXT;
     BEGIN
         FOR _obj IN
-            SELECT object_identity, schema_name, object_name,
+            SELECT objid, object_identity, schema_name, object_name,
                    (schema_name || object_name) !~ '[."A-Z]' AS reads_back_unquoted
             FROM pg_event_trigger_dropped_objects()
             WHERE object_type = 'table'
         LOOP
+            -- A dropped partition of a tracked source: the table is gone, so its
+            -- root comes from the snapshot (matched by oid, never by name) and is
+            -- queued for the COMMIT-time partition flush, which classifies the
+            -- vanished child as a detach. Never queued for a root that is an IMV
+            -- (pg_reflex's own swap drops IMV partitions; the cascade is
+            -- code-driven). A root dropped in the same statement is reported
+            -- before its partitions, so its IMVs are already torn down by the
+            -- source branch below and no enabled reader is left to match.
+            -- A role that cannot read the snapshot cannot tell a tracked partition
+            -- from any other table, so it is skipped: reading it would raise on
+            -- every unrelated DROP. A role that finds a tracked partition but
+            -- cannot write the queue (INSERT .. ON CONFLICT DO UPDATE needs
+            -- SELECT, INSERT and UPDATE on it) is told loudly instead.
+            IF has_table_privilege('public.__reflex_source_partition_snapshot', 'SELECT') THEN
+                FOR _stale_root IN
+                    SELECT DISTINCT s.source_root
+                    FROM public.__reflex_source_partition_snapshot s
+                    WHERE s.child_oid = _obj.objid::bigint
+                      AND s.source_root NOT LIKE '%\_\_reflex\_%'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM public.__reflex_ivm_reference r
+                          WHERE public.__reflex_named_relation(
+                                    CASE WHEN r.target_schema IS NOT NULL AND r.name NOT LIKE '%.%'
+                                         THEN quote_ident(r.target_schema) || '.' || r.name
+                                         ELSE r.name END)
+                                = public.__reflex_named_relation(s.source_root))
+                      AND EXISTS (
+                          SELECT 1 FROM public.__reflex_ivm_reference r
+                          WHERE r.enabled
+                            AND public.__reflex_reads_relation(r.depends_on, s.source_root))
+                LOOP
+                    IF has_table_privilege('public.__reflex_partition_pending', 'SELECT')
+                       AND has_table_privilege('public.__reflex_partition_pending', 'INSERT')
+                       AND has_table_privilege('public.__reflex_partition_pending', 'UPDATE') THEN
+                        INSERT INTO public.__reflex_partition_pending (source_root)
+                        VALUES (_stale_root)
+                        ON CONFLICT (source_root)
+                        DO UPDATE SET enqueued_at = statement_timestamp(),
+                                      attempts    = public.__reflex_partition_pending.attempts + 1;
+                    ELSE
+                        RAISE WARNING 'pg_reflex: dropped partition % of source %, but this role cannot write the partition queue; the IMVs over it are stale — run SELECT reflex_flush_partition_source(''%'') as a role that can',
+                            _obj.object_identity, _stale_root, _stale_root;
+                    END IF;
+                END LOOP;
+            END IF;
+
             -- A source is registered without a schema only when it is a table of
             -- public: a table of another schema with the same name is another table.
             -- A name PostgreSQL prints quoted but reads back bare (a non-ASCII
@@ -1977,6 +2042,7 @@ mod tests {
     include!("tests/pg_test_ignored_source_heal.rs");
     include!("tests/pg_test_reconcile_log_noise.rs");
     include!("tests/pg_test_rebuild_commit.rs");
+    include!("tests/pg_test_lock_order.rs");
     include!("tests/pg_test_deferred_marker.rs");
     include!("tests/pg_test_deferred_reconcile.rs");
     include!("tests/pg_test_v112_utf8.rs");
@@ -1995,6 +2061,7 @@ mod tests {
     include!("tests/pg_test_v112_deferred_partition.rs");
     include!("tests/pg_test_v112_shapes.rs");
     include!("tests/pg_test_v112_partition_dml.rs");
+    include!("tests/pg_test_drop_source_partition.rs");
     include!("tests/pg_test_v112_partition_review.rs");
     include!("tests/pg_test_v112_seam_review.rs");
     include!("tests/pg_test_v112_partition_locks.rs");
@@ -2012,6 +2079,15 @@ mod tests {
     include!("tests/pg_test_v1122_guc_empty_cast.rs");
     include!("tests/pg_test_v1122_unread_column_check.rs");
     include!("tests/pg_test_node_fill.rs");
+    include!("tests/pg_test_partitioned_reconcile_dependents.rs");
+    include!("tests/pg_test_joint_delta.rs");
+    include!("tests/pg_test_two_source_statement.rs");
+    include!("tests/pg_test_two_source_counters.rs");
+    include!("tests/pg_test_two_source_exact.rs");
+    include!("tests/pg_test_two_source_stash.rs");
+    include!("tests/pg_test_two_source_correction_cost.rs");
+    include!("tests/pg_test_two_source_partition_set.rs");
+    include!("tests/pg_test_upgrade_1_12_5.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
@@ -2029,7 +2105,10 @@ pub mod pg_test {
         // transaction end. Raise the per-transaction lock budget so larger ad-hoc
         // runs (PG_REFLEX_FUZZ_CASES up to a few hundred) don't hit "out of shared
         // memory". Very large runs still need batching.
-        vec!["max_locks_per_transaction = 4096"]
+        vec![
+            "max_locks_per_transaction = 4096",
+            "max_prepared_transactions = 4",
+        ]
     }
 }
 

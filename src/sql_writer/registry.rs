@@ -548,6 +548,19 @@ pub fn read_rebuild_risk(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Optio
     })
 }
 
+/// Take the IMV's two-key advisory lock, the one the COMMIT-time flush holds
+/// while it writes the IMV's registry row. Every operator path must call this
+/// before its first write to that row, or it can hold the row while queueing for
+/// the lock the flush holds: a deadlock the flush loses.
+pub fn lock_imv(client: &mut pgrx::spi::SpiClient<'_>, name: &str) -> Result<(), spi::Error> {
+    client.update(
+        "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+        None,
+        &[unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+    )?;
+    Ok(())
+}
+
 /// Record one targeted-recovery call against an IMV: bump `rebuild_count` and
 /// stamp `last_rebuild_at`. Returns the number of catalog rows updated (0 = IMV
 /// not found). Called only from the targeted-recovery entry points, never from
@@ -578,6 +591,7 @@ pub fn set_wipe_threshold(
     name: &str,
     value: Option<pgrx::AnyNumeric>,
 ) -> Result<u64, spi::Error> {
+    lock_imv(client, name)?;
     let oid_text = PgBuiltInOids::TEXTOID.oid().value();
     let n = client
         .update(
@@ -603,6 +617,7 @@ fn set_int8_column(
     name: &str,
     value: Option<i64>,
 ) -> Result<u64, spi::Error> {
+    lock_imv(client, name)?;
     let oid_text = PgBuiltInOids::TEXTOID.oid().value();
     let sql = format!("UPDATE public.__reflex_ivm_reference SET {column} = $1 WHERE name = $2");
     let n = client

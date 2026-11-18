@@ -1,6 +1,6 @@
 DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN;
         _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN;
-        _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT;
+        _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT; _skipped_sql TEXT; _then TEXT;
         _pre_trans_count BIGINT; _pre_src_total BIGINT; _pre_thr NUMERIC; _pre_per_imv NUMERIC; _pre_ratio NUMERIC;
 BEGIN
     SELECT EXISTS(SELECT 1 FROM "__REFLEX_SLOT_TRANSITION_TBL__" LIMIT 1) INTO _has_rows;

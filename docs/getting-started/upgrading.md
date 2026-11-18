@@ -52,6 +52,8 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.11.3 → 1.11.4 | Silent-wipe observability and prevention. A failed deferred flush now marks the IMV `known_stale` (it previously discarded the staged delta silently); `reflex_ivm_status()` gains `is_estimate`, counts anomalous IMVs exactly, and reports IMVs whose partition source is capped; new `__reflex_event_log` table and `reflex_prune_event_log`; new `pg_reflex.flush_failure_policy` GUC (`warn` default, opt-in `error`); **`create_reflex_ivm` refuses an unsound `ignore_sources` entry** unless acknowledged with a `'!'` prefix or `reflex_ack_ignore_source`; `reflex_audit` / `reflex_doctor` (F13) report existing ones; a change to an ignored source that joins onto the partition key queues the affected partitions for heal (`reflex_heal_ignored_sources`, run by `reflex_scheduled_reconcile` and doctor F14). The migration adds `ignore_ack`, the event log, the heal queue, recreates `reflex_ivm_status()` (return-shape change), and installs heal triggers on existing partitioned IMVs. | See [Upgrading to 1.11.4](#upgrading-to-1114) below: upgrade in a quiet window with `lock_timeout` set, treat `HEALED` from `reflex_scheduled_reconcile` as success, and add the `'!'` marker to accepted unsound ignores before recreating any IMV or running `reflex_rebuild_chain`. |
 | 1.11.4 → 1.11.5 | Rebuilds of an IMV with dependents (source TRUNCATE, `reflex_reconcile`, wipe dispatch, partition rebuilds) hand dependents a row diff instead of clearing or fully rebuilding them; a DEFERRED IMV whose source is truncated is rebuilt once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a 0.9 threshold for IMVs with dependents; a multi-source guard rebuild failure marks the IMV stale instead of aborting COMMIT. IMMEDIATE IMVs no longer rebuild on a large statement (the DEFERRED flush still may), and a passthrough IMMEDIATE IMV without a key for a source is fully refreshed by every write to it (`create_reflex_ivm` warns). The migration adds five functions, replaces `__reflex_deferred_flush_fn` and `__reflex_partition_child_for_key`, rewrites the installed deferred TRUNCATE trigger bodies and cuts the rebuild out of the IMMEDIATE trigger bodies, in place. | **Writes to IMV sources fail until the update runs.** See [Upgrading to 1.11.5](#upgrading-to-1115): in a quiet window, install the library, immediately run `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5'` in every database, then recycle connection pools. The update takes no lock on sources. |
 | 1.11.5 → 1.12.0 | Correctness of the create-time contract and of maintenance: SQL built from the query text, aggregates and HAVING, joins, subqueries, CTEs, column types, identifier spelling, partitioned sources. Also: sources a partition swap cannot follow are refused, one schema's partition maintenance no longer waits on another's locks, a swap refreshes each dependent once, a transient lock error no longer suspends a root. Several definitions are now refused at create and several shapes are recomputed in full on write. The migration replaces `__reflex_on_sql_drop`, `__reflex_on_ddl_command_end` and `__reflex_partition_flush_fn`, and creates `__reflex_named_relation` and `__reflex_reads_relation`; it does not rewrite per-source trigger functions. | **Partition DDL on a source fails until the update runs**: run `ALTER EXTENSION pg_reflex UPDATE TO '1.12.0'` right after installing the library. Then **recreate every IMV.** See [Upgrading to 1.12.0](#upgrading-to-1120) for the steps, the refused definitions with their remedies, the slower shapes, and what stays stale if IMVs are not recreated. |
+| … 1.12.0 → 1.12.4 | See the [changelog](../changelog.md) for each intermediate release. | see changelog per version. |
+| 1.12.4 → 1.12.5 | Operator calls take an IMV's advisory lock before its registry row (no deadlock with a COMMIT flush); IMVs over one source's delta are maintained readers first; a join IMV whose two sources change in one statement (writable CTE, MERGE, a trigger, an FK cascade) is corrected exactly for IMMEDIATE SUM / COUNT / AVG and passthrough over inner equi-joins, recomputed otherwise; `DROP TABLE` of a filled source partition removes its rows from the IMVs at COMMIT. The migration creates six functions, replaces `__reflex_on_sql_drop` and rewrites every source's delta trigger functions in place (INFO count; WARNING lists bodies it could not match). | Run `ALTER EXTENSION pg_reflex UPDATE TO '1.12.5'` right after installing the library: an IMV created before it renders bodies that call the new functions. Recommended, not required: `reflex_reconcile` the join IMVs listed in [Upgrading to 1.12.5](#upgrading-to-1125). |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
 
@@ -195,6 +197,29 @@ into them, so on a large IMV the `COMMIT` can take minutes.
 - The diff stages rows in a temporary table, so a transaction that
   rebuilds an IMV with dependents (also via `reflex_reconcile`) cannot be
   prepared with `PREPARE TRANSACTION`.
+
+## Upgrading to 1.12.5
+
+```sql
+ALTER EXTENSION pg_reflex UPDATE TO '1.12.5';
+```
+
+The migration creates six functions (`reflex_build_delta_sql_resolving`, `reflex_joint_resolved_delta_sql`, `reflex_joint_skipped_delta_sql`, `reflex_joint_delta_may_be_skipped`, `reflex_joint_stash_text`, `reflex_joint_stashed_rows`), replaces `__reflex_on_sql_drop()` and rewrites the delta trigger function of every source in place into what 1.12.5 renders. It reports the count of rewritten bodies (INFO) and lists any body it could not match in a WARNING with its remedy. No registry column changes and no IMV needs to be recreated.
+
+**Run the update right after installing the library, before creating IMVs.** An IMV created in between renders trigger bodies that call the new functions, and writes to its sources fail until the update runs. Bodies not yet rewritten stay correct: they recompute the IMV on a two-source statement.
+
+**Reconcile join IMVs that 1.12.4 may have double counted** (recommended, not required). 1.12.4 counted the joint term ΔA ⋈ ΔB twice in:
+
+- a join IMV two of whose sources were written in one statement: a writable CTE, a MERGE, a trigger on one source writing another, or an `ON DELETE CASCADE` foreign key between two of its sources;
+- a join IMV that reads both a source and an IMMEDIATE IMV over that source.
+
+```sql
+SELECT reflex_reconcile('<imv_name>');
+```
+
+A DEFERRED IMV whose sources were written in one transaction was rebuilt at COMMIT and is not affected.
+
+**Behaviour change: two-source statements.** An IMMEDIATE SUM / COUNT / AVG or passthrough IMV over inner equi-joins is corrected exactly when one statement writes two of its sources. Other shapes recompute the IMV at the second source's delta: see [Shapes recomputed in full on write](../limitations/unsupported-shapes.md#shapes-recomputed-in-full-on-write).
 
 ## Upgrading to 1.12.3
 

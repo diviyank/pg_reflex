@@ -168,6 +168,8 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         return msg.to_string();
     }
     let result: Result<(usize, usize, usize), String> = Spi::connect_mut(|client| {
+        crate::sql_writer::registry::lock_imv(client, view_name)
+            .map_err(|e| format!("lock failed: {}", e))?;
         let rows = client
             .select(
                 "SELECT base_query, partition_columns, ignored_sources \
@@ -1406,7 +1408,11 @@ fn reflex_ack_ignore_source(imv: &str, source: &str) -> String {
         s = source.replace('\'', "''"),
         v = imv.replace('\'', "''"),
     );
-    match Spi::run(&sql) {
+    let locked_write = Spi::connect_mut(|client| {
+        crate::sql_writer::registry::lock_imv(client, imv)?;
+        client.update(&sql, None, &[]).map(|_| ())
+    });
+    match locked_write {
         Ok(()) => "ACKNOWLEDGED".to_string(),
         Err(e) => format!("ERROR: {e}"),
     }

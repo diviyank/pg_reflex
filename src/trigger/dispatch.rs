@@ -644,6 +644,62 @@ pub(crate) fn push_materialized_merge_and_affected(
     select_expr: &str,
     include_cleanup: bool,
 ) {
+    push_merge_and_affected(
+        stmts,
+        scratch_tbl,
+        delta_query,
+        intermediate_tbl,
+        plan,
+        op,
+        affected_tbl,
+        select_expr,
+        include_cleanup,
+        true,
+    );
+}
+
+/// [`push_materialized_merge_and_affected`] without refreshing the statistics
+/// of the intermediate and affected tables: for a caller merging several pieces
+/// in a row, which analyzes both once after the last.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_unanalyzed_merge_and_affected(
+    stmts: &mut Vec<String>,
+    scratch_tbl: &str,
+    delta_query: &str,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
+    affected_tbl: &str,
+    select_expr: &str,
+    include_cleanup: bool,
+) {
+    push_merge_and_affected(
+        stmts,
+        scratch_tbl,
+        delta_query,
+        intermediate_tbl,
+        plan,
+        op,
+        affected_tbl,
+        select_expr,
+        include_cleanup,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_merge_and_affected(
+    stmts: &mut Vec<String>,
+    scratch_tbl: &str,
+    delta_query: &str,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
+    affected_tbl: &str,
+    select_expr: &str,
+    include_cleanup: bool,
+    analyze: bool,
+) {
     if include_cleanup {
         stmts.push(format!("TRUNCATE {}", affected_tbl));
     }
@@ -661,7 +717,9 @@ pub(crate) fn push_materialized_merge_and_affected(
     // dead-cleanup DELETE) need accurate stats so the planner picks an Index
     // Scan via the composite key instead of a pathological SeqScan or
     // NestedLoop. A full ANALYZE on a 180K-row intermediate is ~150 ms.
-    stmts.push(format!("ANALYZE {}", intermediate_tbl));
+    if analyze {
+        stmts.push(format!("ANALYZE {}", intermediate_tbl));
+    }
     // Scratch is the result of GROUP BY in build_merge_from_table_sql's delta,
     // so it already contains one row per group key. DISTINCT here would add a
     // redundant hash/sort pass for the same output.
@@ -673,7 +731,9 @@ pub(crate) fn push_materialized_merge_and_affected(
     // fresh stats the planner estimates 1 row and picks NL+SeqScan for the
     // downstream dead-cleanup DELETE and target sync EXISTS lookups
     // (pathological at high affected counts). ~50 ms cost.
-    stmts.push(format!("ANALYZE {}", affected_tbl));
+    if analyze {
+        stmts.push(format!("ANALYZE {}", affected_tbl));
+    }
 }
 
 // Placeholder for dispatch on the INSERT and DELETE codegen paths

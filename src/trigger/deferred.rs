@@ -1341,6 +1341,11 @@ fn flush_staged_deltas(source_table: &str) -> String {
     // source in `ignore_sources` are excluded — the array-overlap check matches
     // both the qualified ($1) and bare ($2) forms, mirroring the trigger-body
     // runtime skip so the ignore contract holds on the deferred path too.
+    //
+    // Deepest first: an IMV V that reads this source and a DEFERRED IMV U over it
+    // must apply this delta against U's state before U absorbs it. U then stages
+    // its own delta, which V receives from U's flush against this source's new
+    // state: ΔX ⋈ U_old + X_new ⋈ ΔU, the joint term counted once.
     let bare_source = source_table
         .split('.')
         .next_back()
@@ -1364,7 +1369,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
                    AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
                    AND NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) && ARRAY[$1, $2]::TEXT[]) \
-                 ORDER BY graph_depth, name",
+                 ORDER BY graph_depth DESC, name",
                 None,
                 &args,
             )
@@ -1710,9 +1715,11 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // net delta were applied independently: every per-source delta joins
         // against the OTHER sources' already-committed NEW state, so the cross
         // product is added once per mutated source instead of once total.
-        // IMMEDIATE mode is immune (per-statement triggers apply deltas
-        // sequentially, each seeing the correct intermediate state); the
-        // hazard is unique to the commit-time batch flush. Detect the batch
+        // (One source and an IMV over it, both read by an IMV, is exact through
+        // the deepest-first order of the per-source loops, here and in the
+        // IMMEDIATE statement triggers; two IMVs over the same source read by
+        // one IMV — a diamond — reach that IMV as two pending sources and are
+        // made correct only by this guard's rebuild.) Detect the batch
         // shape once here — the per-IMV loop lists any affected IMV for one
         // COMMIT-time full rebuild (`rebuild_listed`), and every delta staged for
         // it before that rebuild is skipped. 'TRUNCATE' rows are
@@ -1867,6 +1874,49 @@ fn flush_staged_deltas(source_table: &str) -> String {
                         continue;
                     }
                 }
+            }
+            if super::delta_sources::delta_would_count_twice(imv_name, source_table, base_query) {
+                // Flushed inside the statement that wrote another of its sources
+                // (`SET CONSTRAINTS ALL IMMEDIATE`): rebuilt from their final
+                // state, again if it was rebuilt earlier in the transaction.
+                ensure_temp_table(
+                    client,
+                    "__reflex_deferred_rebuild",
+                    crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                );
+                ensure_temp_table(
+                    client,
+                    "__reflex_deferred_reconciled_batch",
+                    RECONCILED_BATCH_TABLE_DDL,
+                );
+                client
+                    .update(
+                        "DELETE FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = $1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                imv_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report();
+                client
+                    .update(
+                        "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                         VALUES ($1, TRUE) \
+                         ON CONFLICT (name) DO UPDATE SET reconcile = TRUE, attempts = 0",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                imv_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report();
+                total_processed += 1;
+                continue;
             }
             if !scoped.is_empty() {
                 // Partition- or key-scoped rebuilds of this IMV in this
