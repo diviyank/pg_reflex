@@ -5,8 +5,9 @@
 // corrected statement and grows with the IMV.
 
 const JO_DDL: [&str; 4] = [
-    "CREATE TABLE jo_x (k INT PRIMARY KEY, g INT NOT NULL, a INT NOT NULL)",
-    "CREATE TABLE jo_y (k INT PRIMARY KEY, b INT NOT NULL)",
+    "CREATE TABLE jo_x (k INT PRIMARY KEY, g INT NOT NULL, a INT NOT NULL) \
+     WITH (autovacuum_enabled = false)",
+    "CREATE TABLE jo_y (k INT PRIMARY KEY, b INT NOT NULL) WITH (autovacuum_enabled = false)",
     "INSERT INTO jo_x SELECT i, i % 40, i % 7 FROM generate_series(1, 400) i",
     "INSERT INTO jo_y SELECT i, i % 11 FROM generate_series(1, 400) i",
 ];
@@ -32,6 +33,9 @@ fn pg_two_source_correction_analyzes_once_per_correction() {
     ts_create("jo_sum", JO_SUM, None, "IMMEDIATE");
     let intermediate = rbc_select("public.reflex_intermediate_table_name('jo_sum')");
     let affected = "__reflex_affected_jo_sum";
+    for table in [intermediate.as_str(), affected] {
+        worker_exec(&format!("ALTER TABLE {table} SET (autovacuum_enabled = false)"));
+    }
     assert!(
         jo_analyze_count(&intermediate) >= 0 && jo_analyze_count(affected) >= 0,
         "the intermediate and affected tables of jo_sum must exist"
