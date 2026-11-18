@@ -587,6 +587,9 @@ fn bookkeeping(
     operation: &str,
     resolves: bool,
 ) -> Vec<String> {
+    if let Some((_, relation)) = imv.sources.iter().find(|(_, r)| r.oid == source_oid) {
+        delta_sources::remember_leaves(relation);
+    }
     let counted = applied_setting(imv.name, source_oid);
     let mut stmts = vec![format!(
         "SELECT set_config('{counted}', (COALESCE(NULLIF(current_setting('{counted}', true), ''), '0')::bigint \
