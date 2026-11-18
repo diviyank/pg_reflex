@@ -11,7 +11,7 @@ source already has reflex statement triggers (another IMV over it), the statemen
 trigger then fires, finds the new IMV registered in `__reflex_ivm_reference`, and applies the
 statement's transition rows to it a second time.
 
-## Reproduction (verified on 1.12.5, pg17)
+## Reproduction (verified on 1.12.4 and 1.12.5, pg17: same result)
 
 ```sql
 CREATE TABLE sb (k INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL);

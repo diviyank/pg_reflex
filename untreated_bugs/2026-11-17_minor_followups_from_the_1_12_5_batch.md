@@ -15,6 +15,11 @@ a dedicated report before working on one if it turns out larger.
   registry row is missing, silently. Refuse loudly (WARNING naming the IMV) instead.
 - **Skip hook on single-source IMVs.** Every skipped delta of a single-source IMV now calls
   `reflex_joint_delta_may_be_skipped`; the 1.12.5 benchmark measures it (see the release report).
+- **Cost of a correction.** Release build, pg17, IMMEDIATE grouped SUM over a 200 K ⋈ 200 K join:
+  a one-row two-source CTE takes 32.7 ms corrected (1.12.4: 12.5 ms, which double counts insert /
+  delete shapes; a full `reflex_reconcile` of the IMV: 124 ms). About 20 ms of fixed overhead per
+  corrected statement is worth profiling (stash write/read, the pinned-settings functions, the
+  `--<<REFLEX_THEN>>--` re-entry). A one-source write to the same join IMV costs 7.29 ms vs 6.89 ms.
 - **Tests that do not assert a correction ran.** The 2PC (`PREPARE TRANSACTION`) and lock-wait tests
   check the oracle but not `corrected > 0`, so a silent fallback to recompute would stay green.
 
