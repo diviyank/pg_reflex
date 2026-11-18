@@ -117,3 +117,43 @@ fn pg_two_source_partition_set_attached_written_table() {
         ],
     );
 }
+
+/// A table attached, written through the source, emptied and removed again: the
+/// leaves are back to those first read, but the rows counted as applied while
+/// the table was attached are no longer in the sum.
+fn tsp_assert_correct_after_attached_table_removed(dbname: &str, remove: &str) {
+    tsp_open(dbname);
+    worker_exec("CREATE TABLE tsp_t (LIKE tsp_s INCLUDING ALL)");
+    worker_exec("BEGIN");
+    worker_exec("INSERT INTO tsp_s VALUES (40, 'a', 1)");
+    worker_exec("ALTER TABLE tsp_s ATTACH PARTITION tsp_t FOR VALUES IN ('z')");
+    worker_exec("INSERT INTO tsp_s VALUES (41, 'z', 1), (42, 'z', 1), (43, 'z', 1), (44, 'z', 1)");
+    worker_exec("DELETE FROM tsp_s WHERE g = 'z'");
+    worker_exec(remove);
+    worker_exec(
+        "WITH s AS (INSERT INTO tsp_s SELECT 100 + g, 'e', 7 FROM generate_series(1, 8) g \
+         RETURNING 1) INSERT INTO tsp_d VALUES ('e', 'ee')",
+    );
+    let inside = rbc_mismatch("tsp_v", TSP_SQL);
+    worker_exec("COMMIT");
+    let after = rbc_mismatch("tsp_v", TSP_SQL);
+    probe_db_close(dbname);
+    assert_eq!(
+        (inside, after),
+        (0, 0),
+        "tsp_v differs from its query (inside, after COMMIT) after <{remove}>"
+    );
+}
+
+#[pg_test]
+fn pg_two_source_partition_set_attached_written_table_detached() {
+    tsp_assert_correct_after_attached_table_removed(
+        "reflex_tsp_att_det",
+        "ALTER TABLE tsp_s DETACH PARTITION tsp_t",
+    );
+}
+
+#[pg_test]
+fn pg_two_source_partition_set_attached_written_table_dropped() {
+    tsp_assert_correct_after_attached_table_removed("reflex_tsp_att_drop", "DROP TABLE tsp_t");
+}
