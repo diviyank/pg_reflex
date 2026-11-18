@@ -349,7 +349,7 @@ pub(super) fn holds_unapplied_writes(name: &str, relation: &Relation) -> bool {
 /// The rows of a source the running transaction wrote ([`transaction_writes`]),
 /// over every leaf of a partitioned source. `None` when they are not counted, a
 /// leaf is not a heap table, or the leaves are not those this transaction first
-/// read ([`same_leaves_as_first_read`]).
+/// read ([`leaves_unchanged_since_first_read`]).
 pub(super) fn source_writes(relation: &Relation) -> Option<i64> {
     match relation.signal {
         WriteSignal::TransactionCounters => transaction_writes(relation.oid),
@@ -363,7 +363,7 @@ pub(super) fn source_writes(relation: &Relation) -> Option<i64> {
 pub(super) fn remember_leaves(relation: &Relation) {
     if relation.partitioned {
         if let Some(leaves) = leaves_of(relation.oid) {
-            same_leaves_as_first_read(relation.oid, &leaves);
+            leaves_unchanged_since_first_read(relation.oid, &leaves);
         }
     }
 }
@@ -394,9 +394,13 @@ fn leaves_of(root: pg_sys::Oid) -> Option<Vec<(pg_sys::Oid, bool)>> {
     })
 }
 
+/// Recorded in place of the leaves of a partitioned source once they changed:
+/// it matches no set of leaves.
+const LEAVES_CHANGED: &str = "changed";
+
 fn leaf_writes(root: pg_sys::Oid) -> Option<i64> {
     let leaves = leaves_of(root)?;
-    if !same_leaves_as_first_read(root, &leaves) {
+    if !leaves_unchanged_since_first_read(root, &leaves) {
         return None;
     }
     leaves.into_iter().try_fold(0i64, |total, (leaf, heap)| {
@@ -406,13 +410,15 @@ fn leaf_writes(root: pg_sys::Oid) -> Option<i64> {
     })
 }
 
-/// Whether `leaves` are the leaves of `root` the first time this transaction
-/// read them, which it records then in a transaction-local setting. A leaf
-/// detached or dropped since takes its writes out of the sum while the rows of
-/// the deltas applied keep them, and a table attached since adds writes no
-/// delta applied: the sum over leaves that changed is no count of the source's
-/// unapplied writes.
-fn same_leaves_as_first_read(root: pg_sys::Oid, leaves: &[(pg_sys::Oid, bool)]) -> bool {
+/// Whether the leaves of `root` are still those this transaction first read,
+/// which it records then in a transaction-local setting. A leaf detached or
+/// dropped takes its writes out of the sum while the rows of the deltas applied
+/// keep them, and a table attached adds writes no delta applied; a table
+/// attached, written and removed again leaves the first leaves with rows
+/// applied that the sum no longer counts. So the first change is recorded too,
+/// and the sum is no count of the source's unapplied writes for the rest of the
+/// transaction.
+fn leaves_unchanged_since_first_read(root: pg_sys::Oid, leaves: &[(pg_sys::Oid, bool)]) -> bool {
     let mut oids: Vec<u32> = leaves.iter().map(|(leaf, _)| leaf.to_u32()).collect();
     oids.sort_unstable();
     let current = format!(
@@ -427,14 +433,23 @@ fn same_leaves_as_first_read(root: pg_sys::Oid, leaves: &[(pg_sys::Oid, bool)]) 
         return false;
     };
     let first = unsafe { pg_sys::GetConfigOption(name.as_ptr(), true, false) };
-    if !first.is_null() && unsafe { *first } != 0 {
-        return unsafe { std::ffi::CStr::from_ptr(first) }.to_bytes() == current.as_bytes();
+    let first = (!first.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(first) }.to_bytes());
+    let record = |value: &str| {
+        Spi::run_with_args(
+            "SELECT set_config($1, $2, true)",
+            &[text_arg(&setting), text_arg(value)],
+        )
+        .is_ok()
+    };
+    match first {
+        None | Some(b"") => record(&current),
+        Some(first) if first == current.as_bytes() => true,
+        Some(first) if first == LEAVES_CHANGED.as_bytes() => false,
+        Some(_) => {
+            record(LEAVES_CHANGED);
+            false
+        }
     }
-    Spi::run_with_args(
-        "SELECT set_config($1, $2, true)",
-        &[text_arg(&setting), text_arg(&current)],
-    )
-    .is_ok()
 }
 
 /// The sources of `view_name` other than `source` holding writes not yet
