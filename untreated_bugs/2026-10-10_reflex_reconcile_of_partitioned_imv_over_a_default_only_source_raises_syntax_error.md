@@ -46,3 +46,18 @@ SQL of `reflex_reconcile_partition` by hand), then make the predicate of a DEFAU
 sibling `TRUE`. Test: the fixture above, `reflex_reconcile`, `reflex_reconcile_partition` and a
 TRUNCATE of the partition, IMMEDIATE and DEFERRED, with the bidirectional oracle; and the same at
 the second level (a branch whose only leaf is DEFAULT).
+
+## Field occurrence (2026-11-06, db_dev, pg_reflex 1.12.4)
+
+Still open in 1.12.4. Hit on `alp.stock_transfer_baseline_view` (DEFERRED, UNLOGGED, `partition_by
+supply_plan_id`, LIST). The source `alp.stock_transfer_baseline` holds only its DEFAULT partition and
+zero rows (the tenant has no transfers, legitimately). The IMV had been marked `known_stale` by the
+aliased group-column DELETE bug fixed in 1.12.4. Its remedy, `reflex_reconcile`, raised
+`ERROR 42601 syntax error at or near ")"` (`scan.l:1244`), so the stale flag could not be cleared
+even though the IMV held the correct 0 rows.
+
+So the source does not need rows: an empty DEFAULT-only source is enough.
+
+Workaround used: drop and recreate the IMV and its dependents (base-db `recreate-views alp --only
+stock_transfer_baseline_view --with-downstream`). Prod alp is in the same state and will need the
+same workaround until this is fixed.
