@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [1.12.5] - 2026-11-17
+## [1.12.5] - 2026-11-18
 
 A correctness release. An operator call (`reflex_rebuild_imv`,
 `reflex_reconcile`, the `reflex_set_*` setters) could deadlock with a
@@ -49,11 +49,20 @@ functions of every source in place.
     subtracts the joint term computed from the rows the first delta kept
     (`reflex_build_delta_sql_resolving`). Whether the first delta saw all
     of the other source's writes is decided from the transaction's own
-    write counters; in any doubt the IMV is recomputed.
+    write counters; in any doubt the IMV is recomputed. A partitioned
+    source whose partitions were attached, detached or dropped earlier in
+    the transaction is in doubt for the rest of it.
+  - Cost, release build, pg17, a one-row two-source CTE on a 200 K ⋈ 200 K
+    join: 14 → 28 ms with 2 000 groups and 100 → 163 ms with 100 000
+    groups, against 1.12.4's double-counting path. Most of it is one
+    `ANALYZE` of the IMV's intermediate table per correction. A write to
+    one source costs what it did.
   - Other shapes (MIN / MAX, outer joins, subqueries, more than two
     sources written, a source holding a column whose type is outside the
     exact-text whitelist, such as an enum, a domain or money) recompute
-    the IMV at the second delta.
+    the IMV at the second delta. So does an IMMEDIATE IMV over a source
+    that also has a DEFERRED IMV: its trigger bodies do not resolve the
+    correction.
   - DEFERRED IMVs are rebuilt at COMMIT when two of their sources were
     written, as before.
   - A partition attach or detach of one source plus a write to another
@@ -80,6 +89,13 @@ functions of every source in place.
   round trips under other DateStyle / TimeZone / float settings, each
   against the `EXCEPT ALL` oracle; corrected statements are checked to
   rewrite only the groups they touch.
+- `pg_test_two_source_correction_cost.rs`: a corrected statement analyzes
+  the intermediate and affected tables once per correction, not once per
+  piece.
+- `pg_test_two_source_partition_set.rs`: a written partition detached or
+  dropped (a leaf or a branch), or a written table attached, before a
+  statement writing both sources keeps the IMMEDIATE IMV exact inside the
+  transaction.
 - `pg_test_drop_source_partition.rs`: DROP of a filled partition and of a
   sub-partitioned branch, IMMEDIATE and DEFERRED, nine IMV shapes and a
   dependent; the privilege and exclusion guards.

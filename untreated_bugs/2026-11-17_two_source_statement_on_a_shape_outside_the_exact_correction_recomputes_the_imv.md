@@ -20,6 +20,7 @@ IMV for every such statement):
 - a stashed source holding any column of an **enum, domain, money, reg\*, array-of-those or
   user-defined type**, even one the IMV does not read, on an otherwise exact shape: no stash is kept, because the
   text form of those types is not proven exact under every session setting;
+- an IMMEDIATE IMV over a source that **also has a DEFERRED IMV**, whatever its shape (see below);
 - the cascade shapes above on any of these IMVs. The batch's earlier ruling accepted "an IMMEDIATE
   cascade-shaped IMV pays a reconcile per parent delete"; the exact redesign removed that cost for
   the whitelisted shapes, and this report keeps the residual.
@@ -43,11 +44,52 @@ WITH x AS (UPDATE fa SET a = a + 1 WHERE k = 1 RETURNING 1) UPDATE fb SET b = b 
 With the enum only on `fa` (the side that was not stashed) the statement was corrected: which
 source's types matter depends on the trigger firing order.
 
+## An IMMEDIATE IMV over a source that also has a DEFERRED IMV (found by the 1.12.5 final review)
+
+A source read by a DEFERRED IMV gets the DEFERRED-flavour trigger bodies
+(`sql/deferred_trigger_body.plpgsql.in:18`, `sql/deferred_trigger_update_body.plpgsql.in:23`).
+They run the source's IMMEDIATE IMVs through `reflex_build_delta_sql`, which does not resolve a
+correction. Whichever trigger fires first, the IMMEDIATE IMV is recomputed:
+
+- the DEFERRED-flavour body of X fires first: it poisons the stash, and the other source's delta
+  recomputes;
+- the other source's normal body fires first: it stashes, and X's non-resolving delta recomputes.
+
+The DEFERRED-flavour bodies' predicate skip and ignored-source skip also do not call the skip hooks
+(`reflex_joint_skipped_delta_sql`); that leaves an excess, so a recompute, never a wrong result.
+
+Reproduction (pg16, the 1.12.5 final-review probe `pg_finalrev_deferred_flavour_source_is_not_corrected`,
+two dblink sessions):
+
+```sql
+CREATE TABLE fd_x (k INT PRIMARY KEY, v INT NOT NULL);
+CREATE TABLE fd_y (k INT PRIMARY KEY, g INT NOT NULL);
+INSERT INTO fd_x SELECT g, g FROM generate_series(1, 100) g;
+INSERT INTO fd_y SELECT g, g % 5 FROM generate_series(1, 100) g;
+SELECT create_reflex_ivm('fd_v',
+  'SELECT fd_y.g, COUNT(*) AS n, SUM(fd_x.v) AS s FROM fd_x JOIN fd_y ON fd_y.k = fd_x.k GROUP BY fd_y.g',
+  NULL, NULL, 'IMMEDIATE');
+-- add this line to see the recompute:
+SELECT create_reflex_ivm('fd_dx', 'SELECT k % 3 AS b, SUM(v) AS s FROM fd_x GROUP BY k % 3',
+  NULL, NULL, 'DEFERRED');
+BEGIN;
+WITH a AS (INSERT INTO fd_x VALUES (500, 7) RETURNING 1) INSERT INTO fd_y VALUES (500, 2);
+-- corrections counted in the transaction-local setting `joint::corrections_setting('fd_v')`:
+-- 1 without fd_dx, 0 with it; fd_v matches its query in both cases.
+COMMIT;
+```
+
+Fix direction: render the DEFERRED-flavour bodies with `reflex_build_delta_sql_resolving` and the
+`--<<REFLEX_THEN>>--` loop for their IMMEDIATE IMVs, and call the skip hooks from their skips. This
+changes rendered bodies, so the release migration's body rewrite and `pg_test_upgrade_1_12_5` must
+follow.
+
 ## Severity
 
 Performance only. The cost is a full IMV recompute per two-source statement on these shapes; zero
 for single-source writes. Not on a known production path (db_dev's two-source shapes are SUM/COUNT
-over integer and text keys).
+over integer and text keys). The DEFERRED-IMV case was not checked against db_dev: a source there
+with both a DEFERRED IMV and an IMMEDIATE join IMV written together in one statement would pay it.
 
 ## Fix direction
 
