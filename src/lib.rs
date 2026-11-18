@@ -2086,6 +2086,7 @@ mod tests {
     include!("tests/pg_test_two_source_exact.rs");
     include!("tests/pg_test_two_source_stash.rs");
     include!("tests/pg_test_two_source_correction_cost.rs");
+    include!("tests/pg_test_two_source_partition_set.rs");
     include!("tests/pg_test_upgrade_1_12_5.rs");
 }
 
