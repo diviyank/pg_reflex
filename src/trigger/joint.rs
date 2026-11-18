@@ -36,7 +36,7 @@ use super::delta_sources::{self, Relation};
 use super::{
     affected_groups_select, aggregate_epilogue_stmts, delta_statements, group_columns,
     imv_has_no_scoped_delta, passthrough_op_stmts, push_materialized_merge,
-    push_materialized_merge_and_affected, recompute_sql, registered_plan, union_delta, DeltaOp,
+    push_unanalyzed_merge_and_affected, recompute_sql, registered_plan, union_delta, DeltaOp,
 };
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
@@ -943,6 +943,8 @@ fn joint_rows(
 /// `−(ΔX ⋈ ΔS)`. Aggregates: the additions first (X⁺ ⋈ S⁻, X⁻ ⋈ S⁺), then the
 /// subtractions (X⁺ ⋈ S⁺, X⁻ ⋈ S⁻), each from a group that holds it (the
 /// exactness check), so no group's count drops below its exact value.
+/// The intermediate and affected tables are analyzed once, after the last
+/// piece, before the epilogue reads them.
 /// Passthrough: rows are removed by key, which neither delta counts twice, so
 /// only the rows X's delta inserted for S's inserted rows are removed, by S's
 /// key, before S inserts them.
@@ -1002,7 +1004,7 @@ fn correction(
     for (i, (stashed, transition, op)) in pieces.into_iter().enumerate() {
         let delta_q = joint_rows(imv, stasher, stashed, row_type, source, transition);
         match &grp_cols {
-            Some(cols) => push_materialized_merge_and_affected(
+            Some(cols) => push_unanalyzed_merge_and_affected(
                 &mut stmts,
                 &scratch,
                 &delta_q,
@@ -1017,6 +1019,10 @@ fn correction(
                 push_materialized_merge(&mut stmts, &scratch, &delta_q, &intermediate, plan, op)
             }
         }
+    }
+    if grp_cols.is_some() {
+        stmts.push(format!("ANALYZE {intermediate}"));
+        stmts.push(format!("ANALYZE {affected}"));
     }
     aggregate_epilogue_stmts(
         imv.name,
